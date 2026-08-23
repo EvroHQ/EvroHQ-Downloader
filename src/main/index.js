@@ -28,7 +28,8 @@ const store = new Store({
     outputFolder: '',
     telemetryEnabled: true,
     installId: '',
-    theme: 'evrohq'
+    theme: 'evrohq',
+    codec: 'best'
   }
 })
 
@@ -620,6 +621,28 @@ function getMediaDuration(ffmpegPath, file) {
 // ---------------------------------------------------------------------------
 // Download orchestration
 // ---------------------------------------------------------------------------
+function videoCodecPref(params) {
+  return params?.codec === 'h264' ? 'h264' : 'best'
+}
+
+function videoFormatSelector(maxHeight, codec) {
+  if (codec === 'h264') {
+    const h = Math.min(maxHeight, 1080)
+    return (
+      `bv[vcodec^=avc1][height<=${h}]+ba[acodec^=mp4a]/` +
+      `bv[vcodec^=avc1][height<=${h}]+ba/` +
+      `b[vcodec^=avc1][height<=${h}]`
+    )
+  }
+  return `bv*[height<=${maxHeight}]+ba/b[height<=${maxHeight}]`
+}
+
+function codecLogLine(codec) {
+  return codec === 'h264'
+    ? 'Codec: H.264 + AAC (NLE-compatible · 1080p max)'
+    : 'Codec: Best available (AV1/VP9 + Opus)'
+}
+
 async function handleDownload(params) {
   const { url, format, useRange, start, end } = params
   const byChapters = !!params.byChapters
@@ -633,6 +656,7 @@ async function handleDownload(params) {
   const videoQuality = ['4k', '2k', '1080'].includes(params.videoQuality)
     ? params.videoQuality
     : '1080'
+  const codec = videoCodecPref(params)
   const ytdlp = getBinPath('yt-dlp.exe')
   const ffmpeg = getBinPath('ffmpeg.exe')
   // Prepended to every yt-dlp call so it can solve YouTube's JS challenge.
@@ -648,8 +672,10 @@ async function handleDownload(params) {
   }
 
   // Max height per selected quality (yt-dlp picks the best available up to it).
-  const maxHeight = videoQuality === '4k' ? 2160 : videoQuality === '2k' ? 1440 : 1080
-  const videoSelector = `bv*[height<=${maxHeight}]+ba/b[height<=${maxHeight}]`
+  // YouTube has no native H.264 above 1080p — never re-encode, just cap.
+  const requestedHeight = videoQuality === '4k' ? 2160 : videoQuality === '2k' ? 1440 : 1080
+  const maxHeight = codec === 'h264' ? Math.min(requestedHeight, 1080) : requestedHeight
+  const videoSelector = videoFormatSelector(maxHeight, codec)
 
   // ffmpeg audio encode args for the chosen audio format.
   const audioEncodeArgs =
@@ -662,6 +688,7 @@ async function handleDownload(params) {
     sendLog(`Audio format: ${audioFormat === 'mp3' ? 'MP3 320 kbps' : 'WAV 44.1 kHz stereo'}`)
   } else {
     sendLog(`Video quality: up to ${maxHeight}p (best available), with audio → MP4`)
+    sendLog(codecLogLine(codec))
   }
 
   // Validate & normalize the trim range up front so bad input fails clearly
@@ -754,7 +781,8 @@ async function handleDownload(params) {
         format === 'audio' ? ['.webm', '.m4a', '.opus'] : ['.mp4', '.mkv', '.webm']
       )
       if (!temp) throw new Error('Could not locate the downloaded temp file.')
-      const dur = await getMediaDuration(ffmpeg, temp)
+      const source = temp
+      const dur = await getMediaDuration(ffmpeg, source)
 
       const destDir = join(outputFolder, sanitizeFilename(title, 'chapters'))
       mkdirSync(destDir, { recursive: true })
@@ -783,7 +811,7 @@ async function handleDownload(params) {
         )
         await runBinary(
           ffmpeg,
-          ['-y', '-i', temp, '-ss', secondsToStamp(startS), '-to', secondsToStamp(endS), ...encodeArgs, outName],
+          ['-y', '-i', source, '-ss', secondsToStamp(startS), '-to', secondsToStamp(endS), ...encodeArgs, outName],
           outputFolder
         )
       }
@@ -914,6 +942,7 @@ async function handlePlaylistDownload(params) {
   const videoQuality = ['4k', '2k', '1080'].includes(params.videoQuality)
     ? params.videoQuality
     : '1080'
+  const codec = videoCodecPref(params)
   const embedMeta = params.embedMeta !== false
   const playlistItems =
     typeof params.playlistItems === 'string' ? params.playlistItems.trim() : ''
@@ -933,8 +962,9 @@ async function handlePlaylistDownload(params) {
     throw new Error('ffmpeg.exe is missing from the bundled resources.')
   }
 
-  const maxHeight = videoQuality === '4k' ? 2160 : videoQuality === '2k' ? 1440 : 1080
-  const videoSelector = `bv*[height<=${maxHeight}]+ba/b[height<=${maxHeight}]`
+  const requestedHeight = videoQuality === '4k' ? 2160 : videoQuality === '2k' ? 1440 : 1080
+  const maxHeight = codec === 'h264' ? Math.min(requestedHeight, 1080) : requestedHeight
+  const videoSelector = videoFormatSelector(maxHeight, codec)
 
   const args = [
     ...jsArgs,
@@ -966,6 +996,7 @@ async function handlePlaylistDownload(params) {
   } else {
     args.push('-f', videoSelector, '--merge-output-format', 'mp4')
     sendLog(`Playlist video: up to ${maxHeight}p (best available) → MP4`)
+    sendLog(codecLogLine(codec))
   }
 
   // Subfolder named after the playlist, one file per track inside it.
@@ -1014,7 +1045,8 @@ ipcMain.handle('get-config', () => {
     outputFolder: store.get('outputFolder') || app.getPath('downloads'),
     version: app.getVersion(),
     telemetryEnabled: store.get('telemetryEnabled') !== false,
-    theme: THEME_IDS.includes(theme) ? theme : 'evrohq'
+    theme: THEME_IDS.includes(theme) ? theme : 'evrohq',
+    codec: store.get('codec') === 'h264' ? 'h264' : 'best'
   }
 })
 
@@ -1027,6 +1059,9 @@ ipcMain.handle('set-config', (_event, cfg) => {
   }
   if (cfg && typeof cfg.theme === 'string' && THEME_IDS.includes(cfg.theme)) {
     store.set('theme', cfg.theme)
+  }
+  if (cfg && (cfg.codec === 'best' || cfg.codec === 'h264')) {
+    store.set('codec', cfg.codec)
   }
   return true
 })
@@ -1044,6 +1079,7 @@ ipcMain.handle('start-download', async (_event, params) => {
     url: params?.url || null,
     format: params?.format || null,
     quality: params?.format === 'audio' ? params?.audioFormat || null : params?.videoQuality || null,
+    codec: params?.format === 'video' ? (params?.codec === 'h264' ? 'h264' : 'best') : null,
     playlist: false,
     item_count: 1,
     trim: !!params?.useRange,
@@ -1083,6 +1119,7 @@ ipcMain.handle('start-playlist-download', async (_event, params) => {
     format: params?.format || null,
     quality:
       params?.format === 'audio' ? params?.audioFormat || null : params?.videoQuality || null,
+    codec: params?.format === 'video' ? (params?.codec === 'h264' ? 'h264' : 'best') : null,
     playlist: true,
     item_count: itemCount || null,
     trim: false,

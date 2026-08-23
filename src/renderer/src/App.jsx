@@ -169,6 +169,7 @@ export default function App() {
   const [format, setFormat] = useState('audio')
   const [audioFormat, setAudioFormat] = useState('wav')
   const [videoQuality, setVideoQuality] = useState('1080')
+  const [codec, setCodec] = useState('best')
   const [useRange, setUseRange] = useState(false)
   const [start, setStart] = useState('')
   const [end, setEnd] = useState('')
@@ -207,6 +208,7 @@ export default function App() {
       if (cfg?.outputFolder) setOutputFolder(cfg.outputFolder)
       if (cfg?.version) setVersion(cfg.version)
       if (cfg?.theme) setTheme(cfg.theme)
+      if (cfg?.codec === 'h264' || cfg?.codec === 'best') setCodec(cfg.codec)
       themeReady.current = true
     })
 
@@ -258,6 +260,17 @@ export default function App() {
     document.documentElement.style.colorScheme = LIGHT_THEMES.has(theme) ? 'light' : 'dark'
     if (themeReady.current) window.api?.setConfig({ theme })
   }, [theme])
+
+  useEffect(() => {
+    if (themeReady.current) window.api?.setConfig({ codec })
+  }, [codec])
+
+  const selectCodec = (next) => {
+    setCodec(next)
+    if (next === 'h264' && (videoQuality === '2k' || videoQuality === '4k')) {
+      setVideoQuality('1080')
+    }
+  }
 
   // Follow the pasted URL into the matching preview mode.
   useEffect(() => {
@@ -425,6 +438,7 @@ export default function App() {
         format,
         audioFormat,
         videoQuality,
+        codec,
         embedMeta
       })
       return
@@ -438,6 +452,7 @@ export default function App() {
       format,
       audioFormat,
       videoQuality,
+      codec,
       useRange,
       embedMeta,
       start: start || '00:00:00',
@@ -489,11 +504,8 @@ export default function App() {
         : 'Select tracks to download'
       : 'Download'
 
-  // Embed toggle is available for audio (single) and playlists. It's hidden while
-  // Trim is open — embedding isn't applied to trimmed audio anyway — which also
-  // frees the room the START/END fields need.
+  // Embed toggle is available for audio (single) and playlists.
   const showEmbed = (mode === 'single' && format === 'audio') || mode === 'playlist'
-  const embedHiddenByTrim = mode === 'single' && useRange
 
   /* ---------------------------------------------------------------------- */
   return (
@@ -592,7 +604,7 @@ export default function App() {
                       onClick={() => setFormat('video')}
                       icon={<Video size={16} />}
                       title="Video"
-                      subtitle="MP4 · up to 4K"
+                      subtitle={codec === 'h264' ? 'MP4 · up to 1080p' : 'MP4 · up to 4K'}
                     />
                   </div>
                 </div>
@@ -601,10 +613,10 @@ export default function App() {
                 {format === 'audio' ? (
                   spec ? (
                     <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
-                      <Pill spec active={audioFormat === 'wav'} onClick={() => setAudioFormat('wav')}>
+                      <Pill spec group="audio" active={audioFormat === 'wav'} onClick={() => setAudioFormat('wav')}>
                         WAV · Lossless
                       </Pill>
-                      <Pill spec active={audioFormat === 'mp3'} onClick={() => setAudioFormat('mp3')}>
+                      <Pill spec group="audio" active={audioFormat === 'mp3'} onClick={() => setAudioFormat('mp3')}>
                         MP3 · 320 kbps
                       </Pill>
                     </div>
@@ -620,13 +632,27 @@ export default function App() {
                   )
                 ) : spec ? (
                   <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
-                    <Pill spec active={videoQuality === '1080'} onClick={() => setVideoQuality('1080')}>
+                    <Pill spec group="quality" active={videoQuality === '1080'} onClick={() => setVideoQuality('1080')}>
                       1080p
                     </Pill>
-                    <Pill spec active={videoQuality === '2k'} onClick={() => setVideoQuality('2k')}>
+                    <Pill
+                      spec
+                      group="quality"
+                      active={videoQuality === '2k'}
+                      disabled={codec === 'h264'}
+                      title={codec === 'h264' ? 'H.264 on YouTube tops out at 1080p' : undefined}
+                      onClick={() => setVideoQuality('2k')}
+                    >
                       2K · 1440p
                     </Pill>
-                    <Pill spec active={videoQuality === '4k'} onClick={() => setVideoQuality('4k')}>
+                    <Pill
+                      spec
+                      group="quality"
+                      active={videoQuality === '4k'}
+                      disabled={codec === 'h264'}
+                      title={codec === 'h264' ? 'H.264 on YouTube tops out at 1080p' : undefined}
+                      onClick={() => setVideoQuality('4k')}
+                    >
                       4K · 2160p
                     </Pill>
                   </div>
@@ -635,41 +661,118 @@ export default function App() {
                     <Pill group="v" active={videoQuality === '1080'} onClick={() => setVideoQuality('1080')}>
                       1080p
                     </Pill>
-                    <Pill group="v" active={videoQuality === '2k'} onClick={() => setVideoQuality('2k')}>
+                    <Pill
+                      group="v"
+                      active={videoQuality === '2k'}
+                      disabled={codec === 'h264'}
+                      title={codec === 'h264' ? 'H.264 on YouTube tops out at 1080p' : undefined}
+                      onClick={() => setVideoQuality('2k')}
+                    >
                       2K · 1440p
                     </Pill>
-                    <Pill group="v" active={videoQuality === '4k'} onClick={() => setVideoQuality('4k')}>
+                    <Pill
+                      group="v"
+                      active={videoQuality === '4k'}
+                      disabled={codec === 'h264'}
+                      title={codec === 'h264' ? 'H.264 on YouTube tops out at 1080p' : undefined}
+                      onClick={() => setVideoQuality('4k')}
+                    >
                       4K · 2160p
                     </Pill>
                   </div>
                 )}
 
-                {/* Trim (single) / disabled note (playlist) */}
+                {format === 'video' && (
+                  spec ? (
+                    <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
+                      <Pill
+                        spec
+                        group="codec"
+                        active={codec === 'best'}
+                        onClick={() => selectCodec('best')}
+                        title="AV1/VP9 · best resolution"
+                      >
+                        Best quality
+                      </Pill>
+                      <Pill
+                        spec
+                        group="codec"
+                        active={codec === 'h264'}
+                        onClick={() => selectCodec('h264')}
+                        title="H.264 + AAC · native YouTube streams, 1080p max"
+                      >
+                        Compatible (H.264)
+                      </Pill>
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-2 gap-2">
+                      <Pill
+                        group="c"
+                        active={codec === 'best'}
+                        onClick={() => selectCodec('best')}
+                        title="AV1/VP9 · best resolution"
+                      >
+                        Best quality
+                      </Pill>
+                      <Pill
+                        group="c"
+                        active={codec === 'h264'}
+                        onClick={() => selectCodec('h264')}
+                        title="H.264 + AAC · native YouTube streams, 1080p max"
+                      >
+                        Compatible (H.264)
+                      </Pill>
+                    </div>
+                  )
+                )}
+
+                {showEmbed && (
+                  <EmbedToggle
+                    on={embedMeta}
+                    onToggle={() => setEmbedMeta((v) => !v)}
+                  />
+                )}
+
+                {/* Trim last so it stays aligned in audio and video */}
                 {mode === 'single' ? (
-                  <div>
+                  <div className="flex h-[42px] w-full items-center justify-between gap-3 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4">
+                    <div className="flex min-w-0 flex-1 items-center">
+                      <AnimatePresence mode="wait" initial={false}>
+                        {useRange ? (
+                          <motion.div
+                            key="range"
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            exit={{ opacity: 0 }}
+                            transition={{ duration: 0.16 }}
+                            className="grid h-7 w-full min-w-0 grid-cols-[1fr_auto_1fr] items-center rounded-[8px] bg-[var(--sunken)] p-[3px] ring-1 ring-inset ring-[var(--border)]"
+                          >
+                            <RangeInput value={start} onChange={setStart} ariaLabel="Start time" />
+                            <span className="h-3 w-px shrink-0 bg-[var(--border)]" />
+                            <RangeInput value={end} onChange={setEnd} ariaLabel="End time" />
+                          </motion.div>
+                        ) : (
+                          <motion.span
+                            key="label"
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            exit={{ opacity: 0 }}
+                            transition={{ duration: 0.14 }}
+                            className="text-sm font-medium"
+                          >
+                            Trim a specific range
+                          </motion.span>
+                        )}
+                      </AnimatePresence>
+                    </div>
                     <button
+                      type="button"
                       onClick={() => setUseRange((v) => !v)}
-                      className="flex w-full items-center justify-between rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 text-left"
+                      aria-label="Toggle trim range"
+                      className="inline-flex shrink-0 appearance-none items-center border-0 bg-transparent p-0"
                     >
-                      <span className="text-sm font-medium">Trim a specific range</span>
                       <Switch on={useRange} />
                     </button>
-                    <AnimatePresence initial={false}>
-                      {useRange && (
-                        <motion.div
-                          initial={{ height: 0, opacity: 0 }}
-                          animate={{ height: 'auto', opacity: 1 }}
-                          exit={{ height: 0, opacity: 0 }}
-                          transition={{ duration: 0.25, ease: 'easeInOut' }}
-                          className="overflow-hidden"
-                        >
-                          <div className="mt-2 grid grid-cols-2 gap-2.5">
-                            <RangeInput label="Start" value={start} onChange={setStart} />
-                            <RangeInput label="End" value={end} onChange={setEnd} />
-                          </div>
-                        </motion.div>
-                      )}
-                    </AnimatePresence>
                   </div>
                 ) : (
                   <div className={`flex items-center gap-2.5 px-4 py-2.5 text-sm font-medium ${spec
@@ -679,14 +782,6 @@ export default function App() {
                     <span className="h-1.5 w-1.5 rounded-full bg-text-muted" />
                     Trimming is unavailable in playlist mode
                   </div>
-                )}
-
-                {/* Embed metadata — hidden while Trim is open (not applied to trims) */}
-                {showEmbed && !embedHiddenByTrim && (
-                  <EmbedToggle
-                    on={embedMeta}
-                    onToggle={() => setEmbedMeta((v) => !v)}
-                  />
                 )}
 
               </div>
@@ -1250,27 +1345,39 @@ function FormatCard({ spec, active, onClick, icon, title, subtitle }) {
   )
 }
 
-function Pill({ spec, active, onClick, group, children }) {
+function Pill({ spec, active, onClick, group, title, disabled, children }) {
   if (spec) {
     return (
       <button
-        onClick={onClick}
-        className={`flex-1 rounded-[7px] py-2 text-center font-mono text-[12px] transition-colors ${active
-          ? 'bg-[var(--control)] font-medium text-[var(--text)] shadow-[0_1px_2px_rgba(0,0,0,0.10)] ring-1 ring-[var(--border)]'
-          : 'text-[var(--text-dim)]'
+        type="button"
+        onClick={disabled ? undefined : onClick}
+        title={title}
+        aria-disabled={disabled || undefined}
+        className={`relative isolate flex-1 rounded-[7px] py-2 text-center font-mono text-[12px] transition-[color,opacity] duration-200 ${disabled ? 'pointer-events-none cursor-default opacity-35' : ''
+          } ${active && !disabled ? 'font-medium text-[var(--text)]' : 'font-normal text-[var(--text-dim)]'
           }`}
       >
-        {children}
+        {active && !disabled && (
+          <motion.span
+            layoutId={`pill-${group}`}
+            transition={{ type: 'spring', stiffness: 380, damping: 34, mass: 0.7 }}
+            className="absolute inset-0 -z-10 rounded-[7px] bg-[var(--control)] shadow-[0_1px_2px_rgba(0,0,0,0.10)] ring-1 ring-[var(--border)]"
+          />
+        )}
+        <span className="relative z-10">{children}</span>
       </button>
     )
   }
   return (
     <button
-      onClick={onClick}
-      className={`relative rounded-xl py-3 text-center text-[13px] font-semibold transition-colors ${active ? 'text-white' : 'bg-white/[0.04] text-text-secondary'
+      onClick={disabled ? undefined : onClick}
+      title={title}
+      aria-disabled={disabled || undefined}
+      className={`relative rounded-xl py-3 text-center text-[13px] font-semibold transition-colors ${disabled ? 'pointer-events-none cursor-default opacity-35' : ''
+        } ${active && !disabled ? 'text-white' : 'bg-white/[0.04] text-text-secondary'
         }`}
     >
-      {active && (
+      {active && !disabled && (
         <motion.span
           layoutId={`pill-${group}`}
           transition={spring}
@@ -1327,7 +1434,7 @@ function EmbedToggle({ on, onToggle }) {
   return (
     <button
       onClick={onToggle}
-      className="flex w-full items-center justify-between rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4 py-2.5 text-left"
+      className="flex h-[42px] w-full items-center justify-between rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4 text-left"
     >
       <span className="text-sm font-medium">Embed metadata &amp; cover art</span>
       <Switch on={on} />
@@ -1338,29 +1445,27 @@ function EmbedToggle({ on, onToggle }) {
 function Switch({ on }) {
   return (
     <span
-      className={`relative h-5 w-9 shrink-0 rounded-full transition-colors ${on ? 'bg-accent-gradient' : 'bg-[var(--border-strong)]'
+      className={`relative inline-flex h-[18px] w-8 shrink-0 items-center rounded-full p-[2px] transition-colors duration-200 ${on ? 'bg-accent-gradient' : 'bg-[var(--border-strong)]'
         }`}
     >
       <span
-        className="absolute top-0.5 h-4 w-4 rounded-full bg-white shadow transition-all"
-        style={{ left: on ? '18px' : '2px' }}
+        className={`block h-3.5 w-3.5 rounded-full bg-white shadow-sm transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${on ? 'translate-x-[14px]' : 'translate-x-0'
+          }`}
       />
     </span>
   )
 }
 
-function RangeInput({ label, value, onChange }) {
+function RangeInput({ value, onChange, ariaLabel }) {
   return (
-    <div>
-      <SectionLabel>{label}</SectionLabel>
-      <input
-        value={value}
-        onChange={(e) => onChange(formatTimeInput(e.target.value))}
-        inputMode="numeric"
-        maxLength={8}
-        placeholder="hh:mm:ss"
-        className="w-full rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-3 py-2 text-center font-mono text-sm text-[var(--text)] placeholder:text-[var(--text-faint)] transition-colors focus:border-[var(--accent)] focus:outline-none"
-      />
-    </div>
+    <input
+      value={value}
+      onChange={(e) => onChange(formatTimeInput(e.target.value))}
+      inputMode="numeric"
+      maxLength={8}
+      aria-label={ariaLabel}
+      placeholder="00:00:00"
+      className="h-full min-w-0 w-full appearance-none rounded-[5px] border-0 bg-transparent p-0 text-center font-mono text-[12px] leading-none tabular-nums tracking-wide text-[var(--text)] outline-none placeholder:text-[var(--text-faint)] transition-colors focus:bg-[var(--control)]"
+    />
   )
 }
