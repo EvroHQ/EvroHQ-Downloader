@@ -17,7 +17,8 @@ import {
   CheckCircle2,
   XCircle,
   Info,
-  AlertTriangle
+  AlertTriangle,
+  Scissors
 } from 'lucide-react'
 
 const spring = { type: 'spring', stiffness: 420, damping: 34 }
@@ -76,6 +77,62 @@ function isPlaylistUrl(value) {
   if (!YT_HOSTS.includes(host)) return false
   if (u.pathname === '/playlist' && u.searchParams.has('list')) return true
   return u.searchParams.has('list') || u.searchParams.has('start_radio')
+}
+
+// YouTube Mix / radio (list=RD…) and Music albums (list=OLAK…) — keep as playlist.
+function keepAsPlaylist(u) {
+  const list = u.searchParams.get('list') || ''
+  return u.searchParams.has('start_radio') || /^RD/i.test(list) || /^OLAK/i.test(list)
+}
+
+// Strip leftover extras from a watch URL so it stays a single video:
+// playlist leftovers (watch?v=…&list=PLxxx), start time (?t=74s), share junk.
+// Mix/radio, Music albums, and /playlist?list= are left alone.
+function cleanYouTubeUrl(value) {
+  const raw = String(value ?? '').trim()
+  if (!raw) return raw
+  const work = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`
+  try {
+    const u = new URL(work)
+    const host = u.hostname.toLowerCase().replace(/^www\./, '')
+    if (!YT_HOSTS.includes(host)) return raw
+    if (u.pathname === '/playlist') return raw
+    if (keepAsPlaylist(u)) return raw
+    const extraKeys = [...u.searchParams.keys()].filter((k) => k !== 'v')
+    const hasJunk = extraKeys.length > 0 || (u.hash && u.hash.length > 1)
+    if (!hasJunk) return raw
+    if (u.pathname === '/watch') {
+      const id = u.searchParams.get('v')
+      return id ? `https://www.youtube.com/watch?v=${id}` : raw
+    }
+    if (host === 'youtu.be') {
+      const id = u.pathname.replace(/^\//, '').split('/')[0]
+      return id ? `https://youtu.be/${id}` : raw
+    }
+    const m = u.pathname.match(/^\/(shorts|live|embed|v)\/([\w-]+)/)
+    if (m) return `https://www.youtube.com/${m[1]}/${m[2]}`
+    return raw
+  } catch {
+    return raw
+  }
+}
+
+function urlCleanNote(raw, cleaned) {
+  if (!raw || raw === cleaned) return null
+  const u = toUrl(raw)
+  if (!u) return 'Extra parameters removed from the link.'
+  if (u.searchParams.has('list') || u.searchParams.has('index')) {
+    return 'Mix/playlist extras removed — this video only.'
+  }
+  if (
+    u.searchParams.has('t') ||
+    u.searchParams.has('start') ||
+    u.searchParams.has('time_continue') ||
+    /^#t=/i.test(u.hash || '')
+  ) {
+    return 'Start time removed from the link.'
+  }
+  return 'Extra parameters removed from the link.'
 }
 
 /* -------------------------------------------------------------------------- */
@@ -173,6 +230,10 @@ export default function App() {
   const [useRange, setUseRange] = useState(false)
   const [start, setStart] = useState('')
   const [end, setEnd] = useState('')
+  const [chapters, setChapters] = useState([])
+  const [byChapters, setByChapters] = useState(false)
+  const [urlCleaned, setUrlCleaned] = useState(false)
+  const [urlCleanMsg, setUrlCleanMsg] = useState('')
   const [embedMeta, setEmbedMeta] = useState(true)
   const [outputFolder, setOutputFolder] = useState('')
   const [version, setVersion] = useState('')
@@ -194,6 +255,23 @@ export default function App() {
   const [selected, setSelected] = useState(() => new Set())
 
   const previewReq = useRef(0)
+  const chapterReq = useRef(0)
+  const formatRef = useRef(format)
+  const playlistPosRef = useRef(playlistPos)
+  const dlPassRef = useRef(1)
+  const dlLastPctRef = useRef(0)
+  const dlShownRef = useRef(0)
+  const extraDlRef = useRef(false)
+  formatRef.current = format
+  playlistPosRef.current = playlistPos
+
+  const resetDownloadProgress = () => {
+    dlPassRef.current = 1
+    dlLastPctRef.current = 0
+    dlShownRef.current = 0
+    extraDlRef.current = false
+    setProgress(0)
+  }
 
   const urlState = useMemo(() => {
     if (!url.trim()) return null
@@ -212,11 +290,61 @@ export default function App() {
       themeReady.current = true
     })
 
+    const applyProgress = (value) => {
+      const next = Math.min(99.9, Math.max(0, value))
+      if (next + 0.05 < dlShownRef.current) return
+      dlShownRef.current = next
+      setProgress(next)
+    }
+
     const offLog = window.api?.onLog((line) => {
-      const match = line.match(/(\d+(?:\.\d+)?)%/)
-      if (match) setProgress(parseFloat(match[1]))
       const item = line.match(/Downloading (?:item|video) (\d+) of (\d+)/i)
-      if (item) setPlaylistPos({ current: Number(item[1]), total: Number(item[2]) })
+      if (item) {
+        setPlaylistPos({ current: Number(item[1]), total: Number(item[2]) })
+        playlistPosRef.current = { current: Number(item[1]), total: Number(item[2]) }
+        dlPassRef.current = 1
+        dlLastPctRef.current = 0
+        extraDlRef.current = false
+      }
+
+      const streams = formatRef.current === 'video' ? 2 : 1
+
+      // yt-dlp video = video stream then audio stream, each 0–100%. A later
+      // Destination (thumbnail, etc.) must not start a 3rd pass.
+      if (/\[download\].*Destination:/i.test(line) && dlLastPctRef.current > 8) {
+        if (dlPassRef.current < streams) {
+          dlPassRef.current += 1
+          dlLastPctRef.current = 0
+        } else {
+          extraDlRef.current = true
+        }
+      }
+
+      const chapterPct = line.match(/Splitting chapter .*?\((\d+(?:\.\d+)?)%\)/)
+      if (chapterPct) {
+        applyProgress(parseFloat(chapterPct[1]))
+      } else if (!extraDlRef.current) {
+        const dl = line.match(/\[download\]\s+(\d+(?:\.\d+)?)%/)
+        if (dl) {
+          const raw = parseFloat(dl[1])
+          if (
+            raw + 12 < dlLastPctRef.current &&
+            dlLastPctRef.current > 55 &&
+            dlPassRef.current < streams
+          ) {
+            dlPassRef.current += 1
+          }
+          dlLastPctRef.current = raw
+          const pass = Math.min(Math.max(dlPassRef.current, 1), streams)
+          const within = (pass - 1 + raw / 100) / streams
+          const pos = playlistPosRef.current
+          const overall =
+            pos && pos.total > 0
+              ? ((Math.max(pos.current, 1) - 1 + within) / pos.total) * 100
+              : within * 100
+          applyProgress(overall)
+        }
+      }
       if (/^ERROR:/.test(line) && /not found/.test(line)) {
         toast.error(line.replace(/^ERROR:\s*/, ''))
       } else if (/were skipped/.test(line)) {
@@ -227,11 +355,14 @@ export default function App() {
     const offComplete = window.api?.onComplete((payload) => {
       setDownloading(false)
       setStopping(false)
-      setProgress(payload.success ? 100 : 0)
+      const finished = payload.success && !payload.alreadyDownloaded
+      dlShownRef.current = finished ? 100 : 0
+      setProgress(finished ? 100 : 0)
       setPlaylistPos(null)
-      if (payload.cancelled) toast.info(payload.message || 'Download cancelled')
-      else if (payload.success) toast.success(payload.message || 'Download complete')
-      else toast.error(payload.message || 'Download failed')
+      if (payload.cancelled) toast.info(payload.message || 'Download cancelled', { id: 'dl' })
+      else if (payload.alreadyDownloaded) toast.info(payload.message || 'File already downloaded', { id: 'dl' })
+      else if (payload.success) toast.success(payload.message || 'Download complete', { id: 'dl' })
+      else toast.error(payload.message || 'Download failed', { id: 'dl' })
     })
 
     const offAppUpdate = window.api?.onAppUpdate((payload) => {
@@ -277,6 +408,34 @@ export default function App() {
     if (urlState === 'playlist') setMode('playlist')
     else if (urlState === 'single') setMode('single')
   }, [urlState])
+
+  // Detect chapters on single videos only (debounced). Trim and chapter-split
+  // are mutually exclusive.
+  useEffect(() => {
+    setChapters([])
+    setByChapters(false)
+    if (urlState !== 'single') return
+    const reqId = ++chapterReq.current
+    const t = setTimeout(async () => {
+      const res = await window.api?.getChapters(url.trim())
+      if (chapterReq.current !== reqId) return
+      setChapters(Array.isArray(res?.chapters) ? res.chapters : [])
+    }, 600)
+    return () => clearTimeout(t)
+  }, [url, urlState])
+
+  useEffect(() => {
+    if (useRange) setByChapters(false)
+  }, [useRange])
+
+  const applyUrl = (raw) => {
+    const next = String(raw ?? '').trim()
+    const cleaned = cleanYouTubeUrl(next)
+    setUrl(cleaned)
+    const note = urlCleanNote(next, cleaned)
+    setUrlCleaned(Boolean(note))
+    setUrlCleanMsg(note || '')
+  }
 
   // Fetch real preview metadata whenever a valid URL settles (debounced, with a
   // request guard so a slow response can't overwrite a newer URL).
@@ -401,7 +560,7 @@ export default function App() {
   const handlePaste = async () => {
     try {
       const text = await navigator.clipboard.readText()
-      if (text) setUrl(text.trim())
+      if (text) applyUrl(text)
     } catch {
       toast.error('Could not read clipboard')
     }
@@ -414,7 +573,7 @@ export default function App() {
 
   const handleDownload = async () => {
     if (!canDownload) return
-    if (mode === 'single' && useRange) {
+    if (mode === 'single' && useRange && !byChapters) {
       const err = trimRangeError(start, end)
       if (err) {
         toast.error(err)
@@ -428,9 +587,8 @@ export default function App() {
         .join(',')
       setDownloading(true)
       setStopping(false)
-      setProgress(0)
+      resetDownloadProgress()
       setPlaylistPos({ current: 0, total: selected.size })
-      toast.info(`Downloading ${selected.size} tracks`)
       await window.api?.startPlaylistDownload({
         url: url.trim(),
         playlistItems: items,
@@ -445,15 +603,16 @@ export default function App() {
     }
     setDownloading(true)
     setStopping(false)
-    setProgress(0)
-    toast.info('Download started')
+    resetDownloadProgress()
     await window.api?.startDownload({
       url: url.trim(),
       format,
       audioFormat,
       videoQuality,
       codec,
-      useRange,
+      useRange: useRange && !byChapters,
+      byChapters: byChapters && !useRange,
+      chapterCount: chapters.length,
       embedMeta,
       start: start || '00:00:00',
       end: end || '00:00:00'
@@ -566,24 +725,40 @@ export default function App() {
               {/* Controls — compact enough to fit without scrolling, even with Trim open */}
               <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
                 {/* URL field */}
-                <div
-                  className={`flex items-center gap-2.5 px-4 py-2 transition-colors ${spec ? 'rounded-[10px] bg-[var(--surface)]' : 'rounded-2xl bg-white/[0.04] focus-within:bg-white/[0.06]'
-                    }`}
-                  style={{ border: `1px solid ${urlRing}` }}
-                >
-                  <input
-                    value={url}
-                    onChange={(e) => setUrl(e.target.value)}
-                    placeholder="Paste a YouTube video or playlist link…"
-                    className={`flex-1 bg-transparent text-text-primary placeholder:text-text-muted focus:outline-none ${spec ? 'font-mono text-[13px]' : 'text-sm'}`}
-                  />
-                  <button
-                    onClick={handlePaste}
-                    title="Paste from clipboard"
-                    className="grid h-7 w-7 shrink-0 place-items-center rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] text-[var(--text-dim)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text)]"
+                <div>
+                  <div
+                    className={`flex items-center gap-2.5 px-4 py-2 transition-colors ${spec ? 'rounded-[10px] bg-[var(--surface)]' : 'rounded-2xl bg-white/[0.04] focus-within:bg-white/[0.06]'
+                      }`}
+                    style={{ border: `1px solid ${urlRing}` }}
                   >
-                    <Clipboard size={15} />
-                  </button>
+                    <input
+                      value={url}
+                      onChange={(e) => applyUrl(e.target.value)}
+                      placeholder="Paste a YouTube video or playlist link…"
+                      className={`flex-1 bg-transparent text-text-primary placeholder:text-text-muted focus:outline-none ${spec ? 'font-mono text-[13px]' : 'text-sm'}`}
+                    />
+                    <button
+                      onClick={handlePaste}
+                      title="Paste from clipboard"
+                      className="grid h-7 w-7 shrink-0 place-items-center rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] text-[var(--text-dim)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text)]"
+                    >
+                      <Clipboard size={15} />
+                    </button>
+                  </div>
+                  <AnimatePresence initial={false}>
+                    {urlCleaned && (
+                      <motion.p
+                        initial={{ opacity: 0, height: 0, marginTop: 0 }}
+                        animate={{ opacity: 1, height: 'auto', marginTop: 6 }}
+                        exit={{ opacity: 0, height: 0, marginTop: 0 }}
+                        transition={{ duration: 0.18 }}
+                        className="flex items-center gap-1.5 px-1 text-[11px] text-[var(--text-dim)]"
+                      >
+                        <Scissors size={11} className="shrink-0 text-accentMid" />
+                        {urlCleanMsg}
+                      </motion.p>
+                    )}
+                  </AnimatePresence>
                 </div>
 
                 {/* Format */}
@@ -733,9 +908,9 @@ export default function App() {
                   />
                 )}
 
-                {/* Trim last so it stays aligned in audio and video */}
-                {mode === 'single' ? (
-                  <div className="flex h-[42px] w-full items-center justify-between gap-3 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4">
+                {/* Trim last so it stays aligned in audio and video. Hidden in playlist mode. */}
+                {mode === 'single' && (
+                  <div className={`flex h-[42px] w-full items-center justify-between gap-3 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4 ${byChapters ? 'pointer-events-none opacity-40' : ''}`}>
                     <div className="flex min-w-0 flex-1 items-center">
                       <AnimatePresence mode="wait" initial={false}>
                         {useRange ? (
@@ -774,13 +949,27 @@ export default function App() {
                       <Switch on={useRange} />
                     </button>
                   </div>
-                ) : (
-                  <div className={`flex items-center gap-2.5 px-4 py-2.5 text-sm font-medium ${spec
-                    ? 'rounded-[10px] border border-dashed border-[var(--border-strong)] bg-[var(--sunken)] text-[var(--text-dim)]'
-                    : 'rounded-2xl border border-dashed border-white/[0.20] text-text-muted'
-                    }`}>
-                    <span className="h-1.5 w-1.5 rounded-full bg-text-muted" />
-                    Trimming is unavailable in playlist mode
+                )}
+
+                {mode === 'single' && chapters.length > 0 && (
+                  <div className="flex h-[42px] w-full items-center justify-between rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4">
+                    <span className="text-sm font-medium">
+                      Split by chapters
+                      <span className="ml-1.5 font-normal text-[var(--text-dim)]">
+                        · {chapters.length}
+                      </span>
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUseRange(false)
+                        setByChapters((v) => !v)
+                      }}
+                      aria-label="Toggle split by chapters"
+                      className="inline-flex shrink-0 appearance-none items-center border-0 bg-transparent p-0"
+                    >
+                      <Switch on={byChapters} />
+                    </button>
                   </div>
                 )}
 
@@ -846,9 +1035,9 @@ export default function App() {
 
             {/* RIGHT — preview */}
             <div className={`flex min-h-0 flex-col overflow-hidden p-5 ${spec ? 'rounded-[12px] bg-[var(--panel)] ring-1 ring-[var(--border)]' : 'rounded-2xl glass'}`}>
-              <div className="mb-3 flex shrink-0 items-center justify-between">
-                <SectionLabel className="mb-0">Preview</SectionLabel>
-                <div className={`flex p-0.5 text-[12px] font-medium ${spec
+              <div className="mb-3 flex h-8 shrink-0 items-center justify-between">
+                <SectionLabel className="mt-2 flex h-full items-center leading-none">Preview</SectionLabel>
+                <div className={`flex h-full items-center p-[3px] text-[12px] font-medium ${spec
                   ? 'rounded-[8px] border border-[var(--border)] bg-[var(--sunken)]'
                   : 'rounded-full border border-white/10 bg-white/5 text-[11px]'
                   }`}>
@@ -861,33 +1050,53 @@ export default function App() {
                 </div>
               </div>
 
-              {mode === 'single' ? (
-                <SinglePreview
-                  info={videoInfo}
-                  loading={previewLoading}
-                  error={previewError}
-                  empty={urlState === null}
-                  sizeLabel={
-                    videoInfo?.duration
-                      ? `~${estSizeLabel(videoInfo.duration)} ${formatLabel}`
-                      : null
-                  }
-                />
-              ) : (
-                <PlaylistPreview
-                  info={playlistInfo}
-                  loading={previewLoading}
-                  error={previewError}
-                  empty={urlState === null}
-                  selected={selected}
-                  onToggle={toggleTrack}
-                  onSelectAll={selectAll}
-                  onDeselectAll={deselectAll}
-                  totalSecs={totalSecs}
-                  selectedSecs={selectedSecs}
-                  sizeLabel={`~${estSizeLabel(selectedSecs)} ${formatLabel}`}
-                />
-              )}
+              <AnimatePresence mode="wait" initial={false}>
+                {mode === 'single' ? (
+                  <motion.div
+                    key="single"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.2 }}
+                    className="flex min-h-0 flex-1 flex-col"
+                  >
+                    <SinglePreview
+                      info={videoInfo}
+                      loading={previewLoading}
+                      error={previewError}
+                      empty={urlState === null}
+                      sizeLabel={
+                        videoInfo?.duration
+                          ? `~${estSizeLabel(videoInfo.duration)} ${formatLabel}`
+                          : null
+                      }
+                    />
+                  </motion.div>
+                ) : (
+                  <motion.div
+                    key="playlist"
+                    initial={{ opacity: 0 }}
+                    animate={{ opacity: 1 }}
+                    exit={{ opacity: 0 }}
+                    transition={{ duration: 0.2 }}
+                    className="flex min-h-0 flex-1 flex-col"
+                  >
+                    <PlaylistPreview
+                      info={playlistInfo}
+                      loading={previewLoading}
+                      error={previewError}
+                      empty={urlState === null}
+                      selected={selected}
+                      onToggle={toggleTrack}
+                      onSelectAll={selectAll}
+                      onDeselectAll={deselectAll}
+                      totalSecs={totalSecs}
+                      selectedSecs={selectedSecs}
+                      sizeLabel={`~${estSizeLabel(selectedSecs)} ${formatLabel}`}
+                    />
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </div>
           </div>
 
@@ -1017,7 +1226,7 @@ function SinglePreview({ info, loading, error, empty, sizeLabel }) {
     .join(' · ')
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="striped relative flex aspect-video w-full items-center justify-center overflow-hidden rounded-xl ring-1 ring-white/10">
+      <div className="striped relative mt-[22px] flex aspect-video w-full items-center justify-center overflow-hidden rounded-xl ring-1 ring-white/10">
         {info.thumbnail ? (
           <img src={info.thumbnail} alt="" className="h-full w-full object-cover" draggable={false} />
         ) : (
@@ -1077,22 +1286,21 @@ function PlaylistPreview({
   }
   const tracks = info.tracks
   return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      {/* Header */}
-      <div className="mb-3 flex shrink-0 items-center gap-3">
+    <div className="mt-[22px] flex min-h-0 flex-1 flex-col">
+      <div className="mb-2.5 flex shrink-0 items-center gap-3">
         {info.cover ? (
           <img
             src={info.cover}
             alt=""
             draggable={false}
-            className="h-11 w-16 shrink-0 rounded-md object-cover ring-1 ring-white/10"
+            className="h-10 w-14 shrink-0 rounded-md object-cover ring-1 ring-white/10"
           />
         ) : (
-          <div className="striped h-11 w-16 shrink-0 rounded-md ring-1 ring-white/10" />
+          <div className="striped h-10 w-14 shrink-0 rounded-md ring-1 ring-white/10" />
         )}
         <div className="min-w-0 flex-1">
-          <h2 className="truncate text-[15px] font-semibold text-text-primary">{info.title}</h2>
-          <p className="text-[12px] text-text-secondary">
+          <h2 className="truncate text-[15px] font-semibold leading-tight text-text-primary">{info.title}</h2>
+          <p className="mt-0.5 text-[12px] leading-tight text-text-secondary">
             {tracks.length} tracks{totalSecs > 0 ? ` · ${fmtLong(totalSecs)}` : ''}
           </p>
         </div>
@@ -1102,16 +1310,15 @@ function PlaylistPreview({
         </div>
       </div>
 
-      {/* Tracks */}
-      <div className="list-scroll -mr-1 min-h-0 flex-1 overflow-y-auto pr-1">
-        <div className="divide-y divide-[var(--border)]">
+      <div className="list-scroll -mr-5 min-h-0 flex-1 overflow-y-auto pr-3">
+        <div className="divide-y divide-[var(--border)] border-t border-[var(--border)]">
           {tracks.map((t, i) => {
             const checked = selected.has(t.id)
             return (
               <button
                 key={t.id}
                 onClick={() => onToggle(t.id)}
-                className="track-row flex w-full items-center gap-3 px-1 py-2.5 text-left"
+                className="track-row flex w-full items-center gap-2.5 py-2.5 text-left"
                 style={{ opacity: checked ? 1 : 0.45 }}
               >
                 <span
@@ -1120,7 +1327,7 @@ function PlaylistPreview({
                 >
                   {checked && <Check size={12} className="track-check-mark" strokeWidth={3} />}
                 </span>
-                <span className="w-5 shrink-0 text-right font-mono text-[11px] text-[var(--text-faint)]">
+                <span className="w-5 shrink-0 text-right font-mono text-[11px] tabular-nums text-[var(--text-faint)]">
                   {pad2(i + 1)}
                 </span>
                 {t.thumbnail ? (
@@ -1136,7 +1343,7 @@ function PlaylistPreview({
                 <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--text)]">
                   {t.title}
                 </span>
-                <span className="shrink-0 font-mono text-[12px] text-[var(--text-dim)]">
+                <span className="w-10 shrink-0 text-right font-mono text-[12px] tabular-nums text-[var(--text-dim)]">
                   {t.duration != null ? fmtClock(t.duration) : '—'}
                 </span>
               </button>
@@ -1284,7 +1491,7 @@ function ThemeMenu({ value, onChange }) {
 function SectionLabel({ children, className = '' }) {
   return (
     <label
-      className={`section-label mb-1.5 block text-[11px] font-semibold uppercase tracking-wide text-text-muted ${className}`}
+      className={`section-label mb-1.5 inline-flex items-center text-[11px] font-semibold uppercase tracking-wide text-text-muted ${className}`}
     >
       {children}
     </label>
@@ -1393,25 +1600,34 @@ function ModeTab({ spec, active, onClick, children }) {
   if (spec) {
     return (
       <button
+        type="button"
         onClick={onClick}
-        className={`rounded-[7px] px-3 py-1 text-[12px] font-medium transition-colors ${active ? 'bg-accent-gradient text-[var(--on-accent)]' : 'text-[var(--text-dim)] hover:text-[var(--text)]'
+        className={`relative isolate h-full rounded-[7px] px-3 text-[12px] font-medium transition-colors duration-200 ${active ? 'text-[var(--on-accent)]' : 'text-[var(--text-dim)] hover:text-[var(--text)]'
           }`}
       >
-        {children}
+        {active && (
+          <motion.span
+            layoutId="preview-mode"
+            transition={{ type: 'spring', stiffness: 380, damping: 34, mass: 0.7 }}
+            className="absolute inset-0 -z-10 rounded-[7px] bg-accent-gradient"
+          />
+        )}
+        <span className="relative z-10">{children}</span>
       </button>
     )
   }
   return (
     <button
+      type="button"
       onClick={onClick}
-      className={`relative rounded-full px-3 py-1 transition-colors ${active ? 'text-white' : 'text-text-secondary hover:text-text-primary'
+      className={`relative isolate h-full rounded-full px-3 transition-colors ${active ? 'text-white' : 'text-text-secondary hover:text-text-primary'
         }`}
     >
       {active && (
         <motion.span
-          layoutId="mode-tab"
+          layoutId="preview-mode"
           transition={spring}
-          className="absolute inset-0 rounded-full bg-accent-gradient"
+          className="absolute inset-0 -z-10 rounded-full bg-accent-gradient"
         />
       )}
       <span className="relative z-10">{children}</span>

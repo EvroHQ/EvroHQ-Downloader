@@ -37,9 +37,10 @@ let mainWindow = null
 let currentChild = null
 let cancelRequested = false
 
-// Mockup window: 1052 × 697, left column 462, preview 1fr, gap 22, pad 20.
+// Mockup window: 1052 × 752, left column 462, preview 1fr, gap 22, pad 20.
+// Extra height vs 697 so Split-by-chapters fits under Trim without clipping.
 const WINDOW_WIDTH = 1052
-const WINDOW_HEIGHT = 697
+const WINDOW_HEIGHT = 752
 
 const CANCELLED = '__CANCELLED__'
 
@@ -192,7 +193,39 @@ function timestamp() {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
 }
 
+// While a download is running, watch yt-dlp output so we can tell a real
+// download from a no-op skip (file already in the output folder).
+let skipTracker = null
+
+function beginSkipTracker() {
+  skipTracker = { skipped: 0, progressed: false }
+}
+
+function endSkipTracker() {
+  const t = skipTracker
+  skipTracker = null
+  return t
+}
+
+function skippedExistingResult(isPlaylist) {
+  const t = endSkipTracker()
+  if (t && t.skipped > 0 && !t.progressed) {
+    return {
+      alreadyDownloaded: true,
+      message: isPlaylist ? 'Files already downloaded' : 'File already downloaded'
+    }
+  }
+  return null
+}
+
 function sendLog(line) {
+  if (skipTracker) {
+    if (/has already been downloaded/i.test(line)) {
+      skipTracker.skipped += 1
+    } else if (/\[download\]\s+\d+(?:\.\d+)?%/i.test(line) && !/already downloaded/i.test(line)) {
+      skipTracker.progressed = true
+    }
+  }
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send('download-log', `[${timestamp()}] ${line}`)
   }
@@ -1087,13 +1120,20 @@ ipcMain.handle('start-download', async (_event, params) => {
     chapter_count: Number.isFinite(params?.chapterCount) ? params.chapterCount : null
   }
   try {
+    beginSkipTracker()
     sendLog(`Starting ${params.format} download...`)
     await handleDownload(params)
     sendLog('Download finished successfully.')
-    sendComplete({ success: true, message: 'Download complete!' })
+    const skipped = skippedExistingResult(false)
+    sendComplete({
+      success: true,
+      message: skipped?.message || 'Download complete!',
+      alreadyDownloaded: !!skipped
+    })
     sendTelemetry('download', { ...details, success: true })
     return { success: true }
   } catch (err) {
+    endSkipTracker()
     if (err.message === CANCELLED || cancelRequested) {
       sendLog('Download cancelled by user.')
       sendComplete({ success: false, cancelled: true, message: 'Download cancelled' })
@@ -1127,13 +1167,20 @@ ipcMain.handle('start-playlist-download', async (_event, params) => {
     chapter_count: null
   }
   try {
+    beginSkipTracker()
     sendLog('Starting playlist download...')
     await handlePlaylistDownload(params)
     sendLog('Playlist download finished.')
-    sendComplete({ success: true, message: 'Playlist download complete!' })
+    const skipped = skippedExistingResult(true)
+    sendComplete({
+      success: true,
+      message: skipped?.message || 'Playlist download complete!',
+      alreadyDownloaded: !!skipped
+    })
     sendTelemetry('download', { ...details, success: true })
     return { success: true }
   } catch (err) {
+    endSkipTracker()
     if (err.message === CANCELLED || cancelRequested) {
       sendLog('Playlist download cancelled by user.')
       sendComplete({ success: false, cancelled: true, message: 'Download cancelled' })
