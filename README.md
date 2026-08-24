@@ -14,9 +14,12 @@ Everything is built in — no extra tools, no terminal, no setup.
 
 - 🎵 **Audio** — WAV (44.1 kHz, lossless) or MP3 (320 kbps)
 - 🎬 **Video** — MP4 up to **1080p / 2K / 4K** (best available, sound included)
+- 🎞️ **Compatible (H.264 + AAC)** — native YouTube streams, 1080p max, no re-encode (works in editors and players that choke on AV1)
 - 📋 **Playlists** — preview every track, pick the ones you want, download into a folder named after the playlist
+- 🔗 **Smart links** — timestamps (`&t=`) and extra params are stripped; Mix and Music albums stay playlists
 - 🖼️ **Live preview** — thumbnail, title, channel, duration and estimated file size before you download
 - ✂️ **Trim** — download only a specific time range (single videos)
+- 📑 **Split by chapters** — save each chapter as its own file when the video has chapters
 - 🏷️ **Embed metadata & cover art** — write tags into audio files (cover art needs MP3)
 - 🔄 **Updates** — the app and yt-dlp can update in-place so YouTube downloads keep working
 - 📦 **All-in-one** — yt-dlp, ffmpeg and a tiny JS runtime are bundled; nothing else to install
