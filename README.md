@@ -1,18 +1,18 @@
-# EvroHQ YouTube Downloader
+# EvroHQ Downloader
 
-A clean, modern Windows app to download **audio** or **video** from YouTube — single videos or whole playlists.
+A clean, modern Windows app to download **audio** or **video** from YouTube and SoundCloud — single videos, tracks, or whole playlists.
 
-[![Latest release](https://img.shields.io/github/v/release/EvroHQ/EvroHQ-YouTube-Downloader?label=download&logo=github)](https://github.com/EvroHQ/EvroHQ-YouTube-Downloader/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/EvroHQ/EvroHQ-Downloader?label=download&logo=github)](https://github.com/EvroHQ/EvroHQ-Downloader/releases/latest)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Buy me a coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-support-orange?logo=buymeacoffee&logoColor=white)](https://buymeacoffee.com/evrohq)
 
-![EvroHQ YouTube Downloader](docs/evrohq.png)
+![EvroHQ Downloader](docs/evrohq.png)
 
 Everything is built in — no extra tools, no terminal, no setup.
 
 ## Features
 
-- 🎵 **Audio** — WAV (44.1 kHz, lossless) or MP3 (320 kbps)
+- 🎵 **Audio** — WAV (44.1 kHz, uncompressed) or MP3 (320 kbps)
 - 🎬 **Video** — MP4 up to **1080p / 2K / 4K** (best available, sound included)
 - 🎞️ **Compatible (H.264 + AAC)** — native YouTube streams, 1080p max, no re-encode (works in editors and players that choke on AV1)
 - 📋 **Playlists** — preview every track, pick the ones you want, download into a folder named after the playlist
@@ -51,7 +51,7 @@ Open **Themes** in the header to switch. The last choice is restored when you re
 
 ## Download
 
-Get the latest version from the [**Releases page**](https://github.com/EvroHQ/EvroHQ-YouTube-Downloader/releases/latest) — installer or portable, both identical in features.
+Get the latest version from the [**Releases page**](https://github.com/EvroHQ/EvroHQ-Downloader/releases/latest) — installer or portable, both identical in features.
 
 ---
 
@@ -59,9 +59,9 @@ Get the latest version from the [**Releases page**](https://github.com/EvroHQ/Ev
 
 ### Single video
 
-1. **Paste a YouTube link** (or click **Paste**). The preview on the right fills in automatically.
+1. **Paste a YouTube or SoundCloud link** (or click **Paste**). The preview on the right fills in automatically.
 2. **Choose the format**:
-   - **Audio** → **WAV** (44.1 kHz, lossless) or **MP3** (320 kbps)
+   - **Audio** → **WAV** (44.1 kHz, uncompressed) or **MP3** (320 kbps)
    - **Video** → **1080p**, **2K**, or **4K** (best quality available up to your choice; video always includes sound)
 3. *(Optional)* Turn on **Trim a specific range** to grab only a portion.
    - Just type the digits — the field formats itself: typing `001030` becomes `00:10:30` (hh:mm:ss).

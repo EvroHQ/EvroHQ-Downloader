@@ -1,6 +1,6 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, net } from 'electron'
-import { join } from 'path'
-import { existsSync, readdirSync, unlinkSync, mkdirSync, renameSync, createWriteStream } from 'fs'
+import { join, basename, extname } from 'path'
+import { existsSync, readdirSync, unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, cpSync } from 'fs'
 import { spawn } from 'child_process'
 import { randomUUID } from 'crypto'
 import Store from 'electron-store'
@@ -17,6 +17,8 @@ const YTDLP_LATEST_API =
 const YTDLP_DOWNLOAD_URL =
   'https://github.com/yt-dlp/yt-dlp-nightly-builds/releases/latest/download/yt-dlp.exe'
 const HTTP_USER_AGENT = 'AudioVideoYouTubeDownloader'
+const SC_BROWSER_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
 
 // Anonymous, privacy-respecting usage telemetry (opt-out). These are the
 // project's PUBLIC keys — safe to embed. RLS allows INSERT only (no reads).
@@ -29,7 +31,9 @@ const store = new Store({
     telemetryEnabled: true,
     installId: '',
     theme: 'evrohq',
-    codec: 'best'
+    codec: 'best',
+    platform: 'youtube',
+    lastSeenVersion: ''
   }
 })
 
@@ -113,6 +117,84 @@ function isPlaylistUrl(value) {
   }
 }
 
+const SC_HOSTS = ['soundcloud.com', 'm.soundcloud.com', 'on.soundcloud.com', 'soundcloud.app.goo.gl']
+const SC_RESERVED = new Set([
+  'discover',
+  'stream',
+  'search',
+  'you',
+  'pages',
+  'charts',
+  'upload',
+  'signin',
+  'login',
+  'signup',
+  'feed',
+  'messages',
+  'notifications',
+  'settings',
+  'pro',
+  'premium',
+  'jobs',
+  'imprint',
+  'terms',
+  'privacy'
+])
+
+function parseHttpUrl(value) {
+  let v = String(value == null ? '' : value).trim()
+  if (!v) return null
+  if (!/^https?:\/\//i.test(v)) v = `https://${v}`
+  try {
+    return new URL(v)
+  } catch (e) {
+    return null
+  }
+}
+
+function isSoundCloudUrl(value) {
+  const u = parseHttpUrl(value)
+  if (!u) return false
+  const host = u.hostname.toLowerCase().replace(/^www\./, '')
+  return SC_HOSTS.includes(host)
+}
+
+function telemetryPlatform(url) {
+  if (isSoundCloudUrl(url)) return 'soundcloud'
+  if (url) return 'youtube'
+  return null
+}
+
+// Playlists, albums, artist pages, likes — anything yt-dlp treats as a list.
+function isSoundCloudCollectionUrl(value) {
+  const u = parseHttpUrl(value)
+  if (!u || !isSoundCloudUrl(value)) return false
+  const host = u.hostname.toLowerCase().replace(/^www\./, '')
+  if (host === 'on.soundcloud.com' || host === 'soundcloud.app.goo.gl') return false
+  const parts = u.pathname.replace(/\/+$/, '').split('/').filter(Boolean)
+  if (!parts.length) return false
+  const joined = parts.join('/').toLowerCase()
+  if (parts.includes('sets') || parts.includes('albums') || parts.includes('likes')) return true
+  if (parts[0] === 'you') return parts[1] === 'likes' || parts[1] === 'sets' || parts[1] === 'albums'
+  if (parts.length === 1) return !SC_RESERVED.has(parts[0].toLowerCase())
+  if (parts.length === 2) {
+    const second = parts[1].toLowerCase()
+    return ['tracks', 'popular-tracks', 'sets', 'albums', 'reposts', 'likes', 'comments'].includes(
+      second
+    )
+  }
+  return /\/(sets|albums|likes)(\/|$)/i.test(joined)
+}
+
+// A concrete set/album URL (/user/sets/slug), not the user's list of sets.
+function isSoundCloudSetUrl(value) {
+  const u = parseHttpUrl(value)
+  if (!u || !isSoundCloudUrl(value)) return false
+  const parts = u.pathname.replace(/\/+$/, '').split('/').filter(Boolean)
+  const i = parts.findIndex((p) => p.toLowerCase() === 'sets' || p.toLowerCase() === 'albums')
+  return i >= 1 && parts.length > i + 1
+}
+
 function getBundledBinPath(name) {
   const root = app.isPackaged ? process.resourcesPath : join(app.getAppPath(), 'resources')
   return join(root, 'bin', name)
@@ -123,6 +205,31 @@ function getBundledBinPath(name) {
 // isn't reliable — instead we drop the newer copy here and prefer it.
 function getUserBinDir() {
   return join(app.getPath('userData'), 'bin')
+}
+
+// productName used to be "EvroHQ YouTube Downloader" — keep settings / in-app
+// yt-dlp updates when the display name changes.
+function migrateOldUserData() {
+  const dest = app.getPath('userData')
+  const destCfg = join(dest, 'config.json')
+  if (existsSync(destCfg)) return
+  const appData = app.getPath('appData')
+  const oldDirs = [
+    join(appData, 'EvroHQ YouTube Downloader'),
+    join(appData, 'evrohq-youtube-downloader')
+  ]
+  for (const src of oldDirs) {
+    if (src === dest || !existsSync(src)) continue
+    mkdirSync(dest, { recursive: true })
+    const srcCfg = join(src, 'config.json')
+    if (existsSync(srcCfg)) copyFileSync(srcCfg, destCfg)
+    const srcBin = join(src, 'bin')
+    const destBin = join(dest, 'bin')
+    if (existsSync(srcBin) && !existsSync(destBin)) {
+      cpSync(srcBin, destBin, { recursive: true })
+    }
+    return
+  }
 }
 
 /**
@@ -157,7 +264,7 @@ function createWindow() {
     show: false,
     autoHideMenuBar: true,
     backgroundColor: '#0a0a0a',
-    title: 'EvroHQ Youtube Downloader',
+    title: 'EvroHQ Downloader',
     icon: appIcon,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -198,7 +305,7 @@ function timestamp() {
 let skipTracker = null
 
 function beginSkipTracker() {
-  skipTracker = { skipped: 0, progressed: false }
+  skipTracker = { skipped: 0, progressed: false, lastDest: '' }
 }
 
 function endSkipTracker() {
@@ -218,12 +325,67 @@ function skippedExistingResult(isPlaylist) {
   return null
 }
 
+function alreadyDownloadedLine(line) {
+  return /already been downloaded|already been recorded|already fully downloaded|file is already in target format/i.test(
+    line
+  )
+}
+
+// Pin the final extension so --no-overwrites checks the file the user already
+// has (Song.wav) instead of the intermediate stream (Song.webm) that -x would
+// otherwise fetch again and convert.
+function mediaOutputTemplate(playlist, ext) {
+  const file = ext ? `%(title)s.${ext}` : '%(title)s.%(ext)s'
+  return playlist ? `%(playlist_title)s/${file}` : file
+}
+
+const AUDIO_EXTS = ['.m4a', '.mp3', '.aac', '.opus', '.ogg', '.wav', '.flac', '.mp4', '.webm', '.mpga']
+
+function stemKey(name) {
+  return String(name || '')
+    .toLowerCase()
+    .replace(/\.[^.]+$/, '')
+    .replace(/[<>:"/\\|?*._\-–—'’,]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function existingOutputForTitle(outputFolder, title, ext) {
+  if (!title || !outputFolder || !existsSync(outputFolder)) return null
+  const base = sanitizeFilename(title)
+  const wanted = ext
+    ? [`.${String(ext).replace(/^\./, '').toLowerCase()}`]
+    : AUDIO_EXTS
+  for (const e of wanted) {
+    const p = join(outputFolder, `${base}${e}`)
+    if (existsSync(p)) return p
+  }
+  const want = stemKey(base)
+  if (!want) return null
+  try {
+    for (const name of readdirSync(outputFolder)) {
+      const e = extname(name).toLowerCase()
+      if (!wanted.includes(e)) continue
+      if (stemKey(basename(name, e)) === want) return join(outputFolder, name)
+    }
+  } catch (e) {
+    // ignore unreadable folders
+  }
+  return null
+}
+
 function sendLog(line) {
   if (skipTracker) {
-    if (/has already been downloaded/i.test(line)) {
+    if (alreadyDownloadedLine(line)) {
       skipTracker.skipped += 1
-    } else if (/\[download\]\s+\d+(?:\.\d+)?%/i.test(line) && !/already downloaded/i.test(line)) {
-      skipTracker.progressed = true
+    } else if (/\[download\].*Destination:/i.test(line)) {
+      skipTracker.lastDest = line
+    } else if (/\[download\]\s+(\d+(?:\.\d+)?)%/i.test(line)) {
+      // Cover-art / thumbnail fetches also print [download] % — those are not
+      // a real media download and must not hide the "already downloaded" toast.
+      if (!/\.(jpe?g|png|webp)/i.test(skipTracker.lastDest || '')) {
+        skipTracker.progressed = true
+      }
     }
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -249,10 +411,13 @@ function sendAppUpdate(payload) {
 
 // GET a URL and resolve with its body as text. Uses Electron's net module so
 // it honours the system proxy and follows redirects automatically.
-function fetchText(url) {
+function fetchText(url, { ua = HTTP_USER_AGENT, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
     const request = net.request({ url, redirect: 'follow' })
-    request.setHeader('User-Agent', HTTP_USER_AGENT)
+    request.setHeader('User-Agent', ua)
+    for (const [key, value] of Object.entries(headers)) {
+      if (value) request.setHeader(key, value)
+    }
     request.on('response', (response) => {
       let data = ''
       response.on('data', (c) => (data += c.toString('utf-8')))
@@ -532,6 +697,371 @@ async function fetchPlaylistInfo(ytdlp, url) {
   } catch (e) {
     return null
   }
+}
+
+// SoundCloud's "-original" size often 404s; t500x500 is the reliable large art.
+function upgradeSoundCloudArt(url) {
+  if (!url || typeof url !== 'string') return url
+  let next = url.trim()
+  if (next.startsWith('//')) next = `https:${next}`
+  else if (next.startsWith('http://')) next = `https://${next.slice(7)}`
+  return next.replace(
+    /-(tiny|small|badge|mini|t50x50|t67x67|t120x120|t200x200|t300x300|large|crop|original)(\.(?:jpg|jpeg|png|webp))(?:\?.*)?$/i,
+    '-t500x500$2'
+  )
+}
+
+function soundCloudThumb(entry) {
+  if (!entry) return null
+  const urls = []
+  if (Array.isArray(entry.thumbnails)) {
+    for (const t of entry.thumbnails) {
+      if (t?.url) urls.push(t.url)
+    }
+  }
+  if (entry.thumbnail) urls.push(entry.thumbnail)
+  if (entry.artwork_url) urls.push(entry.artwork_url)
+  if (!urls.length) return null
+
+  const score = (u) => {
+    if (/artworks/i.test(u) && /t500x500/i.test(u)) return 80
+    if (/artworks/i.test(u)) return 70
+    if (/t500x500/i.test(u)) return 50
+    if (/t300x300|crop/i.test(u)) return 40
+    if (/-large/i.test(u)) return 30
+    if (/-original/i.test(u)) return 5
+    return 20
+  }
+  urls.sort((a, b) => score(b) - score(a))
+  return upgradeSoundCloudArt(urls[0])
+}
+
+// SoundCloud's public playlist page lists every track; yt-dlp's full extract
+// drops items that 403 / have no anonymous stream. We read the same hydration
+// blob the website uses, then fill stub entries via api-v2 /tracks?ids=.
+let scClientId = null
+
+function parseSoundCloudHydration(html) {
+  if (!html) return null
+  const m = html.match(/window\.__sc_hydration\s*=\s*(\[[\s\S]*?\]);/)
+  if (!m) return null
+  try {
+    return JSON.parse(m[1])
+  } catch (e) {
+    return null
+  }
+}
+
+async function soundCloudClientId(html) {
+  if (scClientId) return scClientId
+  const fromPage = html && html.match(/client_id["']?\s*[:=]\s*["']([0-9a-zA-Z]{32})["']/)
+  if (fromPage) {
+    scClientId = fromPage[1]
+    return scClientId
+  }
+  const srcs = html
+    ? [...html.matchAll(/src="(https:\/\/(?:a-v2\.sndcdn\.com|soundcloud\.com)\/[^"]+\.js[^"]*)"/gi)].map(
+        (m) => m[1]
+      )
+    : []
+  for (const src of srcs) {
+    try {
+      const res = await fetchText(src, { ua: SC_BROWSER_UA })
+      const hit = res.body && res.body.match(/client_id["']?\s*[:=]\s*["']([0-9a-zA-Z]{32})["']/)
+      if (hit) {
+        scClientId = hit[1]
+        return scClientId
+      }
+    } catch (e) {
+      // try the next bundle
+    }
+  }
+  return null
+}
+
+async function soundCloudHydrateTracks(clientId, ids) {
+  const map = new Map()
+  const unique = [...new Set(ids.map((id) => String(id)).filter(Boolean))]
+  for (let i = 0; i < unique.length; i += 50) {
+    const chunk = unique.slice(i, i + 50)
+    const url =
+      `https://api-v2.soundcloud.com/tracks?ids=${chunk.join(',')}&client_id=${encodeURIComponent(clientId)}`
+    try {
+      const res = await fetchText(url, {
+        ua: SC_BROWSER_UA,
+        headers: { Accept: 'application/json', Referer: 'https://soundcloud.com/' }
+      })
+      if (res.status === 401 || res.status === 403) {
+        scClientId = null
+        return map
+      }
+      const arr = JSON.parse(res.body)
+      if (!Array.isArray(arr)) continue
+      for (const t of arr) {
+        if (t?.id != null) map.set(String(t.id), t)
+      }
+    } catch (e) {
+      // keep whatever we already hydrated
+    }
+  }
+  return map
+}
+
+function soundCloudProtocol(t) {
+  return String(t?.format?.protocol || '')
+}
+
+function soundCloudIsEncryptedProtocol(proto) {
+  return /encrypted|^cbc-|^ctr-/i.test(proto)
+}
+
+function soundCloudClearTranscodings(track) {
+  return ((track?.media && track.media.transcodings) || []).filter(
+    (t) => t?.url && !soundCloudIsEncryptedProtocol(soundCloudProtocol(t))
+  )
+}
+
+async function soundCloudClearStreamResolves(clientId, transcoding) {
+  const sep = transcoding.url.includes('?') ? '&' : '?'
+  const url = `${transcoding.url}${sep}client_id=${encodeURIComponent(clientId)}`
+  try {
+    const res = await fetchText(url, {
+      ua: SC_BROWSER_UA,
+      headers: { Accept: 'application/json', Referer: 'https://soundcloud.com/' }
+    })
+    if (res.status !== 200 || !res.body) return false
+    const j = JSON.parse(res.body)
+    return Boolean(j?.url)
+  } catch (e) {
+    return false
+  }
+}
+
+// Major-label / GO+ tracks often list fake mp3 transcodings that 404; the only
+// working streams are FairPlay/Widevine HLS. Those cannot be saved.
+async function soundCloudTrackIsProtected(clientId, track) {
+  const trans = (track?.media && track.media.transcodings) || []
+  if (!trans.length) return false
+  const clear = soundCloudClearTranscodings(track)
+  const encrypted = trans.some((t) => soundCloudIsEncryptedProtocol(soundCloudProtocol(t)))
+  if (!encrypted) return false
+  if (!clear.length) return true
+  if (!clientId) return true
+  for (const t of clear) {
+    if (await soundCloudClearStreamResolves(clientId, t)) return false
+  }
+  return true
+}
+
+function soundCloudTrackFromApi(e, i) {
+  const user = e.user || {}
+  const ms = Number.isFinite(e.duration) ? e.duration : null
+  return soundCloudTrackFromEntry(
+    {
+      id: e.id,
+      title: e.title,
+      uploader: user.username || user.full_name || e.publisher_metadata?.artist,
+      duration: ms == null ? null : ms / 1000,
+      artwork_url: e.artwork_url || user.avatar_url,
+      thumbnail: e.artwork_url,
+      webpage_url: e.permalink_url,
+      url: e.permalink_url,
+      view_count: e.playback_count,
+      play_count: e.playback_count
+    },
+    i
+  )
+}
+
+async function fetchSoundCloudSetFromWeb(url) {
+  const res = await fetchText(url, {
+    ua: SC_BROWSER_UA,
+    headers: { Accept: 'text/html', Referer: 'https://soundcloud.com/' }
+  })
+  if (!res?.body) return null
+  const hydration = parseSoundCloudHydration(res.body)
+  const pl = hydration?.find((x) => x?.hydratable === 'playlist')?.data
+  const raw = Array.isArray(pl?.tracks) ? pl.tracks.filter((t) => t?.id != null) : []
+  if (!raw.length) return null
+
+  const clientId = await soundCloudClientId(res.body)
+  if (clientId) {
+    const extra = await soundCloudHydrateTracks(
+      clientId,
+      raw.map((t) => t.id)
+    )
+    for (const t of raw) {
+      const full = extra.get(String(t.id))
+      if (full) Object.assign(t, full)
+    }
+  }
+
+  const protectedFlags = await Promise.all(
+    raw.map((t) => soundCloudTrackIsProtected(clientId, t))
+  )
+
+  const tracks = raw.map((e, i) => ({
+    ...soundCloudTrackFromApi(e, i),
+    protected: !!protectedFlags[i]
+  }))
+  const totalPlays = tracks.reduce((n, t) => n + (t.plays || 0), 0)
+  return {
+    kind: 'playlist',
+    title: pl.title || 'Playlist',
+    artist: pl.user?.username || pl.user?.full_name || null,
+    count: tracks.length,
+    plays: Number.isFinite(pl.playback_count) ? pl.playback_count : totalPlays || null,
+    cover: soundCloudThumb(pl) || tracks[0]?.thumbnail || null,
+    tracks
+  }
+}
+
+function parseYtdlpJson(out) {
+  if (!out) return null
+  const jsonText = out.replace(/^[^{[]+/, '').trim()
+  try {
+    return JSON.parse(jsonText)
+  } catch (e) {
+    return null
+  }
+}
+
+function soundCloudPlays(e) {
+  if (!e) return null
+  if (Number.isFinite(e.view_count)) return e.view_count
+  if (Number.isFinite(e.play_count)) return e.play_count
+  if (Number.isFinite(e.playback_count)) return e.playback_count
+  return null
+}
+
+function soundCloudTrackFromEntry(e, i) {
+  const title = e.title && e.title !== 'NA' ? e.title : `Track ${i + 1}`
+  return {
+    id: e.id != null && e.id !== '' ? String(e.id) : e.ie_key && e.url ? `${e.ie_key}:${e.url}` : String(i),
+    url: e.url || e.webpage_url || e.id || null,
+    title,
+    artist: e.uploader || e.artist || e.creator || null,
+    duration: Number.isFinite(e.duration) ? e.duration : null,
+    thumbnail: soundCloudThumb(e),
+    plays: soundCloudPlays(e)
+  }
+}
+
+function mergeSoundCloudPlaylist(flat, full) {
+  const richById = new Map()
+  const rich = (full?.entries || []).filter(Boolean)
+  for (const e of rich) {
+    if (e.id != null) richById.set(String(e.id), e)
+    const href = e.webpage_url || e.url
+    if (href) richById.set(String(href).replace(/\/+$/, ''), e)
+  }
+  const stubsFlat = (flat?.entries || []).filter(Boolean)
+  const stubs = stubsFlat.length >= rich.length ? stubsFlat : rich
+  const tracks = stubs.map((e, i) => {
+    const href = (e.webpage_url || e.url || '').replace(/\/+$/, '')
+    const extra = (e.id != null && richById.get(String(e.id))) || (href && richById.get(href)) || {}
+    return soundCloudTrackFromEntry({ ...e, ...extra }, i)
+  })
+  const src = full || flat || {}
+  const totalPlays = tracks.reduce((n, t) => n + (t.plays || 0), 0)
+  return {
+    kind: 'playlist',
+    title: src.title || src.playlist_title || flat?.title || 'Playlist',
+    artist: src.uploader || src.playlist_uploader || src.channel || null,
+    count: tracks.length,
+    plays: Number.isFinite(src.view_count) ? src.view_count : totalPlays || null,
+    cover: soundCloudThumb(src) || tracks[0]?.thumbnail || null,
+    tracks
+  }
+}
+
+async function dumpSoundCloudJson(ytdlp, url, extraArgs = []) {
+  return parseYtdlpJson(
+    await getProcessOutput(ytdlp, [
+      ...getJsRuntimeArgs(),
+      '--skip-download',
+      '--yes-playlist',
+      '--ignore-errors',
+      '--no-warnings',
+      ...extraArgs,
+      '--dump-single-json',
+      url
+    ])
+  )
+}
+
+// SoundCloud track or playlist metadata. Sets are read from the public page so
+// we keep every track the website shows — yt-dlp's full dump drops items that
+// fail format extraction (geo / GO+ / 403), which is why a set can look short.
+async function fetchSoundCloudMeta(ytdlp, url) {
+  if (isSoundCloudSetUrl(url)) {
+    try {
+      const fromWeb = await fetchSoundCloudSetFromWeb(url)
+      if (fromWeb?.tracks?.length) return fromWeb
+    } catch (e) {
+      // fall through to yt-dlp
+    }
+  }
+
+  const collection = isSoundCloudCollectionUrl(url)
+  const fullP = dumpSoundCloudJson(ytdlp, url)
+  const flatP = collection
+    ? dumpSoundCloudJson(ytdlp, url, ['--flat-playlist'])
+    : Promise.resolve(null)
+  const [full, flat] = await Promise.all([fullP, flatP])
+  if (!full && !flat) return null
+
+  const src = full || flat
+  const entries = Array.isArray(src.entries) ? src.entries.filter(Boolean) : []
+  const asPlaylist =
+    src._type === 'playlist' ||
+    (entries.length > 0 && collection) ||
+    (flat && Array.isArray(flat.entries) && flat.entries.length > 1)
+
+  if (asPlaylist) return mergeSoundCloudPlaylist(flat, full)
+
+  return {
+    kind: 'track',
+    id: src.id || null,
+    title: src.title || null,
+    artist: src.uploader || src.artist || src.creator || src.channel || null,
+    duration: Number.isFinite(src.duration) ? src.duration : null,
+    thumbnail: soundCloudThumb(src),
+    genre: src.genre || null,
+    plays: soundCloudPlays(src)
+  }
+}
+
+function soundCloudPlaylistItems(params) {
+  if (Array.isArray(params?.selectedTracks) && params.selectedTracks.length) {
+    return params.selectedTracks
+      .map((n) => Number(n))
+      .filter((n) => Number.isFinite(n) && n > 0)
+      .join(',')
+  }
+  if (typeof params?.playlistItems === 'string') return params.playlistItems.trim()
+  return ''
+}
+
+function isSoundCloudTrackUrl(value) {
+  const u = parseHttpUrl(value)
+  if (!u) return false
+  const host = u.hostname.toLowerCase().replace(/^www\./, '')
+  if (host === 'api-v2.soundcloud.com' || host === 'api.soundcloud.com') {
+    return /\/tracks\/\d+/i.test(u.pathname)
+  }
+  return isSoundCloudUrl(value)
+}
+
+function soundCloudTrackUrls(params) {
+  if (!Array.isArray(params?.trackUrls)) return []
+  return params.trackUrls.map((u) => String(u || '').trim()).filter((u) => isSoundCloudTrackUrl(u))
+}
+
+function soundCloudPlaylistOutputTemplate(params, ext) {
+  const file = ext ? `%(title)s.${ext}` : '%(title)s.%(ext)s'
+  const folder = sanitizeFilename(params?.title, 'playlist').replace(/%/g, '_')
+  return `${folder}/${file}`
 }
 
 /**
@@ -856,6 +1386,11 @@ async function handleDownload(params) {
   }
 
   if (format === 'audio' && !useRange) {
+    const already = existingOutputForTitle(outputFolder, params.title, audioFormat)
+    if (already) {
+      sendLog(`${already} has already been downloaded`)
+      return
+    }
     // Direct audio extraction to the chosen format.
     const args = [...jsArgs, '-x', '--no-playlist', '--audio-format', audioFormat, '--ffmpeg-location', ffmpeg]
     if (audioFormat === 'mp3') {
@@ -871,8 +1406,8 @@ async function handleDownload(params) {
       if (audioFormat === 'mp3') args.push('--embed-thumbnail', '--convert-thumbnails', 'jpg')
       sendLog(`Embedding metadata${audioFormat === 'mp3' ? ' + cover art' : ''}.`)
     }
-    args.push('--windows-filenames', '--trim-filenames', '200')
-    args.push('-o', '%(title)s.%(ext)s', url)
+    args.push('--windows-filenames', '--trim-filenames', '200', '--no-overwrites')
+    args.push('-o', mediaOutputTemplate(false, audioFormat), url)
     await runBinary(ytdlp, args, outputFolder)
     return
   }
@@ -901,6 +1436,11 @@ async function handleDownload(params) {
   }
 
   if (format === 'video' && !useRange) {
+    const already = existingOutputForTitle(outputFolder, params.title, 'mp4')
+    if (already) {
+      sendLog(`${already} has already been downloaded`)
+      return
+    }
     await runBinary(
       ytdlp,
       [
@@ -915,8 +1455,9 @@ async function handleDownload(params) {
         '--windows-filenames',
         '--trim-filenames',
         '200',
+        '--no-overwrites',
         '-o',
-        '%(title)s.%(ext)s',
+        mediaOutputTemplate(false, 'mp4'),
         url
       ],
       outputFolder
@@ -1007,7 +1548,8 @@ async function handlePlaylistDownload(params) {
     ffmpeg,
     '--windows-filenames',
     '--trim-filenames',
-    '200'
+    '200',
+    '--no-overwrites'
   ]
   if (playlistItems) args.push('--playlist-items', playlistItems)
 
@@ -1033,7 +1575,7 @@ async function handlePlaylistDownload(params) {
   }
 
   // Subfolder named after the playlist, one file per track inside it.
-  args.push('-o', '%(playlist_title)s/%(title)s.%(ext)s', url)
+  args.push('-o', mediaOutputTemplate(true, format === 'audio' ? audioFormat : 'mp4'), url)
 
   try {
     await runBinary(ytdlp, args, outputFolder)
@@ -1046,6 +1588,182 @@ async function handlePlaylistDownload(params) {
       return
     }
     throw err
+  }
+}
+
+async function handleSoundCloudDownload(params, { playlist } = { playlist: false }) {
+  const url = params?.url
+  if (!isSoundCloudUrl(url)) {
+    throw new Error('Please paste a valid SoundCloud link.')
+  }
+
+  const format = params?.format === 'wav' ? 'wav' : 'original'
+  const ytdlp = getBinPath('yt-dlp.exe')
+  const ffmpeg = getBinPath('ffmpeg.exe')
+  const jsArgs = getJsRuntimeArgs()
+  const outputFolder = store.get('outputFolder') || app.getPath('downloads')
+
+  if (!existsSync(ytdlp)) {
+    throw new Error(
+      'yt-dlp.exe could not be found. If you have antivirus software, it may have ' +
+        'quarantined it (a common false positive) — restore/allow the file, or reinstall the app.'
+    )
+  }
+  if (format === 'wav' && !existsSync(ffmpeg)) {
+    throw new Error('ffmpeg.exe is missing from the bundled resources.')
+  }
+
+  if (!playlist) {
+    let already = existingOutputForTitle(
+      outputFolder,
+      params.title,
+      format === 'wav' ? 'wav' : null
+    )
+    if (!already && format !== 'wav') {
+      const printed = await getProcessOutput(ytdlp, [
+        ...jsArgs,
+        '--windows-filenames',
+        '--trim-filenames',
+        '200',
+        '--no-playlist',
+        '-f',
+        'bestaudio',
+        '-o',
+        mediaOutputTemplate(false, null),
+        '--skip-download',
+        '--print',
+        'filename',
+        url
+      ])
+      const rel = (printed || '')
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .find((l) => l && !/^ERROR/i.test(l) && !l.startsWith('{'))
+      if (rel && existsSync(join(outputFolder, rel))) already = join(outputFolder, rel)
+    }
+    if (already) {
+      sendLog(`${already} has already been downloaded`)
+      return
+    }
+  }
+
+  sendLog('Platform: SoundCloud')
+  const skippedNames = Array.isArray(params?.skippedTracks)
+    ? params.skippedTracks.map((s) => String(s || '').trim()).filter(Boolean)
+    : []
+  if (playlist && skippedNames.length) {
+    sendLog(
+      `${skippedNames.length} track${skippedNames.length === 1 ? '' : 's'} skipped — DRM-protected on SoundCloud (not downloadable): ${skippedNames.join(', ')}`
+    )
+  }
+  const label = params?.title
+    ? params.artist
+      ? `${params.title} by ${params.artist}`
+      : params.title
+    : null
+  if (playlist) {
+    const n = Number.isFinite(params?.itemCount) ? params.itemCount : null
+    sendLog(
+      `Downloading: ${label || 'playlist'}${n ? ` (${n} track${n === 1 ? '' : 's'})` : ''}...`
+    )
+  } else {
+    sendLog(`Downloading: ${label || 'SoundCloud track'}...`)
+  }
+  sendLog(format === 'wav' ? 'Format: WAV uncompressed' : 'Format: Original · best available')
+
+  const args = [
+    ...jsArgs,
+    '--windows-filenames',
+    '--trim-filenames',
+    '200',
+    '--no-overwrites'
+  ]
+
+  const trackUrls = playlist ? soundCloudTrackUrls(params) : []
+
+  if (playlist && trackUrls.length) {
+    // Permalinks, not playlist indexes: yt-dlp's set extract uses api-v2
+    // /tracks/ID for stubs, and those 403 even when the public page streams.
+    args.push('--no-playlist', '--ignore-errors')
+  } else if (playlist) {
+    args.push('--yes-playlist', '--ignore-errors')
+    const items = soundCloudPlaylistItems(params)
+    if (items) args.push('--playlist-items', items)
+  } else {
+    args.push('--no-playlist')
+  }
+
+  if (format === 'wav') {
+    args.push('-x', '--audio-format', 'wav', '--ffmpeg-location', ffmpeg)
+    args.push('--postprocessor-args', 'ffmpeg:-ar 44100 -ac 2 -c:a pcm_s16le')
+  } else {
+    args.push('-f', 'bestaudio/best')
+  }
+
+  const outTmpl = playlist
+    ? soundCloudPlaylistOutputTemplate(params, format === 'wav' ? 'wav' : null)
+    : mediaOutputTemplate(false, format === 'wav' ? 'wav' : null)
+  args.push('-o', outTmpl)
+  if (playlist && trackUrls.length) args.push(...trackUrls)
+  else args.push(url)
+
+  try {
+    await runBinary(ytdlp, args, outputFolder)
+  } catch (err) {
+    if (err.message === CANCELLED || cancelRequested) throw err
+    if (playlist && /exited with code/i.test(err.message)) {
+      sendLog('Some items could not be downloaded and were skipped — see the log above.')
+      return
+    }
+    throw err
+  }
+}
+
+async function runSoundCloudIpc(params, { playlist }) {
+  cancelRequested = false
+  const itemCount = playlist
+    ? Number.isFinite(params?.itemCount)
+      ? params.itemCount
+      : Array.isArray(params?.selectedTracks)
+        ? params.selectedTracks.length
+        : null
+    : 1
+  const details = {
+    platform: telemetryPlatform(params?.url),
+    url: params?.url || null,
+    format: params?.format === 'wav' ? 'wav' : 'original',
+    quality: params?.format === 'wav' ? 'wav' : 'original',
+    codec: null,
+    playlist: !!playlist,
+    item_count: itemCount || 1,
+    trim: false,
+    by_chapters: false,
+    chapter_count: null
+  }
+  try {
+    beginSkipTracker()
+    await handleSoundCloudDownload(params, { playlist })
+    sendLog(playlist ? 'Playlist download finished.' : 'Download finished successfully.')
+    const skipped = skippedExistingResult(playlist)
+    sendComplete({
+      success: true,
+      message: skipped?.message || (playlist ? 'Playlist download complete!' : 'Download complete!'),
+      alreadyDownloaded: !!skipped
+    })
+    sendTelemetry('download', { ...details, success: true })
+    return { success: true }
+  } catch (err) {
+    endSkipTracker()
+    if (err.message === CANCELLED || cancelRequested) {
+      sendLog(playlist ? 'Playlist download cancelled by user.' : 'Download cancelled by user.')
+      sendComplete({ success: false, cancelled: true, message: 'Download cancelled' })
+      sendTelemetry('download', { ...details, success: false, error: 'cancelled' })
+      return { success: false, cancelled: true }
+    }
+    sendLog(`ERROR: ${err.message}`)
+    sendComplete({ success: false, message: err.message })
+    sendTelemetry('download', { ...details, success: false, error: err.message })
+    return { success: false, error: err.message }
   }
 }
 
@@ -1074,12 +1792,15 @@ const THEME_IDS = [
 
 ipcMain.handle('get-config', () => {
   const theme = store.get('theme')
+  const platform = store.get('platform')
   return {
     outputFolder: store.get('outputFolder') || app.getPath('downloads'),
     version: app.getVersion(),
     telemetryEnabled: store.get('telemetryEnabled') !== false,
     theme: THEME_IDS.includes(theme) ? theme : 'evrohq',
-    codec: store.get('codec') === 'h264' ? 'h264' : 'best'
+    codec: store.get('codec') === 'h264' ? 'h264' : 'best',
+    platform: platform === 'soundcloud' ? 'soundcloud' : 'youtube',
+    lastSeenVersion: typeof store.get('lastSeenVersion') === 'string' ? store.get('lastSeenVersion') : ''
   }
 })
 
@@ -1096,6 +1817,12 @@ ipcMain.handle('set-config', (_event, cfg) => {
   if (cfg && (cfg.codec === 'best' || cfg.codec === 'h264')) {
     store.set('codec', cfg.codec)
   }
+  if (cfg && (cfg.platform === 'youtube' || cfg.platform === 'soundcloud')) {
+    store.set('platform', cfg.platform)
+  }
+  if (cfg && typeof cfg.lastSeenVersion === 'string') {
+    store.set('lastSeenVersion', cfg.lastSeenVersion)
+  }
   return true
 })
 
@@ -1109,6 +1836,7 @@ ipcMain.handle('track-link', (_event, which) => {
 ipcMain.handle('start-download', async (_event, params) => {
   cancelRequested = false
   const details = {
+    platform: telemetryPlatform(params?.url),
     url: params?.url || null,
     format: params?.format || null,
     quality: params?.format === 'audio' ? params?.audioFormat || null : params?.videoQuality || null,
@@ -1155,6 +1883,7 @@ ipcMain.handle('start-playlist-download', async (_event, params) => {
       ? params.playlistItems.split(',').filter((s) => s.trim()).length
       : null
   const details = {
+    platform: telemetryPlatform(params?.url),
     url: params?.url || null,
     format: params?.format || null,
     quality:
@@ -1240,6 +1969,42 @@ ipcMain.handle('get-playlist-info', async (_event, url) => {
     return { error: e.message }
   }
 })
+
+ipcMain.handle('fetch-metadata', async (_event, params) => {
+  try {
+    const url = params?.url
+    const platform = params?.platform === 'soundcloud' ? 'soundcloud' : 'youtube'
+    const ytdlp = getBinPath('yt-dlp.exe')
+    if (!existsSync(ytdlp)) return { error: 'yt-dlp is missing.' }
+
+    if (platform === 'soundcloud') {
+      if (!isSoundCloudUrl(url)) return { error: 'Please paste a valid SoundCloud link.' }
+      const meta = await fetchSoundCloudMeta(ytdlp, url)
+      if (!meta) return { error: 'Could not load SoundCloud details.' }
+      return meta
+    }
+
+    if (isPlaylistUrl(url)) {
+      const info = await fetchPlaylistInfo(ytdlp, url)
+      if (!info) return { error: 'Could not load playlist details.' }
+      return { kind: 'playlist', ...info }
+    }
+    if (!isYouTubeUrl(url)) return { error: 'Please paste a valid YouTube link.' }
+    const info = await fetchVideoInfo(ytdlp, url)
+    if (!info) return { error: 'Could not load video details.' }
+    return { kind: 'track', ...info, artist: info.channel }
+  } catch (e) {
+    return { error: e.message }
+  }
+})
+
+ipcMain.handle('start-soundcloud-download', (_event, params) =>
+  runSoundCloudIpc(params, { playlist: false })
+)
+
+ipcMain.handle('start-soundcloud-playlist-download', (_event, params) =>
+  runSoundCloudIpc(params, { playlist: true })
+)
 
 // Compare the bundled/updated yt-dlp version against the latest GitHub release.
 ipcMain.handle('check-ytdlp-update', async () => {
@@ -1335,6 +2100,7 @@ function setupAutoUpdater() {
 // App lifecycle
 // ---------------------------------------------------------------------------
 app.whenReady().then(() => {
+  migrateOldUserData()
   // Ensures Windows uses our icon (not the default Electron one) in the taskbar.
   if (process.platform === 'win32') {
     app.setAppUserModelId('com.evrohq.ytdownloader')
@@ -1353,7 +2119,7 @@ app.whenReady().then(() => {
       sendLog('ERROR: ffmpeg.exe not found at ' + ffmpeg + ' — the build is incomplete.')
     }
     if (existsSync(ytdlp) && existsSync(ffmpeg)) {
-      sendLog('Ready. Binaries detected. Paste a YouTube URL to begin.')
+      sendLog('Ready. Binaries detected. Paste a YouTube or SoundCloud URL to begin.')
     }
   }, 800)
 

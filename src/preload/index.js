@@ -10,6 +10,10 @@ const api = {
   getChapters: (url) => ipcRenderer.invoke('get-chapters', url),
   getVideoInfo: (url) => ipcRenderer.invoke('get-video-info', url),
   getPlaylistInfo: (url) => ipcRenderer.invoke('get-playlist-info', url),
+  fetchMetadata: (params) => ipcRenderer.invoke('fetch-metadata', params),
+  startSoundCloudDownload: (params) => ipcRenderer.invoke('start-soundcloud-download', params),
+  startSoundCloudPlaylistDownload: (params) =>
+    ipcRenderer.invoke('start-soundcloud-playlist-download', params),
   checkYtdlpUpdate: () => ipcRenderer.invoke('check-ytdlp-update'),
   updateYtdlp: () => ipcRenderer.invoke('update-ytdlp'),
   installUpdate: () => ipcRenderer.invoke('install-update'),

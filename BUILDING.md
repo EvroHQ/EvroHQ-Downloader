@@ -1,6 +1,6 @@
 # Building from source
 
-Developer notes for building **EvroHQ YouTube Downloader** (Electron + React + Tailwind, packaged with electron-builder).
+Developer notes for building **EvroHQ Downloader** (Electron + React + Tailwind, packaged with electron-builder).
 
 ## Prerequisites
 
@@ -83,8 +83,8 @@ npm run build:win
 
 Output goes to `release/`:
 
-- `EvroHQ YouTube Downloader-Setup-2.2.0.exe` (NSIS installer)
-- `EvroHQ YouTube Downloader-Portable-2.2.0.exe` (portable)
+- `EvroHQ Downloader-Setup-2.3.0.exe` (NSIS installer)
+- `EvroHQ Downloader-Portable-2.3.0.exe` (portable)
 
 ### Known issue: winCodeSign symlink extraction on Windows
 

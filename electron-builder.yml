@@ -1,5 +1,5 @@
 appId: com.evrohq.ytdownloader
-productName: EvroHQ YouTube Downloader
+productName: EvroHQ Downloader
 # Highest compression for both the NSIS installer and the portable build.
 # `compression` is a global electron-builder setting (no per-target key exists);
 # it applies to every configured target. Trades a bit of build time for size.
@@ -51,4 +51,5 @@ portable:
 publish:
   provider: github
   owner: EvroHQ
-  repo: EvroHQ-YouTube-Downloader
+  repo: EvroHQ-Downloader
+  releaseType: draft

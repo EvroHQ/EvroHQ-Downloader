@@ -1,21 +1,21 @@
 {
-  "name": "evrohq-youtube-downloader",
-  "version": "2.2.0",
-  "description": "EvroHQ YouTube Downloader — download audio, video or playlists from YouTube, with optional trimming, powered by yt-dlp and ffmpeg.",
+  "name": "evrohq-downloader",
+  "version": "2.3.0",
+  "description": "EvroHQ Downloader — download audio, video or playlists from YouTube and SoundCloud, powered by yt-dlp and ffmpeg.",
   "main": "./out/main/index.js",
   "author": "EvroHQ",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/EvroHQ/EvroHQ-YouTube-Downloader"
+    "url": "https://github.com/EvroHQ/EvroHQ-Downloader"
   },
-  "homepage": "https://github.com/EvroHQ/EvroHQ-YouTube-Downloader",
+  "homepage": "https://github.com/EvroHQ/EvroHQ-Downloader",
   "bugs": {
-    "url": "https://github.com/EvroHQ/EvroHQ-YouTube-Downloader/issues"
+    "url": "https://github.com/EvroHQ/EvroHQ-Downloader/issues"
   },
   "keywords": [
     "youtube",
-    "youtube-downloader",
+    "soundcloud",
     "downloader",
     "audio",
     "video",

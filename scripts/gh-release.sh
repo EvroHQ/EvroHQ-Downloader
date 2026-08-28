@@ -3,9 +3,9 @@
 # Uses the token already stored by git (no interactive login, token never printed).
 set -euo pipefail
 
-REPO="EvroHQ/EvroHQ-YouTube-Downloader"
+REPO="EvroHQ/EvroHQ-Downloader"
 TAG="v1.0.0"
-RELEASE_NAME="EvroHQ YouTube Downloader v1.0.0"
+RELEASE_NAME="EvroHQ Downloader v1.0.0"
 API="https://api.github.com"
 UPLOAD="https://uploads.github.com"
 

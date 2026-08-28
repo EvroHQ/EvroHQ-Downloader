@@ -18,7 +18,9 @@ import {
   XCircle,
   Info,
   AlertTriangle,
-  Scissors
+  Scissors,
+  Lock,
+  Sparkles
 } from 'lucide-react'
 
 const spring = { type: 'spring', stiffness: 420, damping: 34 }
@@ -34,6 +36,42 @@ const THEMES = [
 ]
 
 const LIGHT_THEMES = new Set(['paper-rust', 'bone-forest'])
+
+/* What’s New notes, keyed by the version that introduced them. Shown once
+   when lastSeenVersion is older than the running app version. */
+const WHATS_NEW = {
+  '2.3.0': [
+    {
+      title: 'SoundCloud',
+      body: 'Paste a SoundCloud track or playlist in the same field as YouTube.'
+    },
+    {
+      title: 'New name',
+      body: 'The app is now EvroHQ Downloader — same app, YouTube plus SoundCloud.'
+    }
+  ]
+}
+
+function cmpVer(a, b) {
+  const pa = String(a || '0').split('.').map((n) => parseInt(n, 10) || 0)
+  const pb = String(b || '0').split('.').map((n) => parseInt(n, 10) || 0)
+  const len = Math.max(pa.length, pb.length)
+  for (let i = 0; i < len; i++) {
+    const x = pa[i] || 0
+    const y = pb[i] || 0
+    if (x > y) return 1
+    if (x < y) return -1
+  }
+  return 0
+}
+
+function notesSince(lastSeen, current) {
+  if (!current) return []
+  return Object.entries(WHATS_NEW)
+    .filter(([v]) => cmpVer(v, lastSeen || '0.0.0') > 0 && cmpVer(v, current) <= 0)
+    .sort((a, b) => cmpVer(a[0], b[0]))
+    .flatMap(([, items]) => items)
+}
 
 /* -------------------------------------------------------------------------- */
 /*  URL helpers                                                               */
@@ -77,6 +115,48 @@ function isPlaylistUrl(value) {
   if (!YT_HOSTS.includes(host)) return false
   if (u.pathname === '/playlist' && u.searchParams.has('list')) return true
   return u.searchParams.has('list') || u.searchParams.has('start_radio')
+}
+
+const SC_HOSTS = ['soundcloud.com', 'm.soundcloud.com', 'on.soundcloud.com', 'soundcloud.app.goo.gl']
+const SC_RESERVED = new Set([
+  'discover',
+  'stream',
+  'search',
+  'you',
+  'pages',
+  'charts',
+  'upload',
+  'signin',
+  'login',
+  'signup',
+  'feed',
+  'messages',
+  'notifications',
+  'settings'
+])
+
+function isSoundCloudUrl(value) {
+  const u = toUrl(value)
+  if (!u) return false
+  const host = u.hostname.toLowerCase().replace(/^www\./, '')
+  return SC_HOSTS.includes(host)
+}
+
+function isSoundCloudCollectionUrl(value) {
+  const u = toUrl(value)
+  if (!u || !isSoundCloudUrl(value)) return false
+  const host = u.hostname.toLowerCase().replace(/^www\./, '')
+  if (host === 'on.soundcloud.com' || host === 'soundcloud.app.goo.gl') return false
+  const parts = u.pathname.replace(/\/+$/, '').split('/').filter(Boolean)
+  if (!parts.length) return false
+  if (parts.includes('sets') || parts.includes('albums') || parts.includes('likes')) return true
+  if (parts[0] === 'you') return parts[1] === 'likes' || parts[1] === 'sets' || parts[1] === 'albums'
+  if (parts.length === 1) return !SC_RESERVED.has(parts[0].toLowerCase())
+  if (parts.length === 2) {
+    const second = parts[1].toLowerCase()
+    return ['tracks', 'popular-tracks', 'sets', 'albums', 'reposts', 'likes', 'comments'].includes(second)
+  }
+  return /\/(sets|albums|likes)(\/|$)/i.test(parts.join('/'))
 }
 
 // YouTube Mix / radio (list=RD…) and Music albums (list=OLAK…) — keep as playlist.
@@ -246,6 +326,11 @@ export default function App() {
   const [appUpdate, setAppUpdate] = useState(null)
   const [theme, setTheme] = useState('evrohq')
   const themeReady = useRef(false)
+  const [whatsNew, setWhatsNew] = useState(null)
+  const seenVersionRef = useRef('')
+  const [scFormat, setScFormat] = useState('original')
+  const [dlUi, setDlUi] = useState(null)
+  const dlStreamsRef = useRef(1)
 
   // Real metadata for the preview panel (fetched via yt-dlp).
   const [videoInfo, setVideoInfo] = useState(null)
@@ -256,13 +341,11 @@ export default function App() {
 
   const previewReq = useRef(0)
   const chapterReq = useRef(0)
-  const formatRef = useRef(format)
   const playlistPosRef = useRef(playlistPos)
   const dlPassRef = useRef(1)
   const dlLastPctRef = useRef(0)
   const dlShownRef = useRef(0)
   const extraDlRef = useRef(false)
-  formatRef.current = format
   playlistPosRef.current = playlistPos
 
   const resetDownloadProgress = () => {
@@ -275,10 +358,12 @@ export default function App() {
 
   const urlState = useMemo(() => {
     if (!url.trim()) return null
+    if (isSoundCloudUrl(url)) return isSoundCloudCollectionUrl(url) ? 'playlist' : 'single'
     if (isPlaylistUrl(url)) return 'playlist'
     if (isYouTubeUrl(url)) return 'single'
     return 'invalid'
   }, [url])
+  const isSc = Boolean(url.trim()) && isSoundCloudUrl(url)
 
   /* --- lifecycle --------------------------------------------------------- */
   useEffect(() => {
@@ -288,6 +373,11 @@ export default function App() {
       if (cfg?.theme) setTheme(cfg.theme)
       if (cfg?.codec === 'h264' || cfg?.codec === 'best') setCodec(cfg.codec)
       themeReady.current = true
+      const items = notesSince(cfg?.lastSeenVersion, cfg?.version)
+      if (items.length) {
+        seenVersionRef.current = cfg.version
+        setWhatsNew(items)
+      }
     })
 
     const applyProgress = (value) => {
@@ -307,7 +397,7 @@ export default function App() {
         extraDlRef.current = false
       }
 
-      const streams = formatRef.current === 'video' ? 2 : 1
+      const streams = dlStreamsRef.current
 
       // yt-dlp video = video stream then audio stream, each 0–100%. A later
       // Destination (thumbnail, etc.) must not start a 3rd pass.
@@ -355,6 +445,7 @@ export default function App() {
     const offComplete = window.api?.onComplete((payload) => {
       setDownloading(false)
       setStopping(false)
+      setDlUi(null)
       const finished = payload.success && !payload.alreadyDownloaded
       dlShownRef.current = finished ? 100 : 0
       setProgress(finished ? 100 : 0)
@@ -414,7 +505,7 @@ export default function App() {
   useEffect(() => {
     setChapters([])
     setByChapters(false)
-    if (urlState !== 'single') return
+    if (urlState !== 'single' || isSoundCloudUrl(url)) return
     const reqId = ++chapterReq.current
     const t = setTimeout(async () => {
       const res = await window.api?.getChapters(url.trim())
@@ -430,6 +521,12 @@ export default function App() {
 
   const applyUrl = (raw) => {
     const next = String(raw ?? '').trim()
+    if (isSoundCloudUrl(next)) {
+      setUrl(next)
+      setUrlCleaned(false)
+      setUrlCleanMsg('')
+      return
+    }
     const cleaned = cleanYouTubeUrl(next)
     setUrl(cleaned)
     const note = urlCleanNote(next, cleaned)
@@ -459,7 +556,31 @@ export default function App() {
     const link = url.trim()
     const t = setTimeout(async () => {
       try {
-        if (urlState === 'single') {
+        if (isSoundCloudUrl(link)) {
+          const info = await window.api?.fetchMetadata({ platform: 'soundcloud', url: link })
+          if (previewReq.current !== reqId) return
+          if (info && !info.error && info.kind === 'playlist' && info.tracks?.length) {
+            setPlaylistInfo(info)
+            setVideoInfo(null)
+            setSelected(new Set(info.tracks.filter((tr) => !tr.protected).map((tr) => tr.id)))
+            setMode('playlist')
+          } else if (info && !info.error && info.kind !== 'playlist') {
+            setVideoInfo({
+              id: info.id,
+              title: info.title,
+              channel: info.artist,
+              duration: info.duration,
+              thumbnail: info.thumbnail,
+              genre: info.genre || null,
+              views: info.plays ?? null,
+              source: 'soundcloud'
+            })
+            setPlaylistInfo(null)
+            setMode('single')
+          } else {
+            setPreviewError(info?.error || 'Could not load SoundCloud details.')
+          }
+        } else if (urlState === 'single') {
           const info = await window.api?.getVideoInfo(link)
           if (previewReq.current !== reqId) return
           if (info && !info.error) setVideoInfo(info)
@@ -484,9 +605,19 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [url, urlState])
 
+  useEffect(() => {
+    if (!isSc) return
+    setFormat('audio')
+    setUseRange(false)
+    setByChapters(false)
+  }, [isSc])
+
   /* --- derived ----------------------------------------------------------- */
-  const perHourMB =
-    format === 'video'
+  const perHourMB = isSc
+    ? scFormat === 'wav'
+      ? 620
+      : 58
+    : format === 'video'
       ? videoQuality === '4k'
         ? 6000
         : videoQuality === '2k'
@@ -496,7 +627,15 @@ export default function App() {
         ? 620
         : 145
 
-  const formatLabel = format === 'video' ? 'MP4' : audioFormat === 'wav' ? 'WAV' : 'MP3'
+  const formatLabel = isSc
+    ? scFormat === 'wav'
+      ? 'WAV'
+      : 'Original'
+    : format === 'video'
+      ? 'MP4'
+      : audioFormat === 'wav'
+        ? 'WAV'
+        : 'MP3'
 
   const estSizeLabel = (seconds) => {
     const mb = (seconds / 3600) * perHourMB
@@ -510,23 +649,26 @@ export default function App() {
     .filter((t) => selected.has(t.id))
     .reduce((a, t) => a + (t.duration || 0), 0)
 
-  const singleValid = Boolean(url.trim()) && isYouTubeUrl(url)
+  const singleValid = Boolean(url.trim()) && (isYouTubeUrl(url) || isSoundCloudUrl(url))
   const canDownload =
     mode === 'playlist' ? selected.size > 0 && !downloading : singleValid && !downloading
 
-  const formatWord =
-    format === 'video' ? 'MP4' : audioFormat === 'wav' ? 'WAV' : 'MP3'
+  const formatWord = formatLabel
   const statusText = downloading
     ? stopping
       ? 'Stopping…'
-      : mode === 'playlist'
-        ? `Downloading ${playlistPos ? `${playlistPos.current}/${playlistPos.total}` : `0/${selected.size}`} · ${formatWord}`
-        : `Downloading · ${format === 'video'
-          ? 'preparing MP4'
-          : audioFormat === 'wav'
-            ? 'converting to WAV'
-            : 'converting to MP3'
-        }`
+      : dlUi?.platform === 'soundcloud'
+        ? dlUi.playlist
+          ? `Downloading ${playlistPos ? `${playlistPos.current}/${playlistPos.total}` : `0/${dlUi.selectedCount}`} · ${dlUi.formatWord}`
+          : `Downloading · ${dlUi.converting}`
+        : mode === 'playlist'
+          ? `Downloading ${playlistPos ? `${playlistPos.current}/${playlistPos.total}` : `0/${selected.size}`} · ${formatWord}`
+          : `Downloading · ${format === 'video'
+            ? 'preparing MP4'
+            : audioFormat === 'wav'
+              ? 'converting to WAV'
+              : 'converting to MP3'
+          }`
     : 'Idle — ready to download'
 
   const activeBanner =
@@ -573,6 +715,63 @@ export default function App() {
 
   const handleDownload = async () => {
     if (!canDownload) return
+    const link = url.trim()
+
+    if (isSc) {
+      const scWord = scFormat === 'wav' ? 'WAV' : 'Original'
+      dlStreamsRef.current = 1
+      setDlUi({
+        platform: 'soundcloud',
+        playlist: mode === 'playlist',
+        formatWord: scWord,
+        converting: scFormat === 'wav' ? 'converting to WAV' : 'downloading original',
+        selectedCount: selected.size
+      })
+      if (mode === 'playlist') {
+        const chosen = playlistTracks.filter((t) => selected.has(t.id) && !t.protected)
+        const selectedTracks = playlistTracks
+          .map((t, i) => (selected.has(t.id) && !t.protected ? i + 1 : null))
+          .filter(Boolean)
+        const trackUrls = chosen
+          .map((t) => {
+            if (typeof t.url === 'string' && /^https?:\/\//i.test(t.url)) return t.url
+            if (t.id && /^\d+$/.test(String(t.id))) {
+              return `https://api-v2.soundcloud.com/tracks/${t.id}`
+            }
+            return null
+          })
+          .filter(Boolean)
+        const skippedTracks = playlistTracks.filter((t) => t.protected).map((t) => t.title)
+        setDownloading(true)
+        setStopping(false)
+        resetDownloadProgress()
+        setPlaylistPos({ current: 0, total: selectedTracks.length })
+        await window.api?.startSoundCloudPlaylistDownload({
+          platform: 'soundcloud',
+          url: link,
+          format: scFormat,
+          selectedTracks,
+          trackUrls,
+          skippedTracks,
+          itemCount: selectedTracks.length,
+          title: playlistInfo?.title,
+          artist: playlistInfo?.artist
+        })
+        return
+      }
+      setDownloading(true)
+      setStopping(false)
+      resetDownloadProgress()
+      await window.api?.startSoundCloudDownload({
+        platform: 'soundcloud',
+        url: link,
+        format: scFormat,
+        title: videoInfo?.title,
+        artist: videoInfo?.channel
+      })
+      return
+    }
+
     if (mode === 'single' && useRange && !byChapters) {
       const err = trimRangeError(start, end)
       if (err) {
@@ -588,6 +787,8 @@ export default function App() {
       setDownloading(true)
       setStopping(false)
       resetDownloadProgress()
+      dlStreamsRef.current = format === 'video' ? 2 : 1
+      setDlUi(null)
       setPlaylistPos({ current: 0, total: selected.size })
       await window.api?.startPlaylistDownload({
         url: url.trim(),
@@ -604,6 +805,8 @@ export default function App() {
     setDownloading(true)
     setStopping(false)
     resetDownloadProgress()
+    dlStreamsRef.current = format === 'video' ? 2 : 1
+    setDlUi(null)
     await window.api?.startDownload({
       url: url.trim(),
       format,
@@ -615,7 +818,8 @@ export default function App() {
       chapterCount: chapters.length,
       embedMeta,
       start: start || '00:00:00',
-      end: end || '00:00:00'
+      end: end || '00:00:00',
+      title: videoInfo?.title
     })
   }
 
@@ -637,15 +841,28 @@ export default function App() {
     }
   }
 
-  const toggleTrack = (id) =>
+  const toggleTrack = (id) => {
+    const track = playlistTracks.find((t) => t.id === id)
+    if (track?.protected) {
+      toast.error('This track is DRM-protected on SoundCloud and can’t be downloaded.')
+      return
+    }
     setSelected((prev) => {
       const next = new Set(prev)
       next.has(id) ? next.delete(id) : next.add(id)
       return next
     })
+  }
 
-  const selectAll = () => setSelected(new Set(playlistTracks.map((t) => t.id)))
+  const selectAll = () =>
+    setSelected(new Set(playlistTracks.filter((t) => !t.protected).map((t) => t.id)))
   const deselectAll = () => setSelected(new Set())
+
+  const dismissWhatsNew = () => {
+    setWhatsNew(null)
+    const v = seenVersionRef.current || version
+    if (v) window.api?.setConfig({ lastSeenVersion: v })
+  }
 
   const spec = true
 
@@ -664,7 +881,7 @@ export default function App() {
       : 'Download'
 
   // Embed toggle is available for audio (single) and playlists.
-  const showEmbed = (mode === 'single' && format === 'audio') || mode === 'playlist'
+  const showEmbed = !isSc && ((mode === 'single' && format === 'audio') || mode === 'playlist')
 
   /* ---------------------------------------------------------------------- */
   return (
@@ -702,10 +919,10 @@ export default function App() {
             <AppLogo />
             <div className="min-w-0">
               <h1 className={`text-[17px] font-bold leading-tight tracking-[-0.3px] ${LIGHT_THEMES.has(theme) ? 'text-black' : 'text-white'}`}>
-                EvroHQ YouTube Downloader
+                EvroHQ Downloader
               </h1>
               <p className="text-[12px] font-normal text-[var(--text-dim)]">
-                Audio &amp; video · powered by yt-dlp &amp; ffmpeg
+                YouTube &amp; SoundCloud · powered by yt-dlp &amp; ffmpeg
               </p>
             </div>
             <div className="ml-auto flex shrink-0 items-center gap-2">
@@ -718,7 +935,6 @@ export default function App() {
             </div>
           </header>
 
-          {/* Main two-column grid */}
           <div className="grid min-h-0 flex-1 grid-cols-[462px_minmax(0,1fr)] gap-[22px]">
             {/* LEFT — controls */}
             <div className="flex min-h-0 flex-col gap-3">
@@ -734,7 +950,7 @@ export default function App() {
                     <input
                       value={url}
                       onChange={(e) => applyUrl(e.target.value)}
-                      placeholder="Paste a YouTube video or playlist link…"
+                      placeholder="Paste a YouTube or SoundCloud link…"
                       className={`flex-1 bg-transparent text-text-primary placeholder:text-text-muted focus:outline-none ${spec ? 'font-mono text-[13px]' : 'text-sm'}`}
                     />
                     <button
@@ -771,15 +987,25 @@ export default function App() {
                       onClick={() => setFormat('audio')}
                       icon={<Music size={16} />}
                       title="Audio"
-                      subtitle={audioFormat === 'wav' ? 'WAV · 44.1 kHz' : 'MP3 · 320 kbps'}
+                      subtitle={
+                        isSc
+                          ? scFormat === 'wav'
+                            ? 'WAV · uncompressed'
+                            : 'Original · best available'
+                          : audioFormat === 'wav'
+                            ? 'WAV · 44.1 kHz'
+                            : 'MP3 · 320 kbps'
+                      }
                     />
                     <FormatCard
                       spec={spec}
                       active={format === 'video'}
+                      disabled={isSc}
+                      hint={isSc ? 'SoundCloud is audio only' : undefined}
                       onClick={() => setFormat('video')}
                       icon={<Video size={16} />}
                       title="Video"
-                      subtitle={codec === 'h264' ? 'MP4 · up to 1080p' : 'MP4 · up to 4K'}
+                      subtitle={isSc ? 'Audio only' : codec === 'h264' ? 'MP4 · up to 1080p' : 'MP4 · up to 4K'}
                     />
                   </div>
                 </div>
@@ -788,21 +1014,47 @@ export default function App() {
                 {format === 'audio' ? (
                   spec ? (
                     <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
-                      <Pill spec group="audio" active={audioFormat === 'wav'} onClick={() => setAudioFormat('wav')}>
-                        WAV · Lossless
-                      </Pill>
-                      <Pill spec group="audio" active={audioFormat === 'mp3'} onClick={() => setAudioFormat('mp3')}>
-                        MP3 · 320 kbps
-                      </Pill>
+                      {isSc ? (
+                        <>
+                          <Pill spec group="audio" active={scFormat === 'original'} onClick={() => setScFormat('original')}>
+                            Original · best available
+                          </Pill>
+                          <Pill spec group="audio" active={scFormat === 'wav'} onClick={() => setScFormat('wav')}>
+                            WAV · uncompressed
+                          </Pill>
+                        </>
+                      ) : (
+                        <>
+                          <Pill spec group="audio" active={audioFormat === 'wav'} onClick={() => setAudioFormat('wav')}>
+                            WAV · uncompressed
+                          </Pill>
+                          <Pill spec group="audio" active={audioFormat === 'mp3'} onClick={() => setAudioFormat('mp3')}>
+                            MP3 · 320 kbps
+                          </Pill>
+                        </>
+                      )}
                     </div>
                   ) : (
                     <div className="grid grid-cols-2 gap-2">
-                      <Pill group="a" active={audioFormat === 'wav'} onClick={() => setAudioFormat('wav')}>
-                        WAV · Lossless
-                      </Pill>
-                      <Pill group="a" active={audioFormat === 'mp3'} onClick={() => setAudioFormat('mp3')}>
-                        MP3 · 320 kbps
-                      </Pill>
+                      {isSc ? (
+                        <>
+                          <Pill group="a" active={scFormat === 'original'} onClick={() => setScFormat('original')}>
+                            Original · best available
+                          </Pill>
+                          <Pill group="a" active={scFormat === 'wav'} onClick={() => setScFormat('wav')}>
+                            WAV · uncompressed
+                          </Pill>
+                        </>
+                      ) : (
+                        <>
+                          <Pill group="a" active={audioFormat === 'wav'} onClick={() => setAudioFormat('wav')}>
+                            WAV · uncompressed
+                          </Pill>
+                          <Pill group="a" active={audioFormat === 'mp3'} onClick={() => setAudioFormat('mp3')}>
+                            MP3 · 320 kbps
+                          </Pill>
+                        </>
+                      )}
                     </div>
                   )
                 ) : spec ? (
@@ -909,7 +1161,7 @@ export default function App() {
                 )}
 
                 {/* Trim last so it stays aligned in audio and video. Hidden in playlist mode. */}
-                {mode === 'single' && (
+                {mode === 'single' && !isSc && (
                   <div className={`flex h-[42px] w-full items-center justify-between gap-3 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4 ${byChapters ? 'pointer-events-none opacity-40' : ''}`}>
                     <div className="flex min-w-0 flex-1 items-center">
                       <AnimatePresence mode="wait" initial={false}>
@@ -951,7 +1203,7 @@ export default function App() {
                   </div>
                 )}
 
-                {mode === 'single' && chapters.length > 0 && (
+                {mode === 'single' && !isSc && chapters.length > 0 && (
                   <div className="flex h-[42px] w-full items-center justify-between rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4">
                     <span className="text-sm font-medium">
                       Split by chapters
@@ -1042,7 +1294,7 @@ export default function App() {
                   : 'rounded-full border border-white/10 bg-white/5 text-[11px]'
                   }`}>
                   <ModeTab spec={spec} active={mode === 'single'} onClick={() => setMode('single')}>
-                    Single video
+                    {isSc ? 'Track' : 'Single video'}
                   </ModeTab>
                   <ModeTab spec={spec} active={mode === 'playlist'} onClick={() => setMode('playlist')}>
                     Playlist
@@ -1065,6 +1317,7 @@ export default function App() {
                       loading={previewLoading}
                       error={previewError}
                       empty={urlState === null}
+                      soundcloud={isSc}
                       sizeLabel={
                         videoInfo?.duration
                           ? `~${estSizeLabel(videoInfo.duration)} ${formatLabel}`
@@ -1093,6 +1346,7 @@ export default function App() {
                       totalSecs={totalSecs}
                       selectedSecs={selectedSecs}
                       sizeLabel={`~${estSizeLabel(selectedSecs)} ${formatLabel}`}
+                      soundcloud={isSc}
                     />
                   </motion.div>
                 )}
@@ -1136,7 +1390,7 @@ export default function App() {
         <div className="flex min-w-0 items-center gap-1 font-sans text-[12px] leading-none text-[var(--text-dim)]">
           <span>If this helped,</span>
           <a
-            href="https://github.com/EvroHQ/EvroHQ-YouTube-Downloader"
+            href="https://github.com/EvroHQ/EvroHQ-Downloader"
             target="_blank"
             rel="noopener noreferrer"
             onClick={() => window.api?.trackLink('star')}
@@ -1158,6 +1412,16 @@ export default function App() {
           </a>
         </div>
       </div>
+
+      <AnimatePresence>
+        {whatsNew && (
+          <WhatsNewModal
+            version={seenVersionRef.current || version}
+            items={whatsNew}
+            onDismiss={dismissWhatsNew}
+          />
+        )}
+      </AnimatePresence>
 
       <Toaster
         theme={LIGHT_THEMES.has(theme) ? 'light' : 'dark'}
@@ -1203,16 +1467,22 @@ function PreviewMessage({ icon, children, spinning }) {
   )
 }
 
-function SinglePreview({ info, loading, error, empty, sizeLabel }) {
+function SinglePreview({ info, loading, error, empty, sizeLabel, soundcloud }) {
+  const [artBroken, setArtBroken] = useState(false)
+  const sc = soundcloud || info?.source === 'soundcloud'
+  useEffect(() => {
+    setArtBroken(false)
+  }, [info?.thumbnail])
+
   if (empty) {
     return (
       <PreviewMessage icon={<Film size={28} className="opacity-50" />}>
-        Paste a link to preview the video
+        Paste a YouTube or SoundCloud link to preview
       </PreviewMessage>
     )
   }
   if (loading && !info) {
-    return <PreviewMessage spinning>Fetching video details…</PreviewMessage>
+    return <PreviewMessage spinning>{sc ? 'Fetching track details…' : 'Fetching video details…'}</PreviewMessage>
   }
   if (!info) {
     return (
@@ -1221,17 +1491,25 @@ function SinglePreview({ info, loading, error, empty, sizeLabel }) {
       </PreviewMessage>
     )
   }
-  const meta = [info.channel, formatCount(info.views) && `${formatCount(info.views)} views`, relativeDate(info.uploadDate)]
-    .filter(Boolean)
-    .join(' · ')
+  const meta = sc
+    ? [info.channel, formatCount(info.views) && `${formatCount(info.views)} plays`].filter(Boolean).join(' · ')
+    : [info.channel, formatCount(info.views) && `${formatCount(info.views)} views`, relativeDate(info.uploadDate)]
+      .filter(Boolean)
+      .join(' · ')
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="striped relative mt-[22px] flex aspect-video w-full items-center justify-center overflow-hidden rounded-xl ring-1 ring-white/10">
-        {info.thumbnail ? (
-          <img src={info.thumbnail} alt="" className="h-full w-full object-cover" draggable={false} />
+        {info.thumbnail && !artBroken ? (
+          <img
+            src={info.thumbnail}
+            alt=""
+            className="h-full w-full object-cover"
+            draggable={false}
+            onError={() => setArtBroken(true)}
+          />
         ) : (
           <span className="font-mono text-[11px] uppercase tracking-[0.2em] text-white/25">
-            Video thumbnail
+            {sc ? 'Artwork' : 'Video thumbnail'}
           </span>
         )}
         {info.duration != null && (
@@ -1241,9 +1519,14 @@ function SinglePreview({ info, loading, error, empty, sizeLabel }) {
         )}
       </div>
       <h2 className="mt-3 line-clamp-2 text-[15px] font-semibold leading-snug text-text-primary">
-        {info.title || 'Untitled video'}
+        {info.title || (sc ? 'Untitled track' : 'Untitled video')}
       </h2>
-      {meta && <p className="mt-1 text-[12px] text-text-secondary">{meta}</p>}
+      {meta && <p className={`mt-1 ${sc ? 'text-[13px]' : 'text-[12px]'} text-text-secondary`}>{meta}</p>}
+      {sc && info.genre && (
+        <span className="mt-2 w-fit rounded-full border border-[var(--border)] px-2 py-0.5 text-[11px] text-text-muted">
+          {info.genre}
+        </span>
+      )}
       <div className="-mx-5 -mb-5 mt-auto flex items-center justify-between border-t border-[var(--border)] bg-[var(--panel-footer)] px-5 py-3 font-mono text-[12px]">
         <span className="text-[var(--text-dim)]">
           {info.duration != null ? `Full length · ${fmtLong(info.duration)}` : 'Length unknown'}
@@ -1265,7 +1548,8 @@ function PlaylistPreview({
   onDeselectAll,
   totalSecs,
   selectedSecs,
-  sizeLabel
+  sizeLabel,
+  soundcloud
 }) {
   if (empty) {
     return (
@@ -1285,6 +1569,7 @@ function PlaylistPreview({
     )
   }
   const tracks = info.tracks
+  const protectedCount = tracks.filter((t) => t.protected).length
   return (
     <div className="mt-[22px] flex min-h-0 flex-1 flex-col">
       <div className="mb-2.5 flex shrink-0 items-center gap-3">
@@ -1300,8 +1585,14 @@ function PlaylistPreview({
         )}
         <div className="min-w-0 flex-1">
           <h2 className="truncate text-[15px] font-semibold leading-tight text-text-primary">{info.title}</h2>
+          {info.artist && (
+            <p className="mt-0.5 truncate text-[13px] leading-tight text-text-secondary">{info.artist}</p>
+          )}
           <p className="mt-0.5 text-[12px] leading-tight text-text-secondary">
-            {tracks.length} tracks{totalSecs > 0 ? ` · ${fmtLong(totalSecs)}` : ''}
+            {tracks.length} tracks
+            {totalSecs > 0 ? ` · ${fmtLong(totalSecs)}` : ''}
+            {soundcloud && info.plays > 0 ? ` · ${formatCount(info.plays)} plays` : ''}
+            {protectedCount > 0 ? ` · ${protectedCount} DRM` : ''}
           </p>
         </div>
         <div className="flex shrink-0 gap-1.5">
@@ -1313,19 +1604,24 @@ function PlaylistPreview({
       <div className="list-scroll -mr-5 min-h-0 flex-1 overflow-y-auto pr-3">
         <div className="divide-y divide-[var(--border)] border-t border-[var(--border)]">
           {tracks.map((t, i) => {
-            const checked = selected.has(t.id)
+            const locked = !!t.protected
+            const checked = !locked && selected.has(t.id)
             return (
               <button
                 key={t.id}
                 onClick={() => onToggle(t.id)}
                 className="track-row flex w-full items-center gap-2.5 py-2.5 text-left"
-                style={{ opacity: checked ? 1 : 0.45 }}
+                style={{ opacity: locked ? 0.55 : checked ? 1 : 0.45 }}
               >
                 <span
                   className={`track-check grid h-[18px] w-[18px] shrink-0 place-items-center rounded-[5px] ${checked ? 'is-checked' : ''
                     }`}
                 >
-                  {checked && <Check size={12} className="track-check-mark" strokeWidth={3} />}
+                  {locked ? (
+                    <Lock size={10} className="text-[var(--text-faint)]" strokeWidth={2.5} />
+                  ) : (
+                    checked && <Check size={12} className="track-check-mark" strokeWidth={3} />
+                  )}
                 </span>
                 <span className="w-5 shrink-0 text-right font-mono text-[11px] tabular-nums text-[var(--text-faint)]">
                   {pad2(i + 1)}
@@ -1343,6 +1639,14 @@ function PlaylistPreview({
                 <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--text)]">
                   {t.title}
                 </span>
+                {locked ? (
+                  <span className="shrink-0 font-mono text-[10px] text-[var(--text-faint)]">DRM</span>
+                ) : null}
+                {soundcloud ? (
+                  <span className="w-11 shrink-0 text-right font-mono text-[11px] tabular-nums text-[var(--text-faint)]">
+                    {t.plays != null ? formatCount(t.plays) : '—'}
+                  </span>
+                ) : null}
                 <span className="w-10 shrink-0 text-right font-mono text-[12px] tabular-nums text-[var(--text-dim)]">
                   {t.duration != null ? fmtClock(t.duration) : '—'}
                 </span>
@@ -1366,6 +1670,68 @@ function PlaylistPreview({
 /* -------------------------------------------------------------------------- */
 /*  Small building blocks                                                     */
 /* -------------------------------------------------------------------------- */
+
+function WhatsNewModal({ version, items, onDismiss }) {
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key === 'Escape') onDismiss()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onDismiss])
+
+  return (
+    <motion.div
+      initial={{ opacity: 0 }}
+      animate={{ opacity: 1 }}
+      exit={{ opacity: 0 }}
+      transition={{ duration: 0.2 }}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 backdrop-blur-[4px]"
+      onClick={onDismiss}
+    >
+      <motion.div
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="whats-new-title"
+        initial={{ opacity: 0, scale: 0.96, y: 10 }}
+        animate={{ opacity: 1, scale: 1, y: 0 }}
+        exit={{ opacity: 0, scale: 0.98, y: 6 }}
+        transition={spring}
+        onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-[400px] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.45)]"
+      >
+        <div className="flex items-start gap-3">
+          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-accent-gradient shadow-glow">
+            <Sparkles size={16} className="text-[var(--on-accent)]" />
+          </span>
+          <div className="min-w-0 pt-0.5">
+            <h2 id="whats-new-title" className="text-[15px] font-semibold leading-tight text-text-primary">
+              What’s new
+            </h2>
+            {version && (
+              <p className="mt-0.5 text-[12px] text-[var(--text-dim)]">Version {version}</p>
+            )}
+          </div>
+        </div>
+        <ul className="mt-4 flex flex-col gap-3">
+          {items.map((item) => (
+            <li key={item.title} className="rounded-xl border border-[var(--border)] bg-[var(--sunken)] px-3.5 py-3">
+              <p className="text-[13px] font-semibold text-text-primary">{item.title}</p>
+              <p className="mt-1 text-[12px] leading-relaxed text-text-secondary">{item.body}</p>
+            </li>
+          ))}
+        </ul>
+        <button
+          type="button"
+          onClick={onDismiss}
+          className="mt-4 h-[38px] w-full rounded-[10px] bg-accent-gradient text-[13px] font-semibold text-[var(--on-accent)] shadow-glow transition-[filter] hover:brightness-110"
+        >
+          Got it
+        </button>
+      </motion.div>
+    </motion.div>
+  )
+}
 
 function UpdateBanner({ title, subtitle, actionLabel, onAction, busy, progress }) {
   const showBar = typeof progress === 'number'
@@ -1498,21 +1864,24 @@ function SectionLabel({ children, className = '' }) {
   )
 }
 
-function FormatCard({ spec, active, onClick, icon, title, subtitle }) {
+function FormatCard({ spec, active, onClick, icon, title, subtitle, disabled, hint }) {
   if (spec) {
     return (
       <button
-        onClick={onClick}
-        className="flex items-start gap-2 rounded-[10px] border px-3.5 py-[14px] text-left transition-colors"
+        onClick={disabled ? undefined : onClick}
+        disabled={disabled}
+        title={hint}
+        className={`flex items-start gap-2 rounded-[10px] border px-3.5 py-[14px] text-left transition-colors ${disabled ? 'cursor-not-allowed opacity-40' : ''
+          }`}
         style={{
-          borderColor: active ? 'var(--accent)' : 'var(--border)',
-          borderWidth: active ? 1.5 : 1,
-          background: active ? 'var(--accent-surface)' : 'var(--sunken)'
+          borderColor: active && !disabled ? 'var(--accent)' : 'var(--border)',
+          borderWidth: active && !disabled ? 1.5 : 1,
+          background: active && !disabled ? 'var(--accent-surface)' : 'var(--sunken)'
         }}
       >
         <span
           className="mt-[6px] h-1.5 w-1.5 shrink-0 rounded-full"
-          style={{ background: active ? 'var(--accent)' : 'var(--border-strong)' }}
+          style={{ background: active && !disabled ? 'var(--accent)' : 'var(--border-strong)' }}
         />
         <span>
           <span className="block text-[13px] font-semibold leading-tight text-[var(--text)]">{title}</span>
@@ -1648,13 +2017,17 @@ function GhostBtn({ onClick, children }) {
 
 function EmbedToggle({ on, onToggle }) {
   return (
-    <button
-      onClick={onToggle}
-      className="flex h-[42px] w-full items-center justify-between rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4 text-left"
-    >
+    <div className="flex h-[42px] w-full items-center justify-between rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4">
       <span className="text-sm font-medium">Embed metadata &amp; cover art</span>
-      <Switch on={on} />
-    </button>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-label="Toggle embed metadata and cover art"
+        className="inline-flex shrink-0 appearance-none items-center border-0 bg-transparent p-0"
+      >
+        <Switch on={on} />
+      </button>
+    </div>
   )
 }
 
