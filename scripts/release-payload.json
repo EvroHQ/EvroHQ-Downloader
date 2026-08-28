@@ -1,6 +1,6 @@
 {
-  "tag_name": "v2.3.1",
-  "name": "EvroHQ Downloader v2.3.1",
+  "tag_name": "v2.3.2",
+  "name": "EvroHQ Downloader v2.3.2",
   "body": "Windows build of EvroHQ Downloader.\n\n- **Setup**: installer, lets you choose the install location.\n- **Portable**: single .exe, no installation.\n\nyt-dlp and ffmpeg are bundled inside — the end user installs nothing else.",
   "draft": true,
   "prerelease": false

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Toaster, toast } from 'sonner'
 import {
@@ -42,7 +43,7 @@ const LIGHT_THEMES = new Set(['paper-rust', 'bone-forest'])
    the overlay and mark the notes as seen before anyone reads them. */
 const WHATS_NEW = [
   {
-    id: '2.3.0-soundcloud',
+    id: '2.3.2-soundcloud',
     minVersion: '2.3.0',
     items: [
       {
@@ -372,7 +373,6 @@ export default function App() {
   /* --- lifecycle --------------------------------------------------------- */
   useEffect(() => {
     let cancelled = false
-    let whatsNewTimer = 0
     window.api?.getConfig().then((cfg) => {
       if (cancelled) return
       if (cfg?.outputFolder) setOutputFolder(cfg.outputFolder)
@@ -384,12 +384,10 @@ export default function App() {
       if (pending.length) {
         seenVersionRef.current = cfg.version
         whatsNewAckRef.current = Array.isArray(cfg.whatsNewAck) ? cfg.whatsNewAck : []
-        const items = pending.flatMap((n) => n.items)
-        const ids = pending.map((n) => n.id)
-        // Wait so a leftover click from Restart-to-update doesn't close it.
-        whatsNewTimer = window.setTimeout(() => {
-          if (!cancelled) setWhatsNew({ items, ids })
-        }, 800)
+        setWhatsNew({
+          items: pending.flatMap((n) => n.items),
+          ids: pending.map((n) => n.id)
+        })
       }
     })
 
@@ -484,7 +482,6 @@ export default function App() {
 
     return () => {
       cancelled = true
-      if (whatsNewTimer) window.clearTimeout(whatsNewTimer)
       offLog && offLog()
       offComplete && offComplete()
       offAppUpdate && offAppUpdate()
@@ -1434,15 +1431,13 @@ export default function App() {
         </div>
       </div>
 
-      <AnimatePresence>
-        {whatsNew && (
-          <WhatsNewModal
-            version={seenVersionRef.current || version}
-            items={whatsNew.items}
-            onDismiss={dismissWhatsNew}
-          />
-        )}
-      </AnimatePresence>
+      {whatsNew ? (
+        <WhatsNewModal
+          version={seenVersionRef.current || version}
+          items={whatsNew.items}
+          onDismiss={dismissWhatsNew}
+        />
+      ) : null}
 
       <Toaster
         theme={LIGHT_THEMES.has(theme) ? 'light' : 'dark'}
@@ -1693,39 +1688,41 @@ function PlaylistPreview({
 /* -------------------------------------------------------------------------- */
 
 function WhatsNewModal({ version, items, onDismiss }) {
-  const [ready, setReady] = useState(false)
+  const [armed, setArmed] = useState(false)
+  const downOnBtn = useRef(false)
+  const dialogRef = useRef(null)
 
   useEffect(() => {
-    const t = window.setTimeout(() => setReady(true), 400)
+    dialogRef.current?.focus()
+    const t = window.setTimeout(() => setArmed(true), 1800)
     return () => window.clearTimeout(t)
   }, [])
 
   useEffect(() => {
-    if (!ready) return
+    if (!armed) return
     const onKey = (e) => {
       if (e.key === 'Escape') onDismiss()
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [ready, onDismiss])
+  }, [armed, onDismiss])
 
-  return (
-    <motion.div
-      initial={{ opacity: 0 }}
-      animate={{ opacity: 1 }}
-      exit={{ opacity: 0 }}
-      transition={{ duration: 0.2 }}
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 backdrop-blur-[4px]"
+  const overlay = (
+    <div
+      className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 p-6 backdrop-blur-[4px]"
+      onPointerDown={(e) => {
+        e.preventDefault()
+        downOnBtn.current = false
+      }}
     >
-      <motion.div
+      <div
+        ref={dialogRef}
         role="dialog"
         aria-modal="true"
         aria-labelledby="whats-new-title"
-        initial={{ opacity: 0, scale: 0.96, y: 10 }}
-        animate={{ opacity: 1, scale: 1, y: 0 }}
-        exit={{ opacity: 0, scale: 0.98, y: 6 }}
-        transition={spring}
-        className="w-full max-w-[400px] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.45)]"
+        tabIndex={-1}
+        onPointerDown={(e) => e.stopPropagation()}
+        className="w-full max-w-[400px] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.45)] outline-none"
       >
         <div className="flex items-start gap-3">
           <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-accent-gradient shadow-glow">
@@ -1750,15 +1747,27 @@ function WhatsNewModal({ version, items, onDismiss }) {
         </ul>
         <button
           type="button"
-          onClick={onDismiss}
-          disabled={!ready}
-          className="mt-4 h-[38px] w-full rounded-[10px] bg-accent-gradient text-[13px] font-semibold text-[var(--on-accent)] shadow-glow transition-[filter] hover:brightness-110 disabled:pointer-events-none"
+          tabIndex={armed ? 0 : -1}
+          disabled={!armed}
+          onPointerDown={(e) => {
+            e.stopPropagation()
+            downOnBtn.current = armed && e.button === 0
+          }}
+          onPointerUp={(e) => {
+            e.stopPropagation()
+            if (!armed || !downOnBtn.current || e.button !== 0) return
+            downOnBtn.current = false
+            onDismiss()
+          }}
+          className="mt-4 h-[38px] w-full rounded-[10px] bg-accent-gradient text-[13px] font-semibold text-[var(--on-accent)] shadow-glow transition-[filter] hover:brightness-110 disabled:opacity-60 disabled:pointer-events-none"
         >
           Got it
         </button>
-      </motion.div>
-    </motion.div>
+      </div>
+    </div>
   )
+
+  return createPortal(overlay, document.body)
 }
 
 function UpdateBanner({ title, subtitle, actionLabel, onAction, busy, progress }) {
