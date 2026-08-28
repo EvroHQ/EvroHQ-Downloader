@@ -33,7 +33,8 @@ const store = new Store({
     theme: 'evrohq',
     codec: 'best',
     platform: 'youtube',
-    lastSeenVersion: ''
+    lastSeenVersion: '',
+    whatsNewAck: []
   }
 })
 
@@ -1800,7 +1801,8 @@ ipcMain.handle('get-config', () => {
     theme: THEME_IDS.includes(theme) ? theme : 'evrohq',
     codec: store.get('codec') === 'h264' ? 'h264' : 'best',
     platform: platform === 'soundcloud' ? 'soundcloud' : 'youtube',
-    lastSeenVersion: typeof store.get('lastSeenVersion') === 'string' ? store.get('lastSeenVersion') : ''
+    lastSeenVersion: typeof store.get('lastSeenVersion') === 'string' ? store.get('lastSeenVersion') : '',
+    whatsNewAck: Array.isArray(store.get('whatsNewAck')) ? store.get('whatsNewAck').filter((id) => typeof id === 'string') : []
   }
 })
 
@@ -1822,6 +1824,12 @@ ipcMain.handle('set-config', (_event, cfg) => {
   }
   if (cfg && typeof cfg.lastSeenVersion === 'string') {
     store.set('lastSeenVersion', cfg.lastSeenVersion)
+  }
+  if (cfg && Array.isArray(cfg.whatsNewAck)) {
+    store.set(
+      'whatsNewAck',
+      cfg.whatsNewAck.filter((id) => typeof id === 'string')
+    )
   }
   return true
 })

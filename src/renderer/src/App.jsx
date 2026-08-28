@@ -37,20 +37,25 @@ const THEMES = [
 
 const LIGHT_THEMES = new Set(['paper-rust', 'bone-forest'])
 
-/* What’s New notes, keyed by the version that introduced them. Shown once
-   when lastSeenVersion is older than the running app version. */
-const WHATS_NEW = {
-  '2.3.0': [
-    {
-      title: 'SoundCloud',
-      body: 'Paste a SoundCloud track or playlist in the same field as YouTube.'
-    },
-    {
-      title: 'New name',
-      body: 'The app is now EvroHQ Downloader — same app, YouTube plus SoundCloud.'
-    }
-  ]
-}
+/* What’s New — each announcement has a stable id. Shown until Got it is
+   clicked. lastSeenVersion is not enough: Restart-to-update can ghost-click
+   the overlay and mark the notes as seen before anyone reads them. */
+const WHATS_NEW = [
+  {
+    id: '2.3.0-soundcloud',
+    minVersion: '2.3.0',
+    items: [
+      {
+        title: 'SoundCloud',
+        body: 'Paste a SoundCloud track or playlist in the same field as YouTube.'
+      },
+      {
+        title: 'New name',
+        body: 'The app is now EvroHQ Downloader — same app, YouTube plus SoundCloud.'
+      }
+    ]
+  }
+]
 
 function cmpVer(a, b) {
   const pa = String(a || '0').split('.').map((n) => parseInt(n, 10) || 0)
@@ -65,12 +70,10 @@ function cmpVer(a, b) {
   return 0
 }
 
-function notesSince(lastSeen, current) {
+function unseenWhatsNew(ackIds, current) {
   if (!current) return []
-  return Object.entries(WHATS_NEW)
-    .filter(([v]) => cmpVer(v, lastSeen || '0.0.0') > 0 && cmpVer(v, current) <= 0)
-    .sort((a, b) => cmpVer(a[0], b[0]))
-    .flatMap(([, items]) => items)
+  const seen = new Set(Array.isArray(ackIds) ? ackIds : [])
+  return WHATS_NEW.filter((n) => !seen.has(n.id) && cmpVer(current, n.minVersion) >= 0)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -328,6 +331,7 @@ export default function App() {
   const themeReady = useRef(false)
   const [whatsNew, setWhatsNew] = useState(null)
   const seenVersionRef = useRef('')
+  const whatsNewAckRef = useRef([])
   const [scFormat, setScFormat] = useState('original')
   const [dlUi, setDlUi] = useState(null)
   const dlStreamsRef = useRef(1)
@@ -367,16 +371,25 @@ export default function App() {
 
   /* --- lifecycle --------------------------------------------------------- */
   useEffect(() => {
+    let cancelled = false
+    let whatsNewTimer = 0
     window.api?.getConfig().then((cfg) => {
+      if (cancelled) return
       if (cfg?.outputFolder) setOutputFolder(cfg.outputFolder)
       if (cfg?.version) setVersion(cfg.version)
       if (cfg?.theme) setTheme(cfg.theme)
       if (cfg?.codec === 'h264' || cfg?.codec === 'best') setCodec(cfg.codec)
       themeReady.current = true
-      const items = notesSince(cfg?.lastSeenVersion, cfg?.version)
-      if (items.length) {
+      const pending = unseenWhatsNew(cfg?.whatsNewAck, cfg?.version)
+      if (pending.length) {
         seenVersionRef.current = cfg.version
-        setWhatsNew(items)
+        whatsNewAckRef.current = Array.isArray(cfg.whatsNewAck) ? cfg.whatsNewAck : []
+        const items = pending.flatMap((n) => n.items)
+        const ids = pending.map((n) => n.id)
+        // Wait so a leftover click from Restart-to-update doesn't close it.
+        whatsNewTimer = window.setTimeout(() => {
+          if (!cancelled) setWhatsNew({ items, ids })
+        }, 800)
       }
     })
 
@@ -470,6 +483,8 @@ export default function App() {
     })
 
     return () => {
+      cancelled = true
+      if (whatsNewTimer) window.clearTimeout(whatsNewTimer)
       offLog && offLog()
       offComplete && offComplete()
       offAppUpdate && offAppUpdate()
@@ -859,9 +874,15 @@ export default function App() {
   const deselectAll = () => setSelected(new Set())
 
   const dismissWhatsNew = () => {
+    const ids = whatsNew?.ids || []
     setWhatsNew(null)
     const v = seenVersionRef.current || version
-    if (v) window.api?.setConfig({ lastSeenVersion: v })
+    const ack = [...new Set([...(whatsNewAckRef.current || []), ...ids])]
+    whatsNewAckRef.current = ack
+    window.api?.setConfig({
+      ...(v ? { lastSeenVersion: v } : {}),
+      whatsNewAck: ack
+    })
   }
 
   const spec = true
@@ -1417,7 +1438,7 @@ export default function App() {
         {whatsNew && (
           <WhatsNewModal
             version={seenVersionRef.current || version}
-            items={whatsNew}
+            items={whatsNew.items}
             onDismiss={dismissWhatsNew}
           />
         )}
@@ -1672,13 +1693,21 @@ function PlaylistPreview({
 /* -------------------------------------------------------------------------- */
 
 function WhatsNewModal({ version, items, onDismiss }) {
+  const [ready, setReady] = useState(false)
+
   useEffect(() => {
+    const t = window.setTimeout(() => setReady(true), 400)
+    return () => window.clearTimeout(t)
+  }, [])
+
+  useEffect(() => {
+    if (!ready) return
     const onKey = (e) => {
       if (e.key === 'Escape') onDismiss()
     }
     document.addEventListener('keydown', onKey)
     return () => document.removeEventListener('keydown', onKey)
-  }, [onDismiss])
+  }, [ready, onDismiss])
 
   return (
     <motion.div
@@ -1687,7 +1716,6 @@ function WhatsNewModal({ version, items, onDismiss }) {
       exit={{ opacity: 0 }}
       transition={{ duration: 0.2 }}
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 backdrop-blur-[4px]"
-      onClick={onDismiss}
     >
       <motion.div
         role="dialog"
@@ -1697,7 +1725,6 @@ function WhatsNewModal({ version, items, onDismiss }) {
         animate={{ opacity: 1, scale: 1, y: 0 }}
         exit={{ opacity: 0, scale: 0.98, y: 6 }}
         transition={spring}
-        onClick={(e) => e.stopPropagation()}
         className="w-full max-w-[400px] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.45)]"
       >
         <div className="flex items-start gap-3">
@@ -1724,7 +1751,8 @@ function WhatsNewModal({ version, items, onDismiss }) {
         <button
           type="button"
           onClick={onDismiss}
-          className="mt-4 h-[38px] w-full rounded-[10px] bg-accent-gradient text-[13px] font-semibold text-[var(--on-accent)] shadow-glow transition-[filter] hover:brightness-110"
+          disabled={!ready}
+          className="mt-4 h-[38px] w-full rounded-[10px] bg-accent-gradient text-[13px] font-semibold text-[var(--on-accent)] shadow-glow transition-[filter] hover:brightness-110 disabled:pointer-events-none"
         >
           Got it
         </button>
