@@ -83,8 +83,8 @@ npm run build:win
 
 Output goes to `release/`:
 
-- `EvroHQ Downloader-Setup-2.3.2.exe` (NSIS installer)
-- `EvroHQ Downloader-Portable-2.3.2.exe` (portable)
+- `EvroHQ Downloader-Setup-2.3.3.exe` (NSIS installer)
+- `EvroHQ Downloader-Portable-2.3.3.exe` (portable)
 
 ### Known issue: winCodeSign symlink extraction on Windows
 

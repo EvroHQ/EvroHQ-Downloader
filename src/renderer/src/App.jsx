@@ -699,6 +699,19 @@ export default function App() {
           actionLabel: 'Restart now',
           onAction: () => window.api?.installUpdate()
         }
+        : appUpdate?.status === 'portable-available'
+          ? {
+            key: 'app-portable',
+            title: 'App update available',
+            subtitle: `Version ${appUpdate.version || ''} — download the portable .exe. This build will not install.`.trim(),
+            actionLabel: 'Download',
+            onAction: () => {
+              const href =
+                appUpdate.downloadUrl ||
+                'https://github.com/EvroHQ/EvroHQ-Downloader/releases/latest'
+              window.open(href, '_blank', 'noopener,noreferrer')
+            }
+          }
         : ytdlpUpdate
           ? {
             key: 'ytdlp',
@@ -792,20 +805,28 @@ export default function App() {
       }
     }
     if (mode === 'playlist') {
-      const items = playlistTracks
-        .map((t, i) => (selected.has(t.id) ? i + 1 : null))
+      const chosen = playlistTracks.filter((t) => selected.has(t.id))
+      const trackUrls = chosen
+        .map((t) => {
+          if (t.url && /^https?:\/\//i.test(t.url)) return t.url
+          return t.id ? `https://www.youtube.com/watch?v=${t.id}` : null
+        })
         .filter(Boolean)
-        .join(',')
+      if (!trackUrls.length) {
+        toast.error('Could not resolve the selected tracks.')
+        return
+      }
       setDownloading(true)
       setStopping(false)
       resetDownloadProgress()
       dlStreamsRef.current = format === 'video' ? 2 : 1
       setDlUi(null)
-      setPlaylistPos({ current: 0, total: selected.size })
+      setPlaylistPos({ current: 0, total: trackUrls.length })
       await window.api?.startPlaylistDownload({
         url: url.trim(),
-        playlistItems: items,
-        itemCount: selected.size,
+        trackUrls,
+        title: playlistInfo?.title,
+        itemCount: trackUrls.length,
         format,
         audioFormat,
         videoQuality,
@@ -921,7 +942,7 @@ export default function App() {
         {/* Everything below the banner is blocked while an update is pending */}
         <div className="relative flex min-h-0 flex-1 flex-col gap-3">
           <AnimatePresence>
-            {activeBanner && (
+            {activeBanner && appUpdate?.status !== 'portable-available' && (
               <motion.div
                 initial={{ opacity: 0 }}
                 animate={{ opacity: 1 }}

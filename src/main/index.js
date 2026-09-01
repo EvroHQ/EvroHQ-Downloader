@@ -1,6 +1,6 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, net } from 'electron'
 import { join, basename, extname } from 'path'
-import { existsSync, readdirSync, unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, cpSync } from 'fs'
+import { existsSync, readdirSync, unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, cpSync, writeFileSync } from 'fs'
 import { spawn } from 'child_process'
 import { randomUUID } from 'crypto'
 import Store from 'electron-store'
@@ -70,6 +70,58 @@ function killTree(child) {
  * In a packaged build they are extracted (via extraResources) to
  * process.resourcesPath/bin.
  */
+function isPortableBuild() {
+  return Boolean(process.env.PORTABLE_EXECUTABLE_DIR || process.env.PORTABLE_EXECUTABLE_FILE)
+}
+
+function portableDownloadUrl(version) {
+  const v = String(version || '').replace(/^v/i, '')
+  if (!v) return 'https://github.com/EvroHQ/EvroHQ-Downloader/releases/latest'
+  return `https://github.com/EvroHQ/EvroHQ-Downloader/releases/download/v${v}/EvroHQ-Downloader-Portable-${v}.exe`
+}
+
+function youtubeWatchUrl(value) {
+  const raw = String(value == null ? '' : value).trim()
+  if (!raw) return null
+  if (/^[\w-]{11}$/.test(raw)) return `https://www.youtube.com/watch?v=${raw}`
+  let v = raw
+  if (!/^https?:\/\//i.test(v)) v = `https://${v}`
+  try {
+    const u = new URL(v)
+    const host = u.hostname.toLowerCase().replace(/^www\./, '')
+    if (host === 'youtu.be') {
+      const id = u.pathname.replace(/^\//, '').split('/')[0]
+      return id ? `https://www.youtube.com/watch?v=${id}` : null
+    }
+    const allowed = [
+      'youtube.com',
+      'm.youtube.com',
+      'music.youtube.com',
+      'youtube-nocookie.com'
+    ]
+    if (!allowed.includes(host)) return null
+    const id =
+      u.searchParams.get('v') ||
+      (u.pathname.match(/^\/(?:shorts|live|embed|v)\/([\w-]+)/) || [])[1]
+    return id ? `https://www.youtube.com/watch?v=${id}` : null
+  } catch (e) {
+    return null
+  }
+}
+
+function youtubeTrackUrls(params) {
+  if (!Array.isArray(params?.trackUrls)) return []
+  const seen = new Set()
+  const out = []
+  for (const raw of params.trackUrls) {
+    const href = youtubeWatchUrl(raw)
+    if (!href || seen.has(href)) continue
+    seen.add(href)
+    out.push(href)
+  }
+  return out
+}
+
 // Validate that a string is a real YouTube video URL (and not just any site
 // yt-dlp happens to support). Lenient about a missing scheme.
 function isYouTubeUrl(value) {
@@ -1504,12 +1556,14 @@ async function handleDownload(params) {
   throw new Error('Invalid download parameters.')
 }
 
-// Download selected tracks of a playlist in a single yt-dlp pass. Files land in
-// a subfolder named after the playlist (%(playlist_title)s). `playlistItems` is
-// a comma list of 1-based positions (e.g. "1,2,4"); empty means all items.
+// Download selected tracks of a playlist. Files land in a subfolder named after
+// the playlist. Prefer explicit watch URLs — `--playlist-items` is the YouTube
+// playlist index, which drifts when videos are private/deleted and is why the
+// UI selection used to download the wrong tracks.
 async function handlePlaylistDownload(params) {
   const { url } = params
-  if (!isPlaylistUrl(url)) {
+  const trackUrls = youtubeTrackUrls(params)
+  if (!trackUrls.length && !isPlaylistUrl(url)) {
     throw new Error('Please paste a valid YouTube playlist link.')
   }
   const format = params.format === 'video' ? 'video' : 'audio'
@@ -1519,8 +1573,6 @@ async function handlePlaylistDownload(params) {
     : '1080'
   const codec = videoCodecPref(params)
   const embedMeta = params.embedMeta !== false
-  const playlistItems =
-    typeof params.playlistItems === 'string' ? params.playlistItems.trim() : ''
 
   const ytdlp = getBinPath('yt-dlp.exe')
   const ffmpeg = getBinPath('ffmpeg.exe')
@@ -1543,7 +1595,7 @@ async function handlePlaylistDownload(params) {
 
   const args = [
     ...jsArgs,
-    '--yes-playlist',
+    trackUrls.length ? '--no-playlist' : '--yes-playlist',
     '--ignore-errors',
     '--ffmpeg-location',
     ffmpeg,
@@ -1552,7 +1604,6 @@ async function handlePlaylistDownload(params) {
     '200',
     '--no-overwrites'
   ]
-  if (playlistItems) args.push('--playlist-items', playlistItems)
 
   if (format === 'audio') {
     args.push('-x', '--audio-format', audioFormat)
@@ -1576,7 +1627,19 @@ async function handlePlaylistDownload(params) {
   }
 
   // Subfolder named after the playlist, one file per track inside it.
-  args.push('-o', mediaOutputTemplate(true, format === 'audio' ? audioFormat : 'mp4'), url)
+  const folder = sanitizeFilename(params?.title, 'playlist').replace(/%/g, '_')
+  const ext = format === 'audio' ? audioFormat : 'mp4'
+  args.push('-o', `${folder}/%(title)s.${ext}`)
+
+  let batchFile = null
+  if (trackUrls.length) {
+    batchFile = join(app.getPath('temp'), `evrohq-pl-${Date.now()}.txt`)
+    writeFileSync(batchFile, `${trackUrls.join('\n')}\n`, 'utf8')
+    args.push('--batch-file', batchFile)
+    sendLog(`Downloading ${trackUrls.length} selected track${trackUrls.length === 1 ? '' : 's'}.`)
+  } else {
+    args.push(url)
+  }
 
   try {
     await runBinary(ytdlp, args, outputFolder)
@@ -1589,6 +1652,14 @@ async function handlePlaylistDownload(params) {
       return
     }
     throw err
+  } finally {
+    if (batchFile) {
+      try {
+        unlinkSync(batchFile)
+      } catch (e) {
+        // temp file
+      }
+    }
   }
 }
 
@@ -1802,7 +1873,8 @@ ipcMain.handle('get-config', () => {
     codec: store.get('codec') === 'h264' ? 'h264' : 'best',
     platform: platform === 'soundcloud' ? 'soundcloud' : 'youtube',
     lastSeenVersion: typeof store.get('lastSeenVersion') === 'string' ? store.get('lastSeenVersion') : '',
-    whatsNewAck: Array.isArray(store.get('whatsNewAck')) ? store.get('whatsNewAck').filter((id) => typeof id === 'string') : []
+    whatsNewAck: Array.isArray(store.get('whatsNewAck')) ? store.get('whatsNewAck').filter((id) => typeof id === 'string') : [],
+    portable: isPortableBuild()
   }
 })
 
@@ -2052,6 +2124,7 @@ ipcMain.handle('update-ytdlp', async () => {
 
 // Quit and install a downloaded app update (electron-updater).
 ipcMain.handle('install-update', () => {
+  if (isPortableBuild()) return false
   autoUpdater.quitAndInstall()
   return true
 })
@@ -2077,13 +2150,23 @@ function setupAutoUpdater() {
   // in-app log via the 'error' handler below instead.
   autoUpdater.logger = null
 
-  // Don't actually pull down an installer while developing.
-  autoUpdater.autoDownload = app.isPackaged
-  autoUpdater.autoInstallOnAppQuit = true
+  const portable = isPortableBuild()
+  // Packaged NSIS can download + install. Portable must not pull the Setup
+  // installer — that would install the app, which is the opposite of portable.
+  autoUpdater.autoDownload = app.isPackaged && !portable
+  autoUpdater.autoInstallOnAppQuit = !portable
 
   // Everything below is silent — the only user-visible signal is the banner,
   // which appears only when an update is actually available/downloaded.
   autoUpdater.on('update-available', (info) => {
+    if (portable) {
+      sendAppUpdate({
+        status: 'portable-available',
+        version: info?.version,
+        downloadUrl: portableDownloadUrl(info?.version)
+      })
+      return
+    }
     sendAppUpdate({ status: 'available', version: info?.version })
   })
   autoUpdater.on('update-not-available', () => {
