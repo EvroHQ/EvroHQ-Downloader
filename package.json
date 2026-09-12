@@ -1,6 +1,6 @@
 {
   "name": "evrohq-downloader",
-  "version": "2.3.3",
+  "version": "2.3.4",
   "description": "EvroHQ Downloader — download audio, video or playlists from YouTube and SoundCloud, powered by yt-dlp and ffmpeg.",
   "main": "./out/main/index.js",
   "author": "EvroHQ",

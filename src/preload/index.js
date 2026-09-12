@@ -4,6 +4,7 @@ const api = {
   selectFolder: () => ipcRenderer.invoke('select-folder'),
   getConfig: () => ipcRenderer.invoke('get-config'),
   setConfig: (cfg) => ipcRenderer.invoke('set-config', cfg),
+  setWindowSize: (size) => ipcRenderer.invoke('set-window-size', size),
   startDownload: (params) => ipcRenderer.invoke('start-download', params),
   startPlaylistDownload: (params) => ipcRenderer.invoke('start-playlist-download', params),
   cancelDownload: () => ipcRenderer.invoke('cancel-download'),

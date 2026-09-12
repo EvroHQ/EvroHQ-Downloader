@@ -1,4 +1,4 @@
-import { app, shell, BrowserWindow, ipcMain, dialog, net } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, net, Menu, MenuItem, screen } from 'electron'
 import { join, basename, extname } from 'path'
 import { existsSync, readdirSync, unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, cpSync, writeFileSync } from 'fs'
 import { spawn } from 'child_process'
@@ -34,7 +34,8 @@ const store = new Store({
     codec: 'best',
     platform: 'youtube',
     lastSeenVersion: '',
-    whatsNewAck: []
+    whatsNewAck: [],
+    windowSize: 'default'
   }
 })
 
@@ -42,10 +43,61 @@ let mainWindow = null
 let currentChild = null
 let cancelRequested = false
 
-// Mockup window: 1052 × 752, left column 462, preview 1fr, gap 22, pad 20.
-// Extra height vs 697 so Split-by-chapters fits under Trim without clipping.
-const WINDOW_WIDTH = 1052
-const WINDOW_HEIGHT = 752
+// Default is the original mockup (1052 × 752) and never scales with the display.
+// Compact uses these caps on 1440p / 4K; on a 1080p-class screen it shrinks so
+// the window occupies about the same share of the desktop as on 4K @ 150%.
+const WINDOW_SIZES = {
+  default: { width: 1052, height: 730 },
+  compact: { width: 880, height: 600 }
+}
+
+function windowSizeKey(value) {
+  return value === 'compact' ? 'compact' : 'default'
+}
+
+function displayWorkArea() {
+  try {
+    const d = screen.getPrimaryDisplay()
+    return {
+      work: d.workAreaSize,
+      scale: d.scaleFactor || 1
+    }
+  } catch {
+    return { work: { width: 1920, height: 1080 }, scale: 1 }
+  }
+}
+
+function is1080ClassDisplay() {
+  const { work, scale } = displayWorkArea()
+  return work.width * scale <= 1920 || work.height * scale <= 1080
+}
+
+function compactWindowDims() {
+  const cap = WINDOW_SIZES.compact
+  if (!is1080ClassDisplay()) return { ...cap }
+  const { work } = displayWorkArea()
+  return {
+    width: Math.min(cap.width, Math.max(720, Math.round(work.width * 0.4))),
+    height: Math.min(cap.height, Math.max(580, Math.round(work.height * 0.58)))
+  }
+}
+
+function windowDims(key) {
+  return windowSizeKey(key) === 'compact' ? compactWindowDims() : { ...WINDOW_SIZES.default }
+}
+
+function applyWindowSize(key, { animate } = {}) {
+  if (!mainWindow || mainWindow.isDestroyed()) return windowSizeKey(key)
+  const next = windowSizeKey(key)
+  const compact = compactWindowDims()
+  const full = WINDOW_SIZES.default
+  const { width, height } = next === 'compact' ? compact : full
+  mainWindow.setMinimumSize(compact.width, compact.height)
+  mainWindow.setMaximumSize(full.width, full.height)
+  mainWindow.setSize(width, height, animate !== false)
+  mainWindow.center()
+  return next
+}
 
 const CANCELLED = '__CANCELLED__'
 
@@ -308,9 +360,15 @@ function getJsRuntimeArgs() {
 }
 
 function createWindow() {
+  const compact = compactWindowDims()
+  const initial = windowDims(store.get('windowSize'))
   mainWindow = new BrowserWindow({
-    width: WINDOW_WIDTH,
-    height: WINDOW_HEIGHT,
+    width: initial.width,
+    height: initial.height,
+    minWidth: compact.width,
+    minHeight: compact.height,
+    maxWidth: WINDOW_SIZES.default.width,
+    maxHeight: WINDOW_SIZES.default.height,
     resizable: false,
     maximizable: false,
     fullscreenable: false,
@@ -329,6 +387,42 @@ function createWindow() {
 
   mainWindow.on('ready-to-show', () => {
     mainWindow.show()
+  })
+
+  mainWindow.webContents.on('context-menu', (_event, params) => {
+    const menu = new Menu()
+
+    if (params.isEditable) {
+      menu.append(new MenuItem({
+        label: 'Cut',
+        role: 'cut',
+        enabled: params.editFlags.canCut
+      }))
+      menu.append(new MenuItem({
+        label: 'Copy',
+        role: 'copy',
+        enabled: params.editFlags.canCopy
+      }))
+      menu.append(new MenuItem({
+        label: 'Paste',
+        role: 'paste',
+        enabled: params.editFlags.canPaste
+      }))
+      menu.append(new MenuItem({ type: 'separator' }))
+      menu.append(new MenuItem({
+        label: 'Select All',
+        role: 'selectAll'
+      }))
+    } else if (params.selectionText) {
+      menu.append(new MenuItem({
+        label: 'Copy',
+        role: 'copy'
+      }))
+    }
+
+    if (menu.items.length > 0) {
+      menu.popup()
+    }
   })
 
   mainWindow.webContents.setWindowOpenHandler((details) => {
@@ -1874,7 +1968,8 @@ ipcMain.handle('get-config', () => {
     platform: platform === 'soundcloud' ? 'soundcloud' : 'youtube',
     lastSeenVersion: typeof store.get('lastSeenVersion') === 'string' ? store.get('lastSeenVersion') : '',
     whatsNewAck: Array.isArray(store.get('whatsNewAck')) ? store.get('whatsNewAck').filter((id) => typeof id === 'string') : [],
-    portable: isPortableBuild()
+    portable: isPortableBuild(),
+    windowSize: windowSizeKey(store.get('windowSize'))
   }
 })
 
@@ -1903,11 +1998,22 @@ ipcMain.handle('set-config', (_event, cfg) => {
       cfg.whatsNewAck.filter((id) => typeof id === 'string')
     )
   }
+  if (cfg && (cfg.windowSize === 'default' || cfg.windowSize === 'compact')) {
+    store.set('windowSize', cfg.windowSize)
+  }
   return true
 })
 
+ipcMain.handle('set-window-size', (_event, size) => {
+  const next = windowSizeKey(size)
+  store.set('windowSize', next)
+  applyWindowSize(next, { animate: true })
+  sendTelemetry('window_size', { window_size: next })
+  return next
+})
+
 ipcMain.handle('track-link', (_event, which) => {
-  if (which === 'madeby' || which === 'coffee' || which === 'star') {
+  if (which === 'madeby' || which === 'coffee' || which === 'star' || which === 'about') {
     sendTelemetry('link_click', { link: which })
   }
   return true
@@ -2218,7 +2324,7 @@ app.whenReady().then(() => {
   setupAutoUpdater()
 
   // Anonymous launch ping (opt-out). Fire-and-forget, never blocks startup.
-  sendTelemetry('launch')
+  sendTelemetry('launch', { window_size: windowSizeKey(store.get('windowSize')) })
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()

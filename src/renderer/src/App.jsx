@@ -21,7 +21,9 @@ import {
   AlertTriangle,
   Scissors,
   Lock,
-  Sparkles
+  Sparkles,
+  Maximize2,
+  Minimize2
 } from 'lucide-react'
 
 const spring = { type: 'spring', stiffness: 420, damping: 34 }
@@ -38,13 +40,13 @@ const THEMES = [
 
 const LIGHT_THEMES = new Set(['paper-rust', 'bone-forest'])
 
-/* What’s New — each announcement has a stable id. Shown until Got it is
-   clicked. lastSeenVersion is not enough: Restart-to-update can ghost-click
-   the overlay and mark the notes as seen before anyone reads them. */
+/* What’s New — one block per app version. Add a new `{ id, version, items }`
+   whenever package.json is bumped. Shown until Got it; ids already in
+   whatsNewAck are skipped. Restart-to-update must not count as seen. */
 const WHATS_NEW = [
   {
     id: '2.3.2-soundcloud',
-    minVersion: '2.3.0',
+    version: '2.3.0',
     items: [
       {
         title: 'SoundCloud',
@@ -53,6 +55,24 @@ const WHATS_NEW = [
       {
         title: 'New name',
         body: 'The app is now EvroHQ Downloader — same app, YouTube plus SoundCloud.'
+      }
+    ]
+  },
+  {
+    id: '2.3.4',
+    version: '2.3.4',
+    items: [
+      {
+        title: 'Compact window',
+        body: 'Switch Default or Compact from the header icons. Embed and Split by chapters now share one row.'
+      },
+      {
+        title: 'Right-click',
+        body: 'Right-click the URL field for Cut, Copy, Paste, and Select All.'
+      },
+      {
+        title: 'About',
+        body: 'Open About next to Themes to read who I am, what this project is, and how to support it.'
       }
     ]
   }
@@ -74,7 +94,7 @@ function cmpVer(a, b) {
 function unseenWhatsNew(ackIds, current) {
   if (!current) return []
   const seen = new Set(Array.isArray(ackIds) ? ackIds : [])
-  return WHATS_NEW.filter((n) => !seen.has(n.id) && cmpVer(current, n.minVersion) >= 0)
+  return WHATS_NEW.filter((n) => !seen.has(n.id) && cmpVer(current, n.version) >= 0)
 }
 
 /* -------------------------------------------------------------------------- */
@@ -329,6 +349,8 @@ export default function App() {
   const [updatingYtdlp, setUpdatingYtdlp] = useState(false)
   const [appUpdate, setAppUpdate] = useState(null)
   const [theme, setTheme] = useState('evrohq')
+  const [windowSize, setWindowSize] = useState('default')
+  const [aboutOpen, setAboutOpen] = useState(false)
   const themeReady = useRef(false)
   const [whatsNew, setWhatsNew] = useState(null)
   const seenVersionRef = useRef('')
@@ -378,6 +400,7 @@ export default function App() {
       if (cfg?.outputFolder) setOutputFolder(cfg.outputFolder)
       if (cfg?.version) setVersion(cfg.version)
       if (cfg?.theme) setTheme(cfg.theme)
+      if (cfg?.windowSize === 'compact' || cfg?.windowSize === 'default') setWindowSize(cfg.windowSize)
       if (cfg?.codec === 'h264' || cfg?.codec === 'best') setCodec(cfg.codec)
       themeReady.current = true
       const pending = unseenWhatsNew(cfg?.whatsNewAck, cfg?.version)
@@ -712,16 +735,16 @@ export default function App() {
               window.open(href, '_blank', 'noopener,noreferrer')
             }
           }
-        : ytdlpUpdate
-          ? {
-            key: 'ytdlp',
-            title: 'yt-dlp update available',
-            subtitle: `Installed ${ytdlpUpdate.current} · latest ${ytdlpUpdate.latest} — keeps YouTube downloads working.`,
-            actionLabel: updatingYtdlp ? 'Updating…' : 'Update now',
-            busy: updatingYtdlp,
-            onAction: handleUpdateYtdlp
-          }
-          : null
+          : ytdlpUpdate
+            ? {
+              key: 'ytdlp',
+              title: 'yt-dlp update available',
+              subtitle: `Installed ${ytdlpUpdate.current} · latest ${ytdlpUpdate.latest} — keeps YouTube downloads working.`,
+              actionLabel: updatingYtdlp ? 'Updating…' : 'Update now',
+              busy: updatingYtdlp,
+              onAction: handleUpdateYtdlp
+            }
+            : null
 
   /* --- handlers ---------------------------------------------------------- */
   const handlePaste = async () => {
@@ -903,6 +926,12 @@ export default function App() {
     })
   }
 
+  const selectWindowSize = (next) => {
+    setWindowSize(next)
+    window.api?.setWindowSize(next)
+  }
+
+  const compact = windowSize === 'compact'
   const spec = true
 
   const urlRing =
@@ -933,14 +962,14 @@ export default function App() {
       </div>
       <div className="grain" />
 
-      <div className="relative z-10 flex min-h-0 flex-1 flex-col gap-3 p-5">
+      <div className={`relative z-10 flex min-h-0 flex-1 flex-col ${compact ? 'gap-2 p-2.5' : 'gap-3 p-5'}`}>
         {/* Update banner */}
         <AnimatePresence>
           {activeBanner && <UpdateBanner key={activeBanner.key} {...activeBanner} />}
         </AnimatePresence>
 
         {/* Everything below the banner is blocked while an update is pending */}
-        <div className="relative flex min-h-0 flex-1 flex-col gap-3">
+        <div className={`relative flex min-h-0 flex-1 flex-col ${compact ? 'gap-2' : 'gap-3'}`}>
           <AnimatePresence>
             {activeBanner && appUpdate?.status !== 'portable-available' && (
               <motion.div
@@ -948,7 +977,7 @@ export default function App() {
                 animate={{ opacity: 1 }}
                 exit={{ opacity: 0 }}
                 transition={{ duration: 0.2 }}
-                className="absolute -inset-5 z-20 cursor-not-allowed bg-black/72 backdrop-blur-[4px]"
+                className={`absolute z-20 cursor-not-allowed bg-black/72 backdrop-blur-[4px] ${compact ? '-inset-3' : '-inset-5'}`}
               />
             )}
           </AnimatePresence>
@@ -965,7 +994,18 @@ export default function App() {
               </p>
             </div>
             <div className="ml-auto flex shrink-0 items-center gap-2">
+              <WindowSizeMenu value={windowSize} onChange={selectWindowSize} />
               <ThemeMenu value={theme} onChange={setTheme} />
+              <button
+                type="button"
+                onClick={() => {
+                  setAboutOpen(true)
+                  window.api?.trackLink('about')
+                }}
+                className="chrome-chip px-2.5 py-1 text-[11px] font-medium transition-colors hover:text-[var(--text)]"
+              >
+                About
+              </button>
               {version && (
                 <span className="chrome-chip self-center px-2.5 py-1 font-mono text-[11px] font-medium">
                   v{version}
@@ -974,15 +1014,14 @@ export default function App() {
             </div>
           </header>
 
-          <div className="grid min-h-0 flex-1 grid-cols-[462px_minmax(0,1fr)] gap-[22px]">
-            {/* LEFT — controls */}
-            <div className="flex min-h-0 flex-col gap-3">
-              {/* Controls — compact enough to fit without scrolling, even with Trim open */}
-              <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+          <div className={`grid min-h-0 flex-1 ${compact ? 'grid-cols-2 gap-2' : 'grid-cols-[462px_minmax(0,1fr)] gap-[22px]'}`}>
+            {/* LEFT — controls. Compact stacks everything (no scrollbar). */}
+            <div className={`flex min-h-0 flex-col ${compact ? 'gap-2' : 'gap-3'}`}>
+              <div className={`flex min-h-0 flex-col overflow-hidden ${compact ? 'gap-2' : 'flex-1 gap-3'}`}>
                 {/* URL field */}
                 <div>
                   <div
-                    className={`flex items-center gap-2.5 px-4 py-2 transition-colors ${spec ? 'rounded-[10px] bg-[var(--surface)]' : 'rounded-2xl bg-white/[0.04] focus-within:bg-white/[0.06]'
+                    className={`flex items-center gap-2.5 px-4 transition-colors ${compact ? 'py-1.5' : 'py-2'} ${spec ? 'rounded-[10px] bg-[var(--surface)]' : 'rounded-2xl bg-white/[0.04] focus-within:bg-white/[0.06]'
                       }`}
                     style={{ border: `1px solid ${urlRing}` }}
                   >
@@ -1018,13 +1057,14 @@ export default function App() {
 
                 {/* Format */}
                 <div>
-                  <SectionLabel>Format</SectionLabel>
+                  <SectionLabel compact={compact}>Format</SectionLabel>
                   <div className="grid grid-cols-2 gap-2">
                     <FormatCard
                       spec={spec}
+                      compact={compact}
                       active={format === 'audio'}
                       onClick={() => setFormat('audio')}
-                      icon={<Music size={16} />}
+                      icon={<Music size={compact ? 14 : 16} />}
                       title="Audio"
                       subtitle={
                         isSc
@@ -1038,11 +1078,12 @@ export default function App() {
                     />
                     <FormatCard
                       spec={spec}
+                      compact={compact}
                       active={format === 'video'}
                       disabled={isSc}
                       hint={isSc ? 'SoundCloud is audio only' : undefined}
                       onClick={() => setFormat('video')}
-                      icon={<Video size={16} />}
+                      icon={<Video size={compact ? 14 : 16} />}
                       title="Video"
                       subtitle={isSc ? 'Audio only' : codec === 'h264' ? 'MP4 · up to 1080p' : 'MP4 · up to 4K'}
                     />
@@ -1055,19 +1096,19 @@ export default function App() {
                     <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
                       {isSc ? (
                         <>
-                          <Pill spec group="audio" active={scFormat === 'original'} onClick={() => setScFormat('original')}>
+                          <Pill spec compact={compact} group="audio" active={scFormat === 'original'} onClick={() => setScFormat('original')}>
                             Original · best available
                           </Pill>
-                          <Pill spec group="audio" active={scFormat === 'wav'} onClick={() => setScFormat('wav')}>
+                          <Pill spec compact={compact} group="audio" active={scFormat === 'wav'} onClick={() => setScFormat('wav')}>
                             WAV · uncompressed
                           </Pill>
                         </>
                       ) : (
                         <>
-                          <Pill spec group="audio" active={audioFormat === 'wav'} onClick={() => setAudioFormat('wav')}>
+                          <Pill spec compact={compact} group="audio" active={audioFormat === 'wav'} onClick={() => setAudioFormat('wav')}>
                             WAV · uncompressed
                           </Pill>
-                          <Pill spec group="audio" active={audioFormat === 'mp3'} onClick={() => setAudioFormat('mp3')}>
+                          <Pill spec compact={compact} group="audio" active={audioFormat === 'mp3'} onClick={() => setAudioFormat('mp3')}>
                             MP3 · 320 kbps
                           </Pill>
                         </>
@@ -1098,11 +1139,12 @@ export default function App() {
                   )
                 ) : spec ? (
                   <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
-                    <Pill spec group="quality" active={videoQuality === '1080'} onClick={() => setVideoQuality('1080')}>
+                    <Pill spec compact={compact} group="quality" active={videoQuality === '1080'} onClick={() => setVideoQuality('1080')}>
                       1080p
                     </Pill>
                     <Pill
                       spec
+                      compact={compact}
                       group="quality"
                       active={videoQuality === '2k'}
                       disabled={codec === 'h264'}
@@ -1113,6 +1155,7 @@ export default function App() {
                     </Pill>
                     <Pill
                       spec
+                      compact={compact}
                       group="quality"
                       active={videoQuality === '4k'}
                       disabled={codec === 'h264'}
@@ -1153,6 +1196,7 @@ export default function App() {
                     <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
                       <Pill
                         spec
+                        compact={compact}
                         group="codec"
                         active={codec === 'best'}
                         onClick={() => selectCodec('best')}
@@ -1162,6 +1206,7 @@ export default function App() {
                       </Pill>
                       <Pill
                         spec
+                        compact={compact}
                         group="codec"
                         active={codec === 'h264'}
                         onClick={() => selectCodec('h264')}
@@ -1192,16 +1237,40 @@ export default function App() {
                   )
                 )}
 
-                {showEmbed && (
-                  <EmbedToggle
+                {mode === 'single' && !isSc && (
+                  <div className="grid grid-cols-2 gap-2">
+                    <SwitchRow
+                      label="Embed metadata"
+                      on={embedMeta}
+                      onToggle={() => setEmbedMeta((v) => !v)}
+                      ariaLabel="Toggle embed metadata and cover art"
+                      compact={compact}
+                    />
+                    <SwitchRow
+                      label="Split by chapters"
+                      extra={chapters.length > 0 ? `· ${chapters.length}` : null}
+                      on={byChapters}
+                      disabled={chapters.length === 0}
+                      onToggle={() => {
+                        setUseRange(false)
+                        setByChapters((v) => !v)
+                      }}
+                      ariaLabel="Toggle split by chapters"
+                      compact={compact}
+                    />
+                  </div>
+                )}
+                {mode === 'playlist' && showEmbed && (
+                  <SwitchRow
+                    label="Embed metadata"
                     on={embedMeta}
                     onToggle={() => setEmbedMeta((v) => !v)}
+                    ariaLabel="Toggle embed metadata and cover art"
+                    compact={compact}
                   />
                 )}
-
-                {/* Trim last so it stays aligned in audio and video. Hidden in playlist mode. */}
                 {mode === 'single' && !isSc && (
-                  <div className={`flex h-[42px] w-full items-center justify-between gap-3 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4 ${byChapters ? 'pointer-events-none opacity-40' : ''}`}>
+                  <div className={`flex w-full items-center justify-between gap-3 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] ${compact ? 'h-9 px-3' : 'h-[42px] px-4'} ${byChapters ? 'pointer-events-none opacity-40' : ''}`}>
                     <div className="flex min-w-0 flex-1 items-center">
                       <AnimatePresence mode="wait" initial={false}>
                         {useRange ? (
@@ -1242,35 +1311,13 @@ export default function App() {
                   </div>
                 )}
 
-                {mode === 'single' && !isSc && chapters.length > 0 && (
-                  <div className="flex h-[42px] w-full items-center justify-between rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4">
-                    <span className="text-sm font-medium">
-                      Split by chapters
-                      <span className="ml-1.5 font-normal text-[var(--text-dim)]">
-                        · {chapters.length}
-                      </span>
-                    </span>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setUseRange(false)
-                        setByChapters((v) => !v)
-                      }}
-                      aria-label="Toggle split by chapters"
-                      className="inline-flex shrink-0 appearance-none items-center border-0 bg-transparent p-0"
-                    >
-                      <Switch on={byChapters} />
-                    </button>
-                  </div>
-                )}
-
               </div>
 
               {/* Output + download pinned to bottom */}
-              <div className="flex shrink-0 flex-col gap-3">
+              <div className={`flex shrink-0 flex-col ${compact ? 'mt-auto gap-2' : 'gap-3'}`}>
                 <div>
-                  <SectionLabel>Output folder</SectionLabel>
-                  <div className={`flex items-center gap-2 rounded-[10px] px-3 py-2 ${spec ? 'border border-[var(--border)] bg-[var(--sunken)]' : 'glass-soft rounded-2xl'}`}>
+                  <SectionLabel compact={compact}>Output folder</SectionLabel>
+                  <div className={`flex items-center gap-2 rounded-[10px] px-3 ${compact ? 'py-1.5' : 'py-2'} ${spec ? 'border border-[var(--border)] bg-[var(--sunken)]' : 'glass-soft rounded-2xl'}`}>
                     <FolderOpen size={15} className="shrink-0 text-text-secondary" />
                     <input
                       readOnly
@@ -1291,14 +1338,14 @@ export default function App() {
 
                 {downloading ? (
                   <div className="flex gap-2">
-                    <div className="glass-soft flex h-[46px] flex-1 items-center justify-center gap-2 rounded-2xl text-sm font-bold tracking-wide text-text-secondary">
+                    <div className={`glass-soft flex flex-1 items-center justify-center gap-2 rounded-2xl text-sm font-bold tracking-wide text-text-secondary ${compact ? 'h-10' : 'h-[46px]'}`}>
                       <Loader2 size={16} className="animate-spin" />
                       DOWNLOADING…
                     </div>
                     <button
                       onClick={handleStop}
                       disabled={stopping}
-                      className={`flex h-[46px] items-center justify-center gap-2 rounded-[10px] border px-5 text-sm font-medium ${stopping
+                      className={`flex items-center justify-center gap-2 rounded-[10px] border px-5 text-sm font-medium ${compact ? 'h-10' : 'h-[46px]'} ${stopping
                         ? 'cursor-not-allowed border-[var(--border)] bg-[var(--sunken)] text-[var(--text-faint)]'
                         : 'border-[var(--border)] bg-[var(--surface)] text-[var(--text-dim)] hover:border-error/60 hover:text-error'
                         }`}
@@ -1312,7 +1359,7 @@ export default function App() {
                     whileTap={canDownload ? { scale: 0.985 } : {}}
                     onClick={handleDownload}
                     disabled={!canDownload}
-                    className={`flex h-[46px] w-full items-center justify-center gap-2 rounded-[8px] text-[15px] font-bold tracking-wide transition-[filter] ${canDownload
+                    className={`flex w-full items-center justify-center gap-2 rounded-[8px] font-bold tracking-wide transition-[filter] ${compact ? 'h-10 text-[13px]' : 'h-[46px] text-[15px]'} ${canDownload
                       ? 'bg-accent-gradient text-[var(--on-accent)] hover:brightness-110'
                       : 'glass-soft cursor-not-allowed text-text-muted'
                       }`}
@@ -1325,8 +1372,8 @@ export default function App() {
             </div>
 
             {/* RIGHT — preview */}
-            <div className={`flex min-h-0 flex-col overflow-hidden p-5 ${spec ? 'rounded-[12px] bg-[var(--panel)] ring-1 ring-[var(--border)]' : 'rounded-2xl glass'}`}>
-              <div className="mb-3 flex h-8 shrink-0 items-center justify-between">
+            <div className={`flex min-h-0 flex-col overflow-hidden ${compact ? 'p-2.5' : 'p-5'} ${spec ? 'rounded-[12px] bg-[var(--panel)] ring-1 ring-[var(--border)]' : 'rounded-2xl glass'}`}>
+              <div className={`flex h-8 shrink-0 items-center justify-between ${compact ? 'mb-2' : 'mb-3'}`}>
                 <SectionLabel className="mt-2 flex h-full items-center leading-none">Preview</SectionLabel>
                 <div className={`flex h-full items-center p-[3px] text-[12px] font-medium ${spec
                   ? 'rounded-[8px] border border-[var(--border)] bg-[var(--sunken)]'
@@ -1357,6 +1404,7 @@ export default function App() {
                       error={previewError}
                       empty={urlState === null}
                       soundcloud={isSc}
+                      compact={compact}
                       sizeLabel={
                         videoInfo?.duration
                           ? `~${estSizeLabel(videoInfo.duration)} ${formatLabel}`
@@ -1386,6 +1434,7 @@ export default function App() {
                       selectedSecs={selectedSecs}
                       sizeLabel={`~${estSizeLabel(selectedSecs)} ${formatLabel}`}
                       soundcloud={isSc}
+                      compact={compact}
                     />
                   </motion.div>
                 )}
@@ -1393,7 +1442,7 @@ export default function App() {
             </div>
           </div>
 
-          <div className="flex shrink-0 items-center gap-3 mt-2">
+          <div className={`flex shrink-0 items-center gap-3 ${compact ? 'mt-1' : 'mt-2'}`}>
             <span className="shrink-0 font-mono text-[11px] text-[var(--text-faint)]">
               {statusText}
             </span>
@@ -1413,7 +1462,7 @@ export default function App() {
         </div>
       </div>
 
-      <div className="app-footer relative z-10 flex shrink-0 items-center justify-between bg-[var(--footer)] px-5 py-2">
+      <div className={`app-footer relative z-10 flex shrink-0 items-center justify-between bg-[var(--footer)] ${compact ? 'px-3 py-1.5' : 'px-5 py-2'}`}>
         <p className="font-sans text-[12px] text-[var(--text-dim)]">
           {spec ? 'made by ' : 'Made by '}
           <a
@@ -1451,6 +1500,10 @@ export default function App() {
           </a>
         </div>
       </div>
+
+      {aboutOpen && (
+        <AboutModal version={version} onClose={() => setAboutOpen(false)} />
+      )}
 
       {whatsNew ? (
         <WhatsNewModal
@@ -1504,7 +1557,7 @@ function PreviewMessage({ icon, children, spinning }) {
   )
 }
 
-function SinglePreview({ info, loading, error, empty, sizeLabel, soundcloud }) {
+function SinglePreview({ info, loading, error, empty, sizeLabel, soundcloud, compact }) {
   const [artBroken, setArtBroken] = useState(false)
   const sc = soundcloud || info?.source === 'soundcloud'
   useEffect(() => {
@@ -1535,7 +1588,7 @@ function SinglePreview({ info, loading, error, empty, sizeLabel, soundcloud }) {
       .join(' · ')
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <div className="striped relative mt-[22px] flex aspect-video w-full items-center justify-center overflow-hidden rounded-xl ring-1 ring-white/10">
+      <div className={`striped relative flex aspect-video w-full items-center justify-center overflow-hidden rounded-xl ring-1 ring-white/10 ${compact ? 'mt-1' : 'mt-[22px]'}`}>
         {info.thumbnail && !artBroken ? (
           <img
             src={info.thumbnail}
@@ -1564,7 +1617,7 @@ function SinglePreview({ info, loading, error, empty, sizeLabel, soundcloud }) {
           {info.genre}
         </span>
       )}
-      <div className="-mx-5 -mb-5 mt-auto flex items-center justify-between border-t border-[var(--border)] bg-[var(--panel-footer)] px-5 py-3 font-mono text-[12px]">
+      <div className={`mt-auto flex items-center justify-between border-t border-[var(--border)] bg-[var(--panel-footer)] font-mono text-[12px] ${compact ? '-mx-3 -mb-3 px-3 py-3' : '-mx-5 -mb-5 px-5 py-3'}`}>
         <span className="text-[var(--text-dim)]">
           {info.duration != null ? `Full length · ${fmtLong(info.duration)}` : 'Length unknown'}
         </span>
@@ -1586,7 +1639,8 @@ function PlaylistPreview({
   totalSecs,
   selectedSecs,
   sizeLabel,
-  soundcloud
+  soundcloud,
+  compact
 }) {
   if (empty) {
     return (
@@ -1608,7 +1662,7 @@ function PlaylistPreview({
   const tracks = info.tracks
   const protectedCount = tracks.filter((t) => t.protected).length
   return (
-    <div className="mt-[22px] flex min-h-0 flex-1 flex-col">
+    <div className={`flex min-h-0 flex-1 flex-col ${compact ? 'mt-1' : 'mt-[22px]'}`}>
       <div className="mb-2.5 flex shrink-0 items-center gap-3">
         {info.cover ? (
           <img
@@ -1638,7 +1692,7 @@ function PlaylistPreview({
         </div>
       </div>
 
-      <div className="list-scroll -mr-5 min-h-0 flex-1 overflow-y-auto pr-3">
+      <div className={`list-scroll min-h-0 flex-1 overflow-y-auto pr-3 ${compact ? '-mr-3' : '-mr-5'}`}>
         <div className="divide-y divide-[var(--border)] border-t border-[var(--border)]">
           {tracks.map((t, i) => {
             const locked = !!t.protected
@@ -1694,7 +1748,7 @@ function PlaylistPreview({
       </div>
 
       {/* Footer */}
-      <div className="-mx-5 -mb-5 mt-auto flex shrink-0 items-center justify-between border-t border-[var(--border)] bg-[var(--panel-footer)] px-5 py-3 font-mono text-[12px]">
+      <div className={`mt-auto flex shrink-0 items-center justify-between border-t border-[var(--border)] bg-[var(--panel-footer)] font-mono text-[12px] ${compact ? '-mx-3 -mb-3 px-3 py-3' : '-mx-5 -mb-5 px-5 py-3'}`}>
         <span className="text-[var(--text-dim)]">
           {selected.size} of {tracks.length} selected{selectedSecs > 0 ? ` · ${fmtLong(selectedSecs)}` : ''}
         </span>
@@ -1791,6 +1845,101 @@ function WhatsNewModal({ version, items, onDismiss }) {
   return createPortal(overlay, document.body)
 }
 
+function AboutModal({ version, onClose }) {
+  const dialogRef = useRef(null)
+
+  useEffect(() => {
+    dialogRef.current?.focus()
+    const onKey = (e) => {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  const overlay = (
+    <div
+      className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 p-6 backdrop-blur-[4px]"
+      onPointerDown={onClose}
+    >
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="about-title"
+        tabIndex={-1}
+        onPointerDown={(e) => e.stopPropagation()}
+        className="w-full max-w-[420px] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.45)] outline-none"
+      >
+        <div className="flex items-start gap-3">
+          <AppLogo />
+          <div className="min-w-0 pt-0.5">
+            <h2 id="about-title" className="text-[15px] font-semibold leading-tight text-text-primary">
+              About EvroHQ Downloader
+            </h2>
+            {version && (
+              <p className="mt-0.5 font-mono text-[12px] text-[var(--text-dim)]">v{version}</p>
+            )}
+          </div>
+        </div>
+
+        <div className="mt-4 flex flex-col gap-3">
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--sunken)] px-3.5 py-3">
+            <p className="text-[13px] font-semibold text-text-primary">Who I am</p>
+            <p className="mt-1 text-[12px] leading-relaxed text-text-secondary">
+              I’m EvroHQ, a full-stack developer. I build web apps, desktop software, and other projects — and I keep this one free and open-source.
+            </p>
+          </div>
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--sunken)] px-3.5 py-3">
+            <p className="text-[13px] font-semibold text-text-primary">This project</p>
+            <p className="mt-1 text-[12px] leading-relaxed text-text-secondary">
+              A free desktop app to download audio, video, or playlists from YouTube and SoundCloud. No ads, no account.
+            </p>
+          </div>
+          <div className="rounded-xl border border-[var(--border)] bg-[var(--sunken)] px-3.5 py-3">
+            <p className="text-[13px] font-semibold text-text-primary">Support</p>
+            <p className="mt-1 text-[12px] leading-relaxed text-text-secondary">
+              If the app helps you, a GitHub star or a coffee goes a long way. It helps cover certificates, updates, and keeping the project free.
+            </p>
+            <div className="mt-3 flex gap-2">
+              <a
+                href="https://github.com/EvroHQ/EvroHQ-Downloader"
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => window.api?.trackLink('star')}
+                className="inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-[10px] border border-[var(--border)] bg-[var(--control)] text-[12px] font-medium text-[var(--text)] transition-colors hover:border-[var(--border-strong)]"
+              >
+                <Star size={13} strokeWidth={2.2} />
+                Star on GitHub
+              </a>
+              <a
+                href="https://buymeacoffee.com/evrohq"
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={() => window.api?.trackLink('coffee')}
+                className="inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-[10px] bg-accent-gradient text-[12px] font-semibold text-[var(--on-accent)] transition-[filter] hover:brightness-110"
+              >
+                <Coffee size={13} strokeWidth={2.2} />
+                Buy me a coffee
+              </a>
+            </div>
+          </div>
+        </div>
+
+        <button
+          type="button"
+          onClick={onClose}
+          className="mt-4 h-[38px] w-full rounded-[10px] border border-[var(--border)] bg-[var(--sunken)] text-[13px] font-medium text-[var(--text)] transition-colors hover:border-[var(--border-strong)]"
+        >
+          Close
+        </button>
+      </div>
+    </div>
+  )
+
+  return createPortal(overlay, document.body)
+}
+
 function UpdateBanner({ title, subtitle, actionLabel, onAction, busy, progress }) {
   const showBar = typeof progress === 'number'
   const pct = showBar ? Math.round(progress) : 0
@@ -1855,6 +2004,34 @@ function AppLogo() {
   )
 }
 
+function WindowSizeMenu({ value, onChange }) {
+  const btn = (id, label, icon) => {
+    const active = value === id
+    return (
+      <button
+        type="button"
+        title={label}
+        aria-label={label}
+        aria-pressed={active}
+        onClick={() => onChange(id)}
+        className={`grid h-6 w-6 place-items-center rounded-[6px] transition-colors ${active
+          ? 'bg-[color-mix(in_srgb,var(--text)_12%,transparent)] text-[var(--text)]'
+          : 'text-[var(--text-dim)] hover:bg-[color-mix(in_srgb,var(--text)_8%,transparent)] hover:text-[var(--text)]'
+          }`}
+      >
+        {icon}
+      </button>
+    )
+  }
+
+  return (
+    <div className="chrome-chip flex items-center gap-0.5 p-[3px]" role="group" aria-label="Window size">
+      {btn('default', 'Default', <Maximize2 size={13} strokeWidth={2.2} />)}
+      {btn('compact', 'Compact', <Minimize2 size={13} strokeWidth={2.2} />)}
+    </div>
+  )
+}
+
 function ThemeMenu({ value, onChange }) {
   const [open, setOpen] = useState(false)
   const ref = useRef(null)
@@ -1890,7 +2067,7 @@ function ThemeMenu({ value, onChange }) {
                   onChange(t.id)
                   setOpen(false)
                 }}
-                className={`flex w-full items-center gap-2.5 px-3 py-2 text-left text-[12px] hover:bg-[var(--sunken)] ${active ? 'text-[var(--text)]' : 'text-[var(--text-dim)]'
+                className={`menu-item flex w-full items-center gap-2.5 px-3 py-2 text-left text-[12px] ${active ? 'text-[var(--text)]' : 'text-[var(--text-dim)]'
                   }`}
               >
                 <span
@@ -1912,38 +2089,38 @@ function ThemeMenu({ value, onChange }) {
   )
 }
 
-function SectionLabel({ children, className = '' }) {
+function SectionLabel({ children, className = '', compact }) {
   return (
     <label
-      className={`section-label mb-1.5 inline-flex items-center text-[11px] font-semibold uppercase tracking-wide text-text-muted ${className}`}
+      className={`section-label inline-flex items-center font-semibold uppercase tracking-wide text-text-muted ${compact ? 'mb-1 text-[10px]' : 'mb-1.5 text-[11px]'} ${className}`}
     >
       {children}
     </label>
   )
 }
 
-function FormatCard({ spec, active, onClick, icon, title, subtitle, disabled, hint }) {
+function FormatCard({ spec, compact, active, onClick, icon, title, subtitle, disabled, hint }) {
   if (spec) {
     return (
       <button
         onClick={disabled ? undefined : onClick}
         disabled={disabled}
         title={hint}
-        className={`flex items-start gap-2 rounded-[10px] border px-3.5 py-[14px] text-left transition-colors ${disabled ? 'cursor-not-allowed opacity-40' : ''
+        className={`box-border flex items-start gap-2 rounded-[10px] border text-left transition-colors ${compact ? 'px-2.5 py-2' : 'px-3.5 py-[14px]'} ${disabled ? 'cursor-not-allowed opacity-40' : ''
           }`}
         style={{
           borderColor: active && !disabled ? 'var(--accent)' : 'var(--border)',
-          borderWidth: active && !disabled ? 1.5 : 1,
+          borderWidth: compact ? 1 : active && !disabled ? 1.5 : 1,
           background: active && !disabled ? 'var(--accent-surface)' : 'var(--sunken)'
         }}
       >
         <span
-          className="mt-[6px] h-1.5 w-1.5 shrink-0 rounded-full"
+          className={`shrink-0 rounded-full ${compact ? 'mt-[5px] h-1 w-1' : 'mt-[6px] h-1.5 w-1.5'}`}
           style={{ background: active && !disabled ? 'var(--accent)' : 'var(--border-strong)' }}
         />
         <span>
-          <span className="block text-[13px] font-semibold leading-tight text-[var(--text)]">{title}</span>
-          <span className="mt-0.5 block font-mono text-[11px] text-[var(--text-dim)]">{subtitle}</span>
+          <span className={`block font-semibold leading-tight text-[var(--text)] ${compact ? 'text-[12px]' : 'text-[13px]'}`}>{title}</span>
+          <span className={`mt-0.5 block font-mono text-[var(--text-dim)] ${compact ? 'text-[10px]' : 'text-[11px]'}`}>{subtitle}</span>
         </span>
       </button>
     )
@@ -1979,7 +2156,7 @@ function FormatCard({ spec, active, onClick, icon, title, subtitle, disabled, hi
   )
 }
 
-function Pill({ spec, active, onClick, group, title, disabled, children }) {
+function Pill({ spec, compact, active, onClick, group, title, disabled, children }) {
   if (spec) {
     return (
       <button
@@ -1987,7 +2164,7 @@ function Pill({ spec, active, onClick, group, title, disabled, children }) {
         onClick={disabled ? undefined : onClick}
         title={title}
         aria-disabled={disabled || undefined}
-        className={`relative isolate flex-1 rounded-[7px] py-2 text-center font-mono text-[12px] transition-[color,opacity] duration-200 ${disabled ? 'pointer-events-none cursor-default opacity-35' : ''
+        className={`relative isolate flex-1 rounded-[7px] text-center font-mono transition-[color,opacity] duration-200 ${compact ? 'py-1 text-[11px]' : 'py-2 text-[12px]'} ${disabled ? 'pointer-events-none cursor-default opacity-35' : ''
           } ${active && !disabled ? 'font-medium text-[var(--text)]' : 'font-normal text-[var(--text-dim)]'
           }`}
       >
@@ -2073,14 +2250,19 @@ function GhostBtn({ onClick, children }) {
   )
 }
 
-function EmbedToggle({ on, onToggle }) {
+function SwitchRow({ label, extra, on, onToggle, ariaLabel, disabled, compact }) {
   return (
-    <div className="flex h-[42px] w-full items-center justify-between rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-4">
-      <span className="text-sm font-medium">Embed metadata &amp; cover art</span>
+    <div className={`flex w-full items-center justify-between rounded-[10px] border border-[var(--border)] bg-[var(--surface)] ${compact ? 'h-9 gap-1.5 px-2.5' : 'h-[42px] px-4'} ${disabled ? 'pointer-events-none opacity-40' : ''}`}>
+      <span className={`min-w-0 truncate font-medium ${compact ? 'text-[12px]' : 'text-sm'}`}>
+        {label}
+        {extra ? (
+          <span className="ml-1 font-normal text-[var(--text-dim)]">{extra}</span>
+        ) : null}
+      </span>
       <button
         type="button"
         onClick={onToggle}
-        aria-label="Toggle embed metadata and cover art"
+        aria-label={ariaLabel}
         className="inline-flex shrink-0 appearance-none items-center border-0 bg-transparent p-0"
       >
         <Switch on={on} />
