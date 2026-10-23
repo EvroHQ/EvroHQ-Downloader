@@ -1423,6 +1423,28 @@ async function handleDownload(params) {
       `Trim range: ${secondsToStamp(startSec)} → ${secondsToStamp(endSec)} ` +
         `(${secondsToStamp(endSec - startSec)} long)`
     )
+    // Check the range against the video length BEFORE downloading, so a bad
+    // range doesn't cost a full download. Use the renderer's value if known.
+    let duration = Number.isFinite(params.duration) ? params.duration : null
+    if (duration == null) {
+      const info = await fetchVideoInfo(ytdlp, url).catch(() => null)
+      duration = info?.duration ?? null
+    }
+    if (cancelRequested) throw new Error(CANCELLED)
+    if (duration != null && duration > 0) {
+      if (startSec >= duration) {
+        throw new Error(
+          `Start (${secondsToStamp(startSec)}) is past the end of the video (${secondsToStamp(duration)}). ` +
+            `Check your time values (fields are hh:mm:ss).`
+        )
+      }
+      if (endSec > duration + 0.5) {
+        throw new Error(
+          `End (${secondsToStamp(endSec)}) is beyond the video length (${secondsToStamp(duration)}). ` +
+            `Check your time values (fields are hh:mm:ss).`
+        )
+      }
+    }
   }
 
   const startStamp = secondsToStamp(startSec)

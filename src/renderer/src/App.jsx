@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
-import { Toaster, toast } from 'sonner'
+import { Toaster, toast as baseToast } from 'sonner'
 import {
   Download,
   Clipboard,
@@ -25,6 +25,12 @@ import {
   Maximize2,
   Minimize2
 } from 'lucide-react'
+
+// Errors and warnings stay up longer than the 2s default so they can be read.
+const toast = Object.assign((...args) => baseToast(...args), baseToast, {
+  error: (msg, opts) => baseToast.error(msg, { duration: 6000, ...opts }),
+  warning: (msg, opts) => baseToast.warning(msg, { duration: 5000, ...opts })
+})
 
 const spring = { type: 'spring', stiffness: 420, damping: 34 }
 
@@ -73,6 +79,24 @@ const WHATS_NEW = [
       {
         title: 'About',
         body: 'Open About next to Themes to read who I am, what this project is, and how to support it.'
+      }
+    ]
+  },
+  {
+    id: '2.3.5',
+    version: '2.3.5',
+    items: [
+      {
+        title: 'Smarter trim',
+        body: 'A trim range past the end of the video is caught before downloading, and the preview shows the length and size of your selection.'
+      },
+      {
+        title: 'Clearer notifications',
+        body: 'Notifications are colored by type and errors stay on screen longer.'
+      },
+      {
+        title: 'Small polish',
+        body: 'Steadier download percentage and full-width track highlight in playlists.'
       }
     ]
   }
@@ -279,13 +303,23 @@ function parseTimeToSeconds(value) {
   return seconds
 }
 
-function trimRangeError(startValue, endValue) {
+// `duration` (seconds) is the video length when known, so a range past the end
+// is rejected before anything is downloaded.
+function trimRangeError(startValue, endValue, duration) {
   const startSec = parseTimeToSeconds(startValue || '00:00:00')
   const endSec = parseTimeToSeconds(endValue || '00:00:00')
   if (startSec == null) return `Invalid Start time "${startValue}". Use hh:mm:ss, mm:ss or seconds.`
   if (endSec == null) return `Invalid End time "${endValue}". Use hh:mm:ss, mm:ss or seconds.`
   if (endSec <= startSec) {
     return `End (${fmtClock(endSec)}) must be greater than Start (${fmtClock(startSec)}).`
+  }
+  if (Number.isFinite(duration) && duration > 0) {
+    if (startSec >= duration) {
+      return `Start (${fmtClock(startSec)}) is past the end of the video (${fmtClock(duration)}).`
+    }
+    if (endSec > duration + 0.5) {
+      return `End (${fmtClock(endSec)}) is beyond the video length (${fmtClock(duration)}).`
+    }
   }
   return null
 }
@@ -684,6 +718,17 @@ export default function App() {
     .filter((t) => selected.has(t.id))
     .reduce((a, t) => a + (t.duration || 0), 0)
 
+  // Length of the trimmed selection (clamped to the video), or null when the
+  // whole video is downloaded or the range isn't valid yet.
+  const clipSecs = (() => {
+    if (isSc || mode !== 'single' || !useRange || byChapters) return null
+    const s = parseTimeToSeconds(start || '00:00:00')
+    let e = parseTimeToSeconds(end || '00:00:00')
+    if (s == null || e == null) return null
+    if (Number.isFinite(videoInfo?.duration)) e = Math.min(e, videoInfo.duration)
+    return e > s ? e - s : null
+  })()
+
   const singleValid = Boolean(url.trim()) && (isYouTubeUrl(url) || isSoundCloudUrl(url))
   const canDownload =
     mode === 'playlist' ? selected.size > 0 && !downloading : singleValid && !downloading
@@ -821,7 +866,7 @@ export default function App() {
     }
 
     if (mode === 'single' && useRange && !byChapters) {
-      const err = trimRangeError(start, end)
+      const err = trimRangeError(start, end, videoInfo?.duration)
       if (err) {
         toast.error(err)
         return
@@ -875,7 +920,8 @@ export default function App() {
       embedMeta,
       start: start || '00:00:00',
       end: end || '00:00:00',
-      title: videoInfo?.title
+      title: videoInfo?.title,
+      duration: videoInfo?.duration
     })
   }
 
@@ -1405,9 +1451,10 @@ export default function App() {
                       empty={urlState === null}
                       soundcloud={isSc}
                       compact={compact}
+                      clipSecs={clipSecs}
                       sizeLabel={
-                        videoInfo?.duration
-                          ? `~${estSizeLabel(videoInfo.duration)} ${formatLabel}`
+                        clipSecs || videoInfo?.duration
+                          ? `~${estSizeLabel(clipSecs || videoInfo.duration)} ${formatLabel}`
                           : null
                       }
                     />
@@ -1454,8 +1501,8 @@ export default function App() {
                   transition={{ ease: 'linear', duration: 0.2 }}
                 />
               </div>
-              <span className="pointer-events-none absolute right-0 top-1/2 -translate-y-1/2 bg-base pl-3 font-mono text-[11px] tabular-nums text-[var(--text-faint)]">
-                {(downloading ? progress : 0).toFixed(1)}%
+              <span className="pointer-events-none absolute right-0 top-1/2 w-[calc(4ch+0.75rem)] -translate-y-1/2 bg-base pl-3 text-right font-mono text-[11px] tabular-nums text-[var(--text-faint)]">
+                {Math.floor(downloading ? progress : 0)}%
               </span>
             </div>
           </div>
@@ -1557,7 +1604,7 @@ function PreviewMessage({ icon, children, spinning }) {
   )
 }
 
-function SinglePreview({ info, loading, error, empty, sizeLabel, soundcloud, compact }) {
+function SinglePreview({ info, loading, error, empty, sizeLabel, clipSecs, soundcloud, compact }) {
   const [artBroken, setArtBroken] = useState(false)
   const sc = soundcloud || info?.source === 'soundcloud'
   useEffect(() => {
@@ -1619,7 +1666,12 @@ function SinglePreview({ info, loading, error, empty, sizeLabel, soundcloud, com
       )}
       <div className={`mt-auto flex items-center justify-between border-t border-[var(--border)] bg-[var(--panel-footer)] font-mono text-[12px] ${compact ? '-mx-3 -mb-3 px-3 py-3' : '-mx-5 -mb-5 px-5 py-3'}`}>
         <span className="text-[var(--text-dim)]">
-          {info.duration != null ? `Full length · ${fmtLong(info.duration)}` : 'Length unknown'}
+          {clipSecs
+            ? `Selection · ${clipSecs < 60 ? `${Math.round(clipSecs)}s` : fmtLong(clipSecs)}` +
+              (info.duration != null ? ` of ${fmtLong(info.duration)}` : '')
+            : info.duration != null
+              ? `Full length · ${fmtLong(info.duration)}`
+              : 'Length unknown'}
         </span>
         {sizeLabel && <span className="size-estimate">{sizeLabel}</span>}
       </div>
@@ -1701,7 +1753,7 @@ function PlaylistPreview({
               <button
                 key={t.id}
                 onClick={() => onToggle(t.id)}
-                className="track-row flex w-full items-center gap-2.5 py-2.5 text-left"
+                className="track-row flex w-full items-center gap-2.5 px-2 py-2.5 text-left"
                 style={{ opacity: locked ? 0.55 : checked ? 1 : 0.45 }}
               >
                 <span
@@ -1738,7 +1790,7 @@ function PlaylistPreview({
                     {t.plays != null ? formatCount(t.plays) : '—'}
                   </span>
                 ) : null}
-                <span className="w-10 shrink-0 text-right font-mono text-[12px] tabular-nums text-[var(--text-dim)]">
+                <span className="min-w-10 shrink-0 text-right font-mono text-[12px] tabular-nums text-[var(--text-dim)]">
                   {t.duration != null ? fmtClock(t.duration) : '—'}
                 </span>
               </button>
