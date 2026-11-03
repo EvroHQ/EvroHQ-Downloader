@@ -23,7 +23,10 @@ import {
   Lock,
   Sparkles,
   Maximize2,
-  Minimize2
+  Minimize2,
+  ListPlus,
+  ListOrdered,
+  X
 } from 'lucide-react'
 
 // Errors and warnings stay up longer than the 2s default so they can be read.
@@ -97,6 +100,24 @@ const WHATS_NEW = [
       {
         title: 'Small polish',
         body: 'Steadier download percentage and full-width track highlight in playlists.'
+      }
+    ]
+  },
+  {
+    id: '2.4.0',
+    version: '2.4.0',
+    items: [
+      {
+        title: 'Download queue',
+        body: 'Add more videos or playlists while a download is running. They start one after another, each with the settings you picked.'
+      },
+      {
+        title: 'Live progress',
+        body: 'Open the queue next to Stop to see the current file filling up as it downloads, and remove anything still waiting.'
+      },
+      {
+        title: 'No duplicates',
+        body: 'The same download can’t be added twice. The same video in another format still can.'
       }
     ]
   }
@@ -391,7 +412,13 @@ export default function App() {
   const whatsNewAckRef = useRef([])
   const [scFormat, setScFormat] = useState('original')
   const [dlUi, setDlUi] = useState(null)
+  // Downloads waiting for the current one to finish (run one at a time).
+  const [queue, setQueue] = useState([])
+  const queueRef = useRef([])
+  const queueIdRef = useRef(0)
   const dlStreamsRef = useRef(1)
+  // Identifies the running job so the same download can't be queued twice.
+  const currentJobKeyRef = useRef(null)
 
   // Real metadata for the preview panel (fetched via yt-dlp).
   const [videoInfo, setVideoInfo] = useState(null)
@@ -730,25 +757,17 @@ export default function App() {
   })()
 
   const singleValid = Boolean(url.trim()) && (isYouTubeUrl(url) || isSoundCloudUrl(url))
-  const canDownload =
-    mode === 'playlist' ? selected.size > 0 && !downloading : singleValid && !downloading
+  const canStart = mode === 'playlist' ? selected.size > 0 : singleValid
+  const canDownload = canStart && !downloading
 
   const formatWord = formatLabel
+  const queuedNote = queue.length ? ` · ${queue.length} queued` : ''
   const statusText = downloading
     ? stopping
       ? 'Stopping…'
-      : dlUi?.platform === 'soundcloud'
-        ? dlUi.playlist
-          ? `Downloading ${playlistPos ? `${playlistPos.current}/${playlistPos.total}` : `0/${dlUi.selectedCount}`} · ${dlUi.formatWord}`
-          : `Downloading · ${dlUi.converting}`
-        : mode === 'playlist'
-          ? `Downloading ${playlistPos ? `${playlistPos.current}/${playlistPos.total}` : `0/${selected.size}`} · ${formatWord}`
-          : `Downloading · ${format === 'video'
-            ? 'preparing MP4'
-            : audioFormat === 'wav'
-              ? 'converting to WAV'
-              : 'converting to MP3'
-          }`
+      : (dlUi?.playlist
+        ? `Downloading ${playlistPos ? `${playlistPos.current}/${playlistPos.total}` : `0/${dlUi.selectedCount}`} · ${dlUi.formatWord}`
+        : `Downloading · ${dlUi?.converting || 'preparing'}`) + queuedNote
     : 'Idle — ready to download'
 
   const activeBanner =
@@ -806,20 +825,19 @@ export default function App() {
     if (folder) setOutputFolder(folder)
   }
 
-  const handleDownload = async () => {
-    if (!canDownload) return
+  // Snapshot everything a download needs now, so later edits to the URL or
+  // options (while it waits in the queue) don't change it.
+  const buildJob = () => {
     const link = url.trim()
+    const label = (mode === 'playlist' ? playlistInfo?.title : videoInfo?.title) || link
 
     if (isSc) {
-      const scWord = scFormat === 'wav' ? 'WAV' : 'Original'
-      dlStreamsRef.current = 1
-      setDlUi({
-        platform: 'soundcloud',
+      const ui = {
         playlist: mode === 'playlist',
-        formatWord: scWord,
+        formatWord: scFormat === 'wav' ? 'WAV' : 'Original',
         converting: scFormat === 'wav' ? 'converting to WAV' : 'downloading original',
         selectedCount: selected.size
-      })
+      }
       if (mode === 'playlist') {
         const chosen = playlistTracks.filter((t) => selected.has(t.id) && !t.protected)
         const selectedTracks = playlistTracks
@@ -835,41 +853,46 @@ export default function App() {
           })
           .filter(Boolean)
         const skippedTracks = playlistTracks.filter((t) => t.protected).map((t) => t.title)
-        setDownloading(true)
-        setStopping(false)
-        resetDownloadProgress()
-        setPlaylistPos({ current: 0, total: selectedTracks.length })
-        await window.api?.startSoundCloudPlaylistDownload({
+        return {
+          label,
+          api: 'startSoundCloudPlaylistDownload',
+          streams: 1,
+          ui,
+          total: selectedTracks.length,
+          params: {
+            platform: 'soundcloud',
+            url: link,
+            format: scFormat,
+            selectedTracks,
+            trackUrls,
+            skippedTracks,
+            itemCount: selectedTracks.length,
+            title: playlistInfo?.title,
+            artist: playlistInfo?.artist
+          }
+        }
+      }
+      return {
+        label,
+        api: 'startSoundCloudDownload',
+        streams: 1,
+        ui,
+        params: {
           platform: 'soundcloud',
           url: link,
           format: scFormat,
-          selectedTracks,
-          trackUrls,
-          skippedTracks,
-          itemCount: selectedTracks.length,
-          title: playlistInfo?.title,
-          artist: playlistInfo?.artist
-        })
-        return
+          title: videoInfo?.title,
+          artist: videoInfo?.channel
+        }
       }
-      setDownloading(true)
-      setStopping(false)
-      resetDownloadProgress()
-      await window.api?.startSoundCloudDownload({
-        platform: 'soundcloud',
-        url: link,
-        format: scFormat,
-        title: videoInfo?.title,
-        artist: videoInfo?.channel
-      })
-      return
     }
 
+    const streams = format === 'video' ? 2 : 1
     if (mode === 'single' && useRange && !byChapters) {
       const err = trimRangeError(start, end, videoInfo?.duration)
       if (err) {
         toast.error(err)
-        return
+        return null
       }
     }
     if (mode === 'playlist') {
@@ -882,47 +905,116 @@ export default function App() {
         .filter(Boolean)
       if (!trackUrls.length) {
         toast.error('Could not resolve the selected tracks.')
-        return
+        return null
       }
-      setDownloading(true)
-      setStopping(false)
-      resetDownloadProgress()
-      dlStreamsRef.current = format === 'video' ? 2 : 1
-      setDlUi(null)
-      setPlaylistPos({ current: 0, total: trackUrls.length })
-      await window.api?.startPlaylistDownload({
-        url: url.trim(),
-        trackUrls,
-        title: playlistInfo?.title,
-        itemCount: trackUrls.length,
+      return {
+        label,
+        api: 'startPlaylistDownload',
+        streams,
+        ui: { playlist: true, formatWord, selectedCount: trackUrls.length },
+        total: trackUrls.length,
+        params: {
+          url: link,
+          trackUrls,
+          title: playlistInfo?.title,
+          itemCount: trackUrls.length,
+          format,
+          audioFormat,
+          videoQuality,
+          codec,
+          embedMeta
+        }
+      }
+    }
+    return {
+      label,
+      api: 'startDownload',
+      streams,
+      ui: {
+        playlist: false,
+        formatWord,
+        converting:
+          format === 'video'
+            ? 'preparing MP4'
+            : audioFormat === 'wav'
+              ? 'converting to WAV'
+              : 'converting to MP3'
+      },
+      params: {
+        url: link,
         format,
         audioFormat,
         videoQuality,
         codec,
-        embedMeta
-      })
-      return
+        useRange: useRange && !byChapters,
+        byChapters: byChapters && !useRange,
+        chapterCount: chapters.length,
+        embedMeta,
+        start: start || '00:00:00',
+        end: end || '00:00:00',
+        title: videoInfo?.title,
+        duration: videoInfo?.duration
+      }
     }
+  }
+
+  // Uses only setters, refs and the job itself: it also runs from the queue
+  // loop, long after the render that created it.
+  const runJob = async (job) => {
+    currentJobKeyRef.current = jobKey(job)
     setDownloading(true)
     setStopping(false)
     resetDownloadProgress()
-    dlStreamsRef.current = format === 'video' ? 2 : 1
-    setDlUi(null)
-    await window.api?.startDownload({
-      url: url.trim(),
-      format,
-      audioFormat,
-      videoQuality,
-      codec,
-      useRange: useRange && !byChapters,
-      byChapters: byChapters && !useRange,
-      chapterCount: chapters.length,
-      embedMeta,
-      start: start || '00:00:00',
-      end: end || '00:00:00',
-      title: videoInfo?.title,
-      duration: videoInfo?.duration
-    })
+    dlStreamsRef.current = job.streams
+    setDlUi({ ...job.ui, label: job.label || job.params?.title || job.params?.url })
+    setPlaylistPos(job.total ? { current: 0, total: job.total } : null)
+    try {
+      await window.api?.[job.api](job.params)
+    } catch (e) {
+      setDownloading(false)
+      toast.error(e?.message || 'Download failed', { id: 'dl' })
+    }
+  }
+
+  // One download at a time; each finished job pulls the next from the queue.
+  const runQueue = async (first) => {
+    let job = first
+    while (job) {
+      await runJob(job)
+      job = queueRef.current.shift()
+      setQueue([...queueRef.current])
+    }
+    currentJobKeyRef.current = null
+  }
+
+  const handleDownload = () => {
+    if (!canStart) return
+    const job = buildJob()
+    if (!job) return
+    if (downloading) {
+      const key = jobKey(job)
+      if (key === currentJobKeyRef.current || queueRef.current.some((j) => jobKey(j) === key)) {
+        toast.info(key === currentJobKeyRef.current ? 'Already downloading' : 'Already in the queue')
+        return
+      }
+      job.id = ++queueIdRef.current
+      queueRef.current.push(job)
+      setQueue([...queueRef.current])
+      toast.info(`Added to queue (${queueRef.current.length})`)
+      applyUrl('')
+      return
+    }
+    runQueue(job)
+  }
+
+  const removeQueued = (id) => {
+    queueRef.current = queueRef.current.filter((j) => j.id !== id)
+    setQueue([...queueRef.current])
+  }
+
+  const clearQueue = () => {
+    queueRef.current = []
+    setQueue([])
   }
 
   const handleStop = async () => {
@@ -1384,19 +1476,40 @@ export default function App() {
 
                 {downloading ? (
                   <div className="flex gap-2">
-                    <div className={`glass-soft flex flex-1 items-center justify-center gap-2 rounded-2xl text-sm font-bold tracking-wide text-text-secondary ${compact ? 'h-10' : 'h-[46px]'}`}>
-                      <Loader2 size={16} className="animate-spin" />
-                      DOWNLOADING…
-                    </div>
+                    {canStart ? (
+                      <motion.button
+                        whileTap={{ scale: 0.985 }}
+                        onClick={handleDownload}
+                        className={`flex flex-1 items-center justify-center gap-2 rounded-[8px] bg-accent-gradient font-bold tracking-wide text-[var(--on-accent)] transition-[filter] hover:brightness-110 ${compact ? 'h-10 text-[13px]' : 'h-[46px] text-[15px]'}`}
+                      >
+                        <ListPlus size={16} />
+                        <span>Add to queue</span>
+                      </motion.button>
+                    ) : (
+                      <div className={`glass-soft flex flex-1 items-center justify-center gap-2 rounded-2xl text-sm font-bold tracking-wide text-text-secondary ${compact ? 'h-10' : 'h-[46px]'}`}>
+                        <Loader2 size={16} className="animate-spin" />
+                        DOWNLOADING…
+                      </div>
+                    )}
+                    {queue.length > 0 && (
+                      <QueueMenu
+                        queue={queue}
+                        current={downloading ? { label: dlUi?.label, progress } : null}
+                        compact={compact}
+                        onRemove={removeQueued}
+                        onClear={clearQueue}
+                      />
+                    )}
                     <button
                       onClick={handleStop}
                       disabled={stopping}
+                      title={queue.length ? 'Stops the current download; the queue continues' : undefined}
                       className={`flex items-center justify-center gap-2 rounded-[10px] border px-5 text-sm font-medium ${compact ? 'h-10' : 'h-[46px]'} ${stopping
                         ? 'cursor-not-allowed border-[var(--border)] bg-[var(--sunken)] text-[var(--text-faint)]'
                         : 'border-[var(--border)] bg-[var(--surface)] text-[var(--text-dim)] hover:border-error/60 hover:text-error'
                         }`}
                     >
-                      <Square size={13} />
+                    <Square size={13} />
                       {stopping ? 'Stopping…' : 'Stop'}
                     </button>
                   </div>
@@ -2138,6 +2251,113 @@ function ThemeMenu({ value, onChange }) {
         </div>
       )}
     </div>
+  )
+}
+
+// Same API + same params = same download (a different format is a new one).
+function jobKey(job) {
+  return `${job.api}:${JSON.stringify(job.params)}`
+}
+
+// Queued downloads, opened from a small button so the list never takes room
+// in the layout. Portaled: the left column clips overflowing children.
+function QueueMenu({ queue, current, compact, onRemove, onClear }) {
+  const [pos, setPos] = useState(null)
+  const btnRef = useRef(null)
+  const listRef = useRef(null)
+
+  useEffect(() => {
+    if (!pos) return
+    const onDoc = (e) => {
+      if (btnRef.current?.contains(e.target) || listRef.current?.contains(e.target)) return
+      setPos(null)
+    }
+    const close = () => setPos(null)
+    document.addEventListener('mousedown', onDoc)
+    window.addEventListener('resize', close)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      window.removeEventListener('resize', close)
+    }
+  }, [pos])
+
+  const toggle = () => {
+    if (pos) return setPos(null)
+    const r = btnRef.current.getBoundingClientRect()
+    setPos({ bottom: window.innerHeight - r.top + 6, right: window.innerWidth - r.right })
+  }
+
+  return (
+    <>
+      <button
+        ref={btnRef}
+        type="button"
+        onClick={toggle}
+        title="Queued downloads"
+        className={`flex items-center justify-center gap-1.5 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-medium text-[var(--text)] hover:border-[var(--accent)] ${compact ? 'h-10' : 'h-[46px]'}`}
+      >
+        <ListOrdered size={14} />
+        <span className="font-mono tabular-nums">{queue.length}</span>
+      </button>
+      {pos &&
+        createPortal(
+          <div
+            ref={listRef}
+            style={{ bottom: pos.bottom, right: pos.right }}
+            className="fixed z-50 w-[280px] max-w-[calc(100vw-32px)] overflow-hidden rounded-[10px] border border-[var(--border)] bg-[var(--surface)] shadow-lg"
+          >
+            <div className="flex items-center justify-between border-b border-[var(--border)] px-3 py-2">
+              <span className="text-[11px] font-semibold uppercase tracking-[0.6px] text-[var(--text-dim)]">
+                Queue · {queue.length}
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  onClear()
+                  setPos(null)
+                }}
+                className="text-[11px] text-[var(--text-faint)] hover:text-error"
+              >
+                Clear
+              </button>
+            </div>
+            <ul className="max-h-[200px] overflow-y-auto py-1">
+              {current && (
+                <li className="relative overflow-hidden text-[12px] text-[var(--text)]" title={current.label}>
+                  <div
+                    className="absolute inset-y-0 left-0 bg-[var(--accent)] opacity-25 transition-[width] duration-300 ease-out"
+                    style={{ width: `${Math.max(0, Math.min(100, current.progress || 0))}%` }}
+                  />
+                  <div className="relative flex items-center gap-2 px-3 py-1.5">
+                    <Loader2 size={11} className="w-4 shrink-0 animate-spin text-[var(--accent)]" />
+                    <span className="min-w-0 flex-1 truncate">{current.label || 'Downloading…'}</span>
+                    <span className="shrink-0 font-mono text-[11px] tabular-nums text-[var(--text-dim)]">
+                      {Math.floor(current.progress || 0)}%
+                    </span>
+                  </div>
+                </li>
+              )}
+              {queue.map((job, i) => (
+                <li key={job.id} className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-[var(--text)]">
+                  <span className="w-4 shrink-0 font-mono text-[11px] text-[var(--text-faint)]">{i + 1}</span>
+                  <span className="min-w-0 flex-1 truncate" title={job.label}>
+                    {job.label}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => onRemove(job.id)}
+                    title="Remove from queue"
+                    className="shrink-0 text-[var(--text-faint)] hover:text-error"
+                  >
+                    <X size={13} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </div>,
+          document.body
+        )}
+    </>
   )
 }
 
