@@ -120,6 +120,16 @@ const WHATS_NEW = [
         body: 'The same download can’t be added twice. The same video in another format still can.'
       }
     ]
+  },
+  {
+    id: '2.4.1',
+    version: '2.4.1',
+    items: [
+      {
+        title: 'What’s new fix',
+        body: 'This window now fits any screen and only shows the latest changes, so it can always be closed.'
+      }
+    ]
   }
 ]
 
@@ -468,8 +478,11 @@ export default function App() {
       if (pending.length) {
         seenVersionRef.current = cfg.version
         whatsNewAckRef.current = Array.isArray(cfg.whatsNewAck) ? cfg.whatsNewAck : []
+        /* Only show the newest block (fresh installs would otherwise get every
+           past release); acking all pending ids so older ones never resurface. */
+        const latest = pending.reduce((a, b) => (cmpVer(b.version, a.version) > 0 ? b : a))
         setWhatsNew({
-          items: pending.flatMap((n) => n.items),
+          items: latest.items,
           ids: pending.map((n) => n.id)
         })
       }
@@ -1962,7 +1975,7 @@ function WhatsNewModal({ version, items, onDismiss }) {
         aria-labelledby="whats-new-title"
         tabIndex={-1}
         onPointerDown={(e) => e.stopPropagation()}
-        className="w-full max-w-[400px] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.45)] outline-none"
+        className="flex max-h-full w-full max-w-[400px] flex-col rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.45)] outline-none"
       >
         <div className="flex items-start gap-3">
           <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-accent-gradient shadow-glow">
@@ -1977,7 +1990,7 @@ function WhatsNewModal({ version, items, onDismiss }) {
             )}
           </div>
         </div>
-        <ul className="mt-4 flex flex-col gap-3">
+        <ul className="mt-4 flex min-h-0 flex-col gap-3 overflow-y-auto">
           {items.map((item) => (
             <li key={item.title} className="rounded-xl border border-[var(--border)] bg-[var(--sunken)] px-3.5 py-3">
               <p className="text-[13px] font-semibold text-text-primary">{item.title}</p>
@@ -1999,7 +2012,7 @@ function WhatsNewModal({ version, items, onDismiss }) {
             downOnBtn.current = false
             onDismiss()
           }}
-          className="mt-4 h-[38px] w-full rounded-[10px] bg-accent-gradient text-[13px] font-semibold text-[var(--on-accent)] shadow-glow transition-[filter] hover:brightness-110 disabled:opacity-60 disabled:pointer-events-none"
+          className="mt-4 h-[38px] w-full shrink-0 rounded-[10px] bg-accent-gradient text-[13px] font-semibold text-[var(--on-accent)] shadow-glow transition-[filter] hover:brightness-110 disabled:opacity-60 disabled:pointer-events-none"
         >
           Got it
         </button>
