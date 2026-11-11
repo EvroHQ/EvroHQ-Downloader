@@ -26,8 +26,13 @@ import {
   Minimize2,
   ListPlus,
   ListOrdered,
+  Eye,
+  EyeOff,
+  ChevronRight,
   X
 } from 'lucide-react'
+import proxyIconUrl from '../../../resources/proxy_icon.svg?url'
+import appIconUrl from '../../../resources/evrohq-icon-1024.svg?url'
 
 // Errors and warnings stay up longer than the 2s default so they can be read.
 const toast = Object.assign((...args) => baseToast(...args), baseToast, {
@@ -128,6 +133,20 @@ const WHATS_NEW = [
       {
         title: 'What’s new fix',
         body: 'This window now fits any screen and only shows the latest changes, so it can always be closed.'
+      }
+    ]
+  },
+  {
+    id: '2.5.0',
+    version: '2.5.0',
+    items: [
+      {
+        title: 'Proxy',
+        body: 'Open Proxy in the header to route downloads through a SOCKS5, SOCKS4 or HTTP proxy, with optional login and a connection test.'
+      },
+      {
+        title: 'New look',
+        body: 'A brand-new app icon, and shorter notifications that fit their message.'
       }
     ]
   }
@@ -416,6 +435,8 @@ export default function App() {
   const [theme, setTheme] = useState('evrohq')
   const [windowSize, setWindowSize] = useState('default')
   const [aboutOpen, setAboutOpen] = useState(false)
+  const [proxy, setProxy] = useState(null)
+  const [proxyOpen, setProxyOpen] = useState(false)
   const themeReady = useRef(false)
   const [whatsNew, setWhatsNew] = useState(null)
   const seenVersionRef = useRef('')
@@ -474,6 +495,9 @@ export default function App() {
       if (cfg?.windowSize === 'compact' || cfg?.windowSize === 'default') setWindowSize(cfg.windowSize)
       if (cfg?.codec === 'h264' || cfg?.codec === 'best') setCodec(cfg.codec)
       themeReady.current = true
+      window.api?.getProxy?.().then((p) => {
+        if (!cancelled && p) setProxy(p)
+      })
       const pending = unseenWhatsNew(cfg?.whatsNewAck, cfg?.version)
       if (pending.length) {
         seenVersionRef.current = cfg.version
@@ -773,6 +797,7 @@ export default function App() {
   const canStart = mode === 'playlist' ? selected.size > 0 : singleValid
   const canDownload = canStart && !downloading
 
+  const proxyOn = Boolean(proxy?.enabled && proxy?.host)
   const formatWord = formatLabel
   const queuedNote = queue.length ? ` · ${queue.length} queued` : ''
   const statusText = downloading
@@ -781,7 +806,7 @@ export default function App() {
       : (dlUi?.playlist
         ? `Downloading ${playlistPos ? `${playlistPos.current}/${playlistPos.total}` : `0/${dlUi.selectedCount}`} · ${dlUi.formatWord}`
         : `Downloading · ${dlUi?.converting || 'preparing'}`) + queuedNote
-    : 'Idle — ready to download'
+    : 'Idle — ready to download' + (proxyOn ? ` · via ${proxySummary(proxy)}` : '')
 
   const activeBanner =
     appUpdate?.status === 'downloading'
@@ -1147,6 +1172,15 @@ export default function App() {
             <div className="ml-auto flex shrink-0 items-center gap-2">
               <WindowSizeMenu value={windowSize} onChange={selectWindowSize} />
               <ThemeMenu value={theme} onChange={setTheme} />
+              <button
+                type="button"
+                onClick={() => setProxyOpen(true)}
+                title={proxyOn ? `Proxy on · ${proxySummary(proxy)}` : 'Proxy settings'}
+                className="chrome-chip inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium transition-colors hover:text-[var(--text)]"
+              >
+                {proxyOn && <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />}
+                Proxy
+              </button>
               <button
                 type="button"
                 onClick={() => {
@@ -1678,6 +1712,17 @@ export default function App() {
         <AboutModal version={version} onClose={() => setAboutOpen(false)} />
       )}
 
+      {proxyOpen && (
+        <ProxyModal
+          initial={proxy}
+          onClose={() => setProxyOpen(false)}
+          onSaved={(p) => {
+            setProxy(p)
+            toast.success(p.enabled ? `Proxy on · ${proxySummary(p)}` : 'Proxy off')
+          }}
+        />
+      )}
+
       {whatsNew ? (
         <WhatsNewModal
           version={seenVersionRef.current || version}
@@ -2023,6 +2068,333 @@ function WhatsNewModal({ version, items, onDismiss }) {
   return createPortal(overlay, document.body)
 }
 
+/* -------------------------------------------------------------------------- */
+/*  Proxy                                                                     */
+/* -------------------------------------------------------------------------- */
+
+const PROXY_TYPE_LABEL = { socks5: 'SOCKS5', socks4: 'SOCKS4', http: 'HTTP' }
+
+function proxySummary(p) {
+  if (!p) return ''
+  const host = String(p.host || '').includes(':') ? `[${p.host}]` : p.host
+  return `${PROXY_TYPE_LABEL[p.type] || 'SOCKS5'} ${host}:${p.port}`
+}
+
+function proxyHostError(host) {
+  const h = String(host || '').trim()
+  if (!h) return 'Enter the proxy address'
+  if (!/^\[?[A-Za-z0-9.\-:]+\]?$/.test(h)) return 'Not a valid address'
+  return null
+}
+
+function proxyPortError(port) {
+  const s = String(port || '').trim()
+  if (!s) return 'Enter the port'
+  const n = Number(s)
+  if (!/^\d+$/.test(s) || n < 1 || n > 65535) return '1 – 65535'
+  return null
+}
+
+// Parse a pasted proxy like "socks5://user:pass@127.0.0.1:1080" or "1.2.3.4:8080".
+function parseProxyString(raw) {
+  const s = String(raw || '').trim()
+  const m = s.match(
+    /^(?:(socks5h?|socks4a?|https?):\/\/)?(?:([^:@\s/]*)(?::([^@\s/]*))?@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):(\d{1,5})\/?$/i
+  )
+  if (!m) return null
+  const scheme = (m[1] || '').toLowerCase()
+  const decode = (v) => {
+    try {
+      return decodeURIComponent(v || '')
+    } catch (e) {
+      return v || ''
+    }
+  }
+  return {
+    type: scheme.startsWith('socks4') ? 'socks4' : scheme.startsWith('http') ? 'http' : scheme ? 'socks5' : null,
+    host: m[4].replace(/^\[|\]$/g, ''),
+    port: m[5],
+    username: decode(m[2]),
+    password: decode(m[3])
+  }
+}
+
+function ProxyField({ label, error, className = '', children }) {
+  return (
+    <label className={`flex min-w-0 flex-col gap-1 ${className}`}>
+      <span className="text-[11px] font-medium text-[var(--text-dim)]">{label}</span>
+      {children}
+      {error ? <span className="text-[11px] text-red-400">{error}</span> : null}
+    </label>
+  )
+}
+
+const proxyInputClass = (invalid) =>
+  `h-9 w-full min-w-0 rounded-[10px] border bg-[var(--sunken)] px-3 font-mono text-[12px] text-[var(--text)] outline-none transition-colors placeholder:text-[var(--text-faint)] focus:border-[var(--border-strong)] ${invalid ? 'border-red-500/60' : 'border-[var(--border)]'
+  }`
+
+function ProxyModal({ initial, onClose, onSaved }) {
+  const [enabled, setEnabled] = useState(Boolean(initial?.enabled))
+  const [type, setType] = useState(initial?.type || 'socks5')
+  const [host, setHost] = useState(initial?.host || '')
+  const [port, setPort] = useState(initial?.port ? String(initial.port) : '1080')
+  const [username, setUsername] = useState(initial?.username || '')
+  const [password, setPassword] = useState(initial?.password || '')
+  const [authOpen, setAuthOpen] = useState(Boolean(initial?.username))
+  const [showPass, setShowPass] = useState(false)
+  const [touched, setTouched] = useState({})
+  const [test, setTest] = useState(null)
+  const [saving, setSaving] = useState(false)
+  const [saveError, setSaveError] = useState('')
+  const dialogRef = useRef(null)
+
+  useEffect(() => {
+    dialogRef.current?.focus()
+    const onKey = (e) => {
+      if (e.key === 'Escape') onClose()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [onClose])
+
+  // Any edit makes an earlier test result stale.
+  useEffect(() => {
+    setTest(null)
+    setSaveError('')
+  }, [type, host, port, username, password, enabled])
+
+  const hostErr = proxyHostError(host)
+  const portErr = proxyPortError(port)
+  const invalid = Boolean(hostErr || portErr)
+  const canAuth = type !== 'socks4'
+
+  const payload = () => ({
+    enabled,
+    type,
+    host: host.trim().replace(/^\[|\]$/g, ''),
+    port: Number(port),
+    username: canAuth ? username : '',
+    password: canAuth ? password : ''
+  })
+
+  const onHostPaste = (e) => {
+    const parsed = parseProxyString(e.clipboardData.getData('text'))
+    if (!parsed) return
+    e.preventDefault()
+    if (parsed.type) setType(parsed.type)
+    setHost(parsed.host)
+    setPort(parsed.port)
+    if (parsed.username) {
+      setUsername(parsed.username)
+      setPassword(parsed.password)
+      setAuthOpen(true)
+    }
+  }
+
+  const runTest = async () => {
+    setTouched({ host: true, port: true })
+    if (invalid) return
+    setTest({ state: 'running' })
+    try {
+      const res = await window.api.testProxy(payload())
+      setTest(res?.ok ? { state: 'ok', ms: res.ms } : { state: 'fail', msg: res?.error || 'Test failed.' })
+    } catch (e) {
+      setTest({ state: 'fail', msg: e?.message || 'Test failed.' })
+    }
+  }
+
+  const save = async () => {
+    if (enabled && invalid) {
+      setTouched({ host: true, port: true })
+      return
+    }
+    setSaving(true)
+    try {
+      const res = await window.api.setProxy(payload())
+      if (res?.ok) {
+        onSaved(res.proxy)
+        onClose()
+      } else {
+        setSaveError(res?.error || 'Could not save.')
+      }
+    } catch (e) {
+      setSaveError(e?.message || 'Could not save.')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const overlay = (
+    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 p-6 backdrop-blur-[4px]">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="proxy-title"
+        tabIndex={-1}
+        className="flex max-h-full w-full max-w-[400px] flex-col rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.45)] outline-none"
+      >
+        <div className="flex shrink-0 items-start gap-3">
+          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-accent-gradient shadow-glow">
+            <span
+              aria-hidden="true"
+              className="h-5 w-5 bg-[var(--on-accent)]"
+              style={{
+                WebkitMask: `url(${proxyIconUrl}) center / contain no-repeat`,
+                mask: `url(${proxyIconUrl}) center / contain no-repeat`
+              }}
+            />
+          </span>
+          <div className="min-w-0 pt-0.5">
+            <h2 id="proxy-title" className="text-[15px] font-semibold leading-tight text-text-primary">
+              Proxy
+            </h2>
+            <p className="mt-0.5 text-[12px] text-[var(--text-dim)]">Route downloads through a SOCKS or HTTP proxy</p>
+          </div>
+        </div>
+
+        <div className="mt-4 flex min-h-0 flex-col gap-3 overflow-y-auto">
+          <SwitchRow label="Use a proxy" on={enabled} onToggle={() => setEnabled((v) => !v)} ariaLabel="Use a proxy" />
+
+          <div className={`flex flex-col gap-3 transition-opacity ${enabled ? '' : 'pointer-events-none opacity-40'}`}>
+            <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
+              {['socks5', 'socks4', 'http'].map((t) => (
+                <Pill key={t} spec group="proxy-type" active={type === t} onClick={() => setType(t)}>
+                  {PROXY_TYPE_LABEL[t]}
+                </Pill>
+              ))}
+            </div>
+
+            <div className="flex gap-2">
+              <ProxyField label="Address" error={touched.host && hostErr} className="flex-1">
+                <input
+                  value={host}
+                  onChange={(e) => setHost(e.target.value)}
+                  onPaste={onHostPaste}
+                  onBlur={() => setTouched((t) => ({ ...t, host: true }))}
+                  placeholder="127.0.0.1"
+                  spellCheck={false}
+                  className={proxyInputClass(touched.host && hostErr)}
+                />
+              </ProxyField>
+              <ProxyField label="Port" error={touched.port && portErr} className="w-[88px] shrink-0">
+                <input
+                  value={port}
+                  onChange={(e) => setPort(e.target.value.replace(/\D/g, '').slice(0, 5))}
+                  onBlur={() => setTouched((t) => ({ ...t, port: true }))}
+                  inputMode="numeric"
+                  placeholder="1080"
+                  className={proxyInputClass(touched.port && portErr)}
+                />
+              </ProxyField>
+            </div>
+
+            {/* SOCKS4 has no login: hidden but still taking its space, so
+                switching type never changes the dialog height. */}
+            <div
+              aria-hidden={!canAuth || undefined}
+              className={`rounded-[10px] border border-[var(--border)] bg-[var(--sunken)] ${canAuth ? '' : 'invisible'}`}
+            >
+                <button
+                  type="button"
+                  onClick={() => setAuthOpen((v) => !v)}
+                  className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text)]"
+                >
+                  <ChevronRight size={13} className={`transition-transform ${authOpen ? 'rotate-90' : ''}`} />
+                  Authentication
+                  <span className="font-normal text-[var(--text-faint)]">(optional)</span>
+                </button>
+                {authOpen && (
+                  <div className="flex flex-col gap-2 px-3 pb-3">
+                   <fieldset disabled={!canAuth} className="m-0 flex min-w-0 flex-col gap-2 border-0 p-0">
+                    <ProxyField label="Username">
+                      <input
+                        value={username}
+                        onChange={(e) => setUsername(e.target.value)}
+                        spellCheck={false}
+                        autoComplete="off"
+                        className={proxyInputClass(false)}
+                      />
+                    </ProxyField>
+                    <ProxyField label="Password">
+                      <div className="relative">
+                        <input
+                          type={showPass ? 'text' : 'password'}
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          autoComplete="off"
+                          className={`${proxyInputClass(false)} pr-9`}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowPass((v) => !v)}
+                          aria-label={showPass ? 'Hide password' : 'Show password'}
+                          className="absolute right-1 top-1/2 grid h-7 w-7 -translate-y-1/2 place-items-center rounded-md text-[var(--text-dim)] hover:text-[var(--text)]"
+                        >
+                          {showPass ? <EyeOff size={14} /> : <Eye size={14} />}
+                        </button>
+                      </div>
+                    </ProxyField>
+                   </fieldset>
+                    <p className="min-h-[36px] text-[11px] leading-relaxed text-[var(--text-faint)]">
+                      {type !== 'http'
+                        ? 'The login is used for downloads. App and yt-dlp updates connect directly.'
+                        : 'The login is used for downloads and app updates.'}
+                    </p>
+                  </div>
+                )}
+            </div>
+
+            <div className="flex min-h-[32px] items-center gap-3">
+              <button
+                type="button"
+                onClick={runTest}
+                disabled={test?.state === 'running'}
+                className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-[8px] border border-[var(--border)] bg-[var(--control)] px-3 text-[12px] font-medium text-[var(--text)] transition-colors hover:border-[var(--border-strong)] disabled:opacity-60"
+              >
+                {test?.state === 'running' && <Loader2 size={13} className="animate-spin" />}
+                Test connection
+              </button>
+              {test?.state === 'ok' && (
+                <span className="inline-flex items-center gap-1 text-[12px] text-emerald-400">
+                  <CheckCircle2 size={14} /> Working · {test.ms} ms
+                </span>
+              )}
+              {test?.state === 'fail' && (
+                <span className="inline-flex min-w-0 items-start gap-1 text-[12px] leading-snug text-red-400">
+                  <XCircle size={14} className="mt-px shrink-0" /> {test.msg}
+                </span>
+              )}
+            </div>
+          </div>
+        </div>
+
+        {saveError ? <p className="mt-3 shrink-0 text-[12px] text-red-400">{saveError}</p> : null}
+
+        <div className="mt-4 flex shrink-0 gap-2">
+          <button
+            type="button"
+            onClick={onClose}
+            className="h-[38px] flex-1 rounded-[10px] border border-[var(--border)] bg-[var(--sunken)] text-[13px] font-medium text-[var(--text)] transition-colors hover:border-[var(--border-strong)]"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={save}
+            disabled={saving || (enabled && invalid)}
+            className="h-[38px] flex-1 rounded-[10px] bg-accent-gradient text-[13px] font-semibold text-[var(--on-accent)] shadow-glow transition-[filter] hover:brightness-110 disabled:opacity-50"
+          >
+            Save
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+
+  return createPortal(overlay, document.body)
+}
+
 function AboutModal({ version, onClose }) {
   const dialogRef = useRef(null)
 
@@ -2169,17 +2541,7 @@ function UpdateBanner({ title, subtitle, actionLabel, onAction, busy, progress }
 }
 
 function AppLogo() {
-  return (
-    <span className="h-9 w-9 shrink-0 overflow-hidden rounded-[22%] bg-accent-gradient">
-      <svg viewBox="0 0 1024 1024" className="h-full w-full" aria-hidden>
-        <g fill="var(--on-accent)">
-          <path d="M460 264h104v152h-104z" />
-          <path d="M352 416h320L512 648z" />
-          <rect x="352" y="688" width="320" height="50" rx="25" />
-        </g>
-      </svg>
-    </span>
-  )
+  return <img src={appIconUrl} alt="" aria-hidden="true" draggable={false} className="h-9 w-9 shrink-0 select-none" />
 }
 
 function WindowSizeMenu({ value, onChange }) {

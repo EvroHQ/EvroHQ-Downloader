@@ -119,7 +119,7 @@ npm run build:win
 
 ## Icon
 
-The master icon is the vector file `resources/audio-video-downloader-icon.svg`.
+The master icon is the vector file `resources/evrohq-icon-1024.svg` (`resources/evrohq-icon-16.svg` is a simplified variant used for the 16 px frame).
 To regenerate the multi-resolution `resources/icon.ico` (16→256 px) after editing it:
 
 ```bash
@@ -127,8 +127,7 @@ node scripts/make-icon.cjs
 ```
 
 This uses `sharp` (a devDependency) to rasterize each size from the SVG and pack a
-PNG-compressed `.ico`. It also writes `resources/icon-256.png` (also copied to
-`src/renderer/src/assets/logo.png` for the in-app header).
+PNG-compressed `.ico`. It also writes `resources/icon-256.png`. The in-app header loads `evrohq-icon-1024.svg` directly.
 
 ## Project structure
 

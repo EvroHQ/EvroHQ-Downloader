@@ -1,12 +1,14 @@
-// Renders resources/audio-video-downloader-icon.svg into a multi-resolution
-// Windows .ico (PNG-compressed frames, Vista+) plus a 256px PNG for reference.
+// Renders resources/evrohq-icon-1024.svg into a multi-resolution Windows .ico
+// (PNG-compressed frames, Vista+) plus a 256px PNG. The 16px frame comes from
+// resources/evrohq-icon-16.svg, a simplified variant that stays readable there.
 // Run: node scripts/make-icon.cjs
 const fs = require('fs')
 const path = require('path')
 const sharp = require('sharp')
 
 const resDir = path.join(__dirname, '..', 'resources')
-const svgPath = path.join(resDir, 'audio-video-downloader-icon.svg')
+const svgPath = path.join(resDir, 'evrohq-icon-1024.svg')
+const svg16Path = path.join(resDir, 'evrohq-icon-16.svg')
 const icoPath = path.join(resDir, 'icon.ico')
 const png256Path = path.join(resDir, 'icon-256.png')
 
@@ -14,11 +16,12 @@ const SIZES = [16, 24, 32, 48, 64, 128, 256]
 
 async function main() {
   const svg = fs.readFileSync(svgPath)
+  const svg16 = fs.readFileSync(svg16Path)
 
   // Render one crisp frame per target size straight from the vector source.
   const pngs = await Promise.all(
     SIZES.map((size) =>
-      sharp(svg, { density: 384 })
+      sharp(size === 16 ? svg16 : svg, { density: 384 })
         .resize(size, size, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } })
         .png({ compressionLevel: 9 })
         .toBuffer()

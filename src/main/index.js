@@ -1,4 +1,5 @@
-import { app, shell, BrowserWindow, ipcMain, dialog, net, Menu, MenuItem, screen } from 'electron'
+import { app, shell, BrowserWindow, ipcMain, dialog, net, Menu, MenuItem, screen, session, safeStorage } from 'electron'
+import { Socket } from 'net'
 import { join, basename, extname } from 'path'
 import { existsSync, readdirSync, unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, cpSync, writeFileSync } from 'fs'
 import { spawn } from 'child_process'
@@ -35,9 +36,288 @@ const store = new Store({
     platform: 'youtube',
     lastSeenVersion: '',
     whatsNewAck: [],
-    windowSize: 'default'
+    windowSize: 'default',
+    proxy: { enabled: false, type: 'socks5', host: '', port: 1080, username: '' }
   }
 })
+
+// ---------------------------------------------------------------------------
+// Proxy (SOCKS5 / SOCKS4 / HTTP) — used by every yt-dlp call and by the app's
+// own requests (yt-dlp self-update, SoundCloud pages, app updates).
+// ---------------------------------------------------------------------------
+
+const PROXY_TYPES = ['socks5', 'socks4', 'http']
+
+function readProxy() {
+  const p = store.get('proxy') || {}
+  let password = ''
+  if (typeof p.passwordEnc === 'string' && p.passwordEnc) {
+    try {
+      password = safeStorage.decryptString(Buffer.from(p.passwordEnc, 'base64'))
+    } catch (e) {
+      password = ''
+    }
+  } else if (typeof p.password === 'string') {
+    password = p.password
+  }
+  const port = Number(p.port)
+  return {
+    enabled: p.enabled === true,
+    type: PROXY_TYPES.includes(p.type) ? p.type : 'socks5',
+    host: typeof p.host === 'string' ? p.host.trim() : '',
+    port: Number.isInteger(port) && port > 0 && port < 65536 ? port : 1080,
+    username: typeof p.username === 'string' ? p.username : '',
+    password
+  }
+}
+
+function normalizeProxy(cfg) {
+  const type = PROXY_TYPES.includes(cfg?.type) ? cfg.type : 'socks5'
+  return {
+    enabled: cfg?.enabled === true,
+    type,
+    host: String(cfg?.host ?? '').trim().replace(/^\[|\]$/g, ''),
+    port: Number(cfg?.port),
+    username: type === 'socks4' ? '' : String(cfg?.username ?? ''),
+    password: type === 'socks4' ? '' : String(cfg?.password ?? '')
+  }
+}
+
+// Returns an error message, or null when the address and port are usable.
+function validateProxy(cfg) {
+  if (!cfg.host) return 'Enter the proxy address.'
+  if (!/^[A-Za-z0-9.\-:]+$/.test(cfg.host)) return 'The proxy address is not valid.'
+  if (!Number.isInteger(cfg.port) || cfg.port < 1 || cfg.port > 65535) return 'The port must be between 1 and 65535.'
+  return null
+}
+
+function writeProxy(cfg) {
+  const out = {
+    enabled: cfg.enabled,
+    type: cfg.type,
+    host: cfg.host,
+    port: Number.isInteger(cfg.port) ? cfg.port : 1080,
+    username: cfg.username
+  }
+  if (cfg.password) {
+    if (safeStorage.isEncryptionAvailable()) {
+      out.passwordEnc = safeStorage.encryptString(cfg.password).toString('base64')
+    } else {
+      out.password = cfg.password
+    }
+  }
+  store.set('proxy', out)
+}
+
+function proxyHostPart(host) {
+  return host.includes(':') ? `[${host}]` : host
+}
+
+// The active proxy (enabled and valid), or null.
+function activeProxy() {
+  const cfg = readProxy()
+  return cfg.enabled && !validateProxy(cfg) ? cfg : null
+}
+
+// yt-dlp proxy URL. socks5h / socks4a resolve hostnames on the proxy side,
+// which matters where DNS itself is filtered (Psiphon and similar tools).
+function ytdlpProxyUrl(cfg) {
+  const scheme = cfg.type === 'socks5' ? 'socks5h' : cfg.type === 'socks4' ? 'socks4a' : 'http'
+  const auth = cfg.username
+    ? `${encodeURIComponent(cfg.username)}${cfg.password ? `:${encodeURIComponent(cfg.password)}` : ''}@`
+    : ''
+  return `${scheme}://${auth}${proxyHostPart(cfg.host)}:${cfg.port}`
+}
+
+function isYtdlpBinary(binPath) {
+  return /yt-dlp(\.exe)?$/i.test(String(binPath || ''))
+}
+
+// Prepend --proxy for yt-dlp when a proxy is active. Other binaries untouched.
+function withProxyArgs(binPath, args) {
+  if (!isYtdlpBinary(binPath)) return args
+  const cfg = activeProxy()
+  return cfg ? ['--proxy', ytdlpProxyUrl(cfg), ...args] : args
+}
+
+// Hide proxy credentials in anything shown in the log.
+function redactProxy(text) {
+  return String(text).replace(/(socks[45][ah]?|https?):\/\/[^@\s/]+@/gi, '$1://***@')
+}
+
+function proxyLabel(cfg) {
+  return `${proxyHostPart(cfg.host)}:${cfg.port}`
+}
+
+// When a yt-dlp failure looks like the proxy is down, return a clear message.
+function proxyFailureMessage(errText) {
+  const cfg = activeProxy()
+  if (!cfg || !errText) return null
+  if (
+    /ProxyError|proxy|socks|WinError 10061|WinError 10060|Connection refused|actively refused|Failed to establish a new connection/i.test(
+      errText
+    )
+  ) {
+    return `Proxy unreachable (${proxyLabel(cfg)}). Check that your proxy app is running.`
+  }
+  return null
+}
+
+let lastYtdlpError = ''
+
+// Electron's own requests. Chromium can't send SOCKS credentials, so a SOCKS
+// proxy that needs a login is only applied to yt-dlp (which can).
+async function applySessionProxy() {
+  const cfg = activeProxy()
+  const config =
+    cfg && !(cfg.type !== 'http' && cfg.username)
+      ? { proxyRules: `${cfg.type}://${proxyHostPart(cfg.host)}:${cfg.port}`, proxyBypassRules: '<local>' }
+      : { mode: 'system' }
+  for (const s of [session.defaultSession, session.fromPartition('electron-updater', { cache: false })]) {
+    try {
+      await s.setProxy(config)
+      await s.closeAllConnections()
+    } catch (e) {
+      // keep the previous setting
+    }
+  }
+}
+
+// Answer HTTP-proxy login prompts on net.request with the saved credentials.
+function attachProxyLogin(request) {
+  request.on('login', (authInfo, callback) => {
+    const cfg = activeProxy()
+    if (authInfo?.isProxy && cfg?.username) callback(cfg.username, cfg.password)
+    else callback()
+  })
+}
+
+const SOCKS5_REPLIES = {
+  1: 'The proxy reported a general failure.',
+  2: 'The proxy refused the connection (ruleset).',
+  3: 'The proxy could not reach the network.',
+  4: 'The proxy could not reach YouTube.',
+  5: 'YouTube refused the connection through the proxy.',
+  6: 'The connection through the proxy timed out.',
+  7: 'The proxy does not support this request.',
+  8: 'The proxy does not support this address type.'
+}
+
+// Connect through the proxy to www.youtube.com:443 (SOCKS handshake or HTTP
+// CONNECT). Proves the proxy is up, the login works and YouTube is reachable.
+function testProxyConnection(cfg, timeoutMs = 10000) {
+  const target = 'www.youtube.com'
+  const targetPort = 443
+  return new Promise((resolve) => {
+    const started = Date.now()
+    const sock = new Socket()
+    let stage = 'connect'
+    let buf = Buffer.alloc(0)
+    let finished = false
+
+    const done = (ok, error) => {
+      if (finished) return
+      finished = true
+      clearTimeout(timer)
+      sock.destroy()
+      resolve(ok ? { ok: true, ms: Date.now() - started } : { ok: false, error })
+    }
+    const timer = setTimeout(
+      () => done(false, stage === 'connect' ? 'Timed out reaching the proxy.' : 'The proxy did not answer in time.'),
+      timeoutMs
+    )
+
+    const sendSocks5Connect = () => {
+      const host = Buffer.from(target)
+      sock.write(Buffer.from([0x05, 0x01, 0x00, 0x03, host.length, ...host, targetPort >> 8, targetPort & 0xff]))
+      stage = 's5-connect'
+    }
+
+    const step = () => {
+      if (stage === 's5-greet') {
+        if (buf.length < 2) return
+        const method = buf[1]
+        buf = buf.subarray(2)
+        if (method === 0x00) return sendSocks5Connect()
+        if (method === 0x02) {
+          if (!cfg.username) return done(false, 'This proxy needs a username and password.')
+          const u = Buffer.from(cfg.username)
+          const p = Buffer.from(cfg.password || '')
+          sock.write(Buffer.from([0x01, u.length, ...u, p.length, ...p]))
+          stage = 's5-auth'
+          return
+        }
+        // 0xFF to a no-login greeting almost always means a login is required.
+        if (method === 0xff && !cfg.username) return done(false, 'This proxy needs a username and password.')
+        return done(false, 'The proxy rejected the login method. Is it really a SOCKS5 proxy?')
+      }
+      if (stage === 's5-auth') {
+        if (buf.length < 2) return
+        const status = buf[1]
+        buf = buf.subarray(2)
+        if (status !== 0x00) return done(false, 'Username or password rejected by the proxy.')
+        return sendSocks5Connect()
+      }
+      if (stage === 's5-connect') {
+        if (buf.length < 2) return
+        if (buf[0] !== 0x05) return done(false, 'Unexpected answer. Is it really a SOCKS5 proxy?')
+        const rep = buf[1]
+        return rep === 0x00 ? done(true) : done(false, SOCKS5_REPLIES[rep] || `The proxy failed (code ${rep}).`)
+      }
+      if (stage === 's4-connect') {
+        if (buf.length < 2) return
+        const rep = buf[1]
+        if (rep === 0x5a) return done(true)
+        if (rep === 0x5b) return done(false, 'The proxy rejected the request.')
+        return done(false, 'Unexpected answer. Is it really a SOCKS4 proxy?')
+      }
+      if (stage === 'http-connect') {
+        const text = buf.toString('latin1')
+        const end = text.indexOf('\r\n')
+        if (end === -1) return
+        const m = text.slice(0, end).match(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/)
+        if (!m) return done(false, 'Unexpected answer. Is it really an HTTP proxy?')
+        const code = Number(m[1])
+        if (code === 200) return done(true)
+        if (code === 407) {
+          return done(false, cfg.username ? 'Username or password rejected by the proxy.' : 'This proxy needs a username and password.')
+        }
+        return done(false, `The proxy answered HTTP ${code}.`)
+      }
+    }
+
+    sock.on('data', (chunk) => {
+      buf = Buffer.concat([buf, chunk])
+      step()
+    })
+    sock.on('error', (e) => {
+      if (e.code === 'ECONNREFUSED') return done(false, 'Connection refused. Is the proxy app running?')
+      if (e.code === 'ENOTFOUND' || e.code === 'EAI_AGAIN') return done(false, 'Proxy address not found.')
+      if (e.code === 'ETIMEDOUT') return done(false, 'Timed out reaching the proxy.')
+      if (e.code === 'ECONNRESET') return done(false, 'The proxy closed the connection.')
+      done(false, e.message)
+    })
+    sock.on('close', () => done(false, 'The proxy closed the connection.'))
+
+    sock.connect(cfg.port, cfg.host, () => {
+      if (cfg.type === 'socks5') {
+        sock.write(Buffer.from(cfg.username ? [0x05, 0x02, 0x00, 0x02] : [0x05, 0x01, 0x00]))
+        stage = 's5-greet'
+      } else if (cfg.type === 'socks4') {
+        // SOCKS4a: IP 0.0.0.1 + hostname, so the proxy resolves the name.
+        const host = Buffer.from(target)
+        sock.write(Buffer.from([0x04, 0x01, targetPort >> 8, targetPort & 0xff, 0, 0, 0, 1, 0x00, ...host, 0x00]))
+        stage = 's4-connect'
+      } else {
+        const auth = cfg.username
+          ? `Proxy-Authorization: Basic ${Buffer.from(`${cfg.username}:${cfg.password || ''}`).toString('base64')}\r\n`
+          : ''
+        sock.write(`CONNECT ${target}:${targetPort} HTTP/1.1\r\nHost: ${target}:${targetPort}\r\n${auth}\r\n`)
+        stage = 'http-connect'
+      }
+    })
+  })
+}
 
 let mainWindow = null
 let currentChild = null
@@ -536,7 +816,7 @@ function sendLog(line) {
     }
   }
   if (mainWindow && !mainWindow.isDestroyed()) {
-    mainWindow.webContents.send('download-log', `[${timestamp()}] ${line}`)
+    mainWindow.webContents.send('download-log', `[${timestamp()}] ${redactProxy(line)}`)
   }
 }
 
@@ -561,6 +841,7 @@ function sendAppUpdate(payload) {
 function fetchText(url, { ua = HTTP_USER_AGENT, headers = {} } = {}) {
   return new Promise((resolve, reject) => {
     const request = net.request({ url, redirect: 'follow' })
+    attachProxyLogin(request)
     request.setHeader('User-Agent', ua)
     for (const [key, value] of Object.entries(headers)) {
       if (value) request.setHeader(key, value)
@@ -623,6 +904,7 @@ function downloadFile(url, dest, label = 'file') {
   return new Promise((resolve, reject) => {
     const tmp = `${dest}.download`
     const request = net.request({ url, redirect: 'follow' })
+    attachProxyLogin(request)
     request.setHeader('User-Agent', HTTP_USER_AGENT)
     request.on('response', (response) => {
       if (response.statusCode !== 200) {
@@ -668,11 +950,16 @@ function downloadFile(url, dest, label = 'file') {
 function getProcessOutput(binPath, args) {
   return new Promise((resolve) => {
     if (!existsSync(binPath)) return resolve(null)
-    const child = spawn(binPath, args, { windowsHide: true })
+    const child = spawn(binPath, withProxyArgs(binPath, args), { windowsHide: true })
     let out = ''
+    let err = ''
     child.stdout.on('data', (c) => (out += c.toString('utf-8')))
+    child.stderr.on('data', (c) => (err += c.toString('utf-8')))
     child.on('error', () => resolve(null))
-    child.on('close', () => resolve(out.trim() || null))
+    child.on('close', () => {
+      if (isYtdlpBinary(binPath)) lastYtdlpError = err
+      resolve(out.trim() || null)
+    })
   })
 }
 
@@ -1222,7 +1509,8 @@ function runBinary(binPath, args, cwd) {
       return
     }
 
-    sendLog(`$ ${binPath.split(/[\\/]/).pop()} ${args.join(' ')}`)
+    args = withProxyArgs(binPath, args)
+    sendLog(redactProxy(`$ ${binPath.split(/[\\/]/).pop()} ${args.join(' ')}`))
 
     const child = spawn(binPath, args, {
       cwd,
@@ -1233,8 +1521,10 @@ function runBinary(binPath, args, cwd) {
 
     let stdoutBuffer = ''
     let stderrBuffer = ''
+    let stderrAll = ''
 
     const flush = (buffer, chunk, isErr) => {
+      if (isErr && stderrAll.length < 20000) stderrAll += chunk.toString('utf-8')
       buffer += chunk.toString('utf-8')
       const lines = buffer.split(/\r?\n/)
       const remainder = lines.pop()
@@ -1271,7 +1561,8 @@ function runBinary(binPath, args, cwd) {
       } else if (code === 0) {
         resolve(code)
       } else {
-        reject(new Error(`Process exited with code ${code}`))
+        const proxyMsg = isYtdlpBinary(binPath) ? proxyFailureMessage(stderrAll) : null
+        reject(new Error(proxyMsg || `Process exited with code ${code}`))
       }
     })
   })
@@ -2188,18 +2479,18 @@ ipcMain.handle('fetch-metadata', async (_event, params) => {
     if (platform === 'soundcloud') {
       if (!isSoundCloudUrl(url)) return { error: 'Please paste a valid SoundCloud link.' }
       const meta = await fetchSoundCloudMeta(ytdlp, url)
-      if (!meta) return { error: 'Could not load SoundCloud details.' }
+      if (!meta) return { error: proxyFailureMessage(lastYtdlpError) || 'Could not load SoundCloud details.' }
       return meta
     }
 
     if (isPlaylistUrl(url)) {
       const info = await fetchPlaylistInfo(ytdlp, url)
-      if (!info) return { error: 'Could not load playlist details.' }
+      if (!info) return { error: proxyFailureMessage(lastYtdlpError) || 'Could not load playlist details.' }
       return { kind: 'playlist', ...info }
     }
     if (!isYouTubeUrl(url)) return { error: 'Please paste a valid YouTube link.' }
     const info = await fetchVideoInfo(ytdlp, url)
-    if (!info) return { error: 'Could not load video details.' }
+    if (!info) return { error: proxyFailureMessage(lastYtdlpError) || 'Could not load video details.' }
     return { kind: 'track', ...info, artist: info.channel }
   } catch (e) {
     return { error: e.message }
@@ -2248,6 +2539,30 @@ ipcMain.handle('update-ytdlp', async () => {
     sendLog(`ERROR updating yt-dlp: ${e.message}`)
     return { success: false, error: e.message }
   }
+})
+
+ipcMain.handle('get-proxy', () => readProxy())
+
+// Save proxy settings. An enabled proxy must have a valid address and port.
+ipcMain.handle('set-proxy', async (_event, cfg) => {
+  const next = normalizeProxy(cfg)
+  if (next.enabled) {
+    const error = validateProxy(next)
+    if (error) return { ok: false, error }
+  }
+  writeProxy(next)
+  await applySessionProxy()
+  const saved = readProxy()
+  sendLog(saved.enabled ? `Proxy on: ${saved.type.toUpperCase()} ${proxyLabel(saved)}` : 'Proxy off')
+  return { ok: true, proxy: saved }
+})
+
+// Check the given (unsaved) settings by connecting to YouTube through them.
+ipcMain.handle('test-proxy', async (_event, cfg) => {
+  const next = normalizeProxy(cfg)
+  const error = validateProxy(next)
+  if (error) return { ok: false, error }
+  return testProxyConnection(next)
 })
 
 // Quit and install a downloaded app update (electron-updater).
@@ -2320,6 +2635,7 @@ function setupAutoUpdater() {
 // ---------------------------------------------------------------------------
 app.whenReady().then(() => {
   migrateOldUserData()
+  applySessionProxy()
   // Ensures Windows uses our icon (not the default Electron one) in the taskbar.
   if (process.platform === 'win32') {
     app.setAppUserModelId('com.evrohq.ytdownloader')

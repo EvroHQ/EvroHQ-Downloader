@@ -19,6 +19,9 @@ const api = {
   updateYtdlp: () => ipcRenderer.invoke('update-ytdlp'),
   installUpdate: () => ipcRenderer.invoke('install-update'),
   trackLink: (which) => ipcRenderer.invoke('track-link', which),
+  getProxy: () => ipcRenderer.invoke('get-proxy'),
+  setProxy: (cfg) => ipcRenderer.invoke('set-proxy', cfg),
+  testProxy: (cfg) => ipcRenderer.invoke('test-proxy', cfg),
   onAppUpdate: (callback) => {
     const listener = (_event, payload) => callback(payload)
     ipcRenderer.on('app-update', listener)

@@ -439,6 +439,12 @@ button.chrome-chip:hover {
     0 0 24px -6px color-mix(in srgb, var(--toast-accent) 45%, transparent) !important;
   padding: 12px 14px !important;
   gap: 10px !important;
+  /* Size to the message (short ones stay small), capped at --width, centered. */
+  width: fit-content !important;
+  max-width: var(--width);
+  left: 0 !important;
+  right: 0 !important;
+  margin-inline: auto !important;
 }
 
 [data-theme='paper-rust'] [data-sonner-toast][data-styled='true'],
