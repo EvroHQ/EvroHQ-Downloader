@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { motion, AnimatePresence } from 'framer-motion'
 import { Toaster, toast as baseToast } from 'sonner'
@@ -147,6 +147,24 @@ const WHATS_NEW = [
       {
         title: 'New look',
         body: 'A brand-new app icon, and shorter notifications that fit their message.'
+      }
+    ]
+  },
+  {
+    id: '2.5.1',
+    version: '2.5.1',
+    items: [
+      {
+        title: 'Faster downloads',
+        body: 'Videos sent in fragments now download about 4× faster.'
+      },
+      {
+        title: 'Live progress',
+        body: 'Speed, size and time left under the bar. The preview shows the real file size, and 2K / 4K are greyed out when a video doesn’t have them.'
+      },
+      {
+        title: 'Fewer YouTube blocks',
+        body: 'The app asks YouTube once per video instead of three times, and the queue pauses between downloads. Errors now show at the top, with how long to wait if YouTube blocks.'
       }
     ]
   }
@@ -319,6 +337,76 @@ function urlCleanNote(raw, cleaned) {
 
 const pad2 = (n) => String(n).padStart(2, '0')
 
+// Pause between two queued downloads, so YouTube doesn't see a burst.
+const QUEUE_GAP_SEC = 5
+
+/* yt-dlp progress line → { done, total, speed, eta } in bytes / bytes per s.
+   e.g. "[download]  12.3% of ~ 120.50MiB at  2.31MiB/s ETA 00:45 (frag 3/40)" */
+const DL_UNITS = { B: 1, KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3, KB: 1e3, MB: 1e6, GB: 1e9 }
+
+function parseDlStats(line) {
+  const m = line.match(
+    /\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?\s*([\d.]+)\s*(B|KiB|MiB|GiB|KB|MB|GB)(?:\s+at\s+(?:([\d.]+)\s*(B|KiB|MiB|GiB|KB|MB|GB)\/s|Unknown))?(?:\s+ETA\s+([\d:]+))?/
+  )
+  if (!m) return null
+  const total = parseFloat(m[2]) * DL_UNITS[m[3]]
+  return {
+    done: (parseFloat(m[1]) / 100) * total,
+    total,
+    estimated: /\bof\s+~/.test(line),
+    speed: m[4] ? parseFloat(m[4]) * DL_UNITS[m[5]] : null
+  }
+}
+
+/* yt-dlp's numbers jump around: fragmented downloads only estimate the size,
+   and the speed is instantaneous. Average both, then derive the time left. */
+function smoothDlStats(prev, s, now = Date.now()) {
+  // Time-based: yt-dlp prints many lines per second, so a per-line factor
+  // would barely smooth anything. The memory grows from 0.3 s to 3 s over the
+  // first seconds, so a silly first reading is forgotten fast, then it's calm.
+  const t0 = prev?.t0 ?? now
+  const dt = prev?.t != null ? Math.max(0, (now - prev.t) / 1000) : 0
+  const tau = Math.min(3, Math.max(0.3, (now - t0) / 1000))
+  const k = prev ? 1 - Math.exp(-dt / tau) : 1
+  const total = Math.max(s.done, prev && s.estimated ? prev.total + k * (s.total - prev.total) : s.total)
+  const speed =
+    s.speed == null ? (prev?.speed ?? null) : prev?.speed ? prev.speed + k * (s.speed - prev.speed) : s.speed
+  return {
+    t: now,
+    t0,
+    done: s.done,
+    total,
+    estimated: s.estimated,
+    speed,
+    etaSec: speed ? Math.max(0, total - s.done) / speed : null
+  }
+}
+
+function fmtEta(sec) {
+  const t = Math.round(sec)
+  const h = Math.floor(t / 3600)
+  const m = Math.floor((t % 3600) / 60)
+  const s = String(t % 60).padStart(2, '0')
+  return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`
+}
+
+// Binary units, like Windows Explorer (1 MB = 1024 KB), so the numbers match
+// what users see on disk.
+function fmtBytes(n) {
+  if (!Number.isFinite(n)) return '–'
+  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)} GB`
+  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`
+  return `${Math.max(0, Math.round(n / 1024))} KB`
+}
+
+function dlStatsLabel(s) {
+  if (!s) return ''
+  const parts = [`${fmtBytes(s.done)} / ${s.estimated ? '~' : ''}${fmtBytes(s.total)}`]
+  if (s.speed) parts.push(`${fmtBytes(s.speed)}/s`)
+  if (s.etaSec != null && Number.isFinite(s.etaSec)) parts.push(`${fmtEta(s.etaSec)} left`)
+  return parts.join(' · ')
+}
+
 function fmtClock(sec) {
   const h = Math.floor(sec / 3600)
   const m = Math.floor((sec % 3600) / 60)
@@ -436,6 +524,7 @@ export default function App() {
   const [windowSize, setWindowSize] = useState('default')
   const [aboutOpen, setAboutOpen] = useState(false)
   const [proxy, setProxy] = useState(null)
+  const [dlStats, setDlStats] = useState(null)
   const [proxyOpen, setProxyOpen] = useState(false)
   const themeReady = useRef(false)
   const [whatsNew, setWhatsNew] = useState(null)
@@ -446,6 +535,9 @@ export default function App() {
   // Downloads waiting for the current one to finish (run one at a time).
   const [queue, setQueue] = useState([])
   const queueRef = useRef([])
+  const queueAbortRef = useRef(false)
+  const [queueWait, setQueueWait] = useState(null) // { until, bot } between queued jobs
+  const [, setQueueTick] = useState(0)
   const queueIdRef = useRef(0)
   const dlStreamsRef = useRef(1)
   // Identifies the running job so the same download can't be queued twice.
@@ -456,12 +548,19 @@ export default function App() {
   const [playlistInfo, setPlaylistInfo] = useState(null)
   const [previewLoading, setPreviewLoading] = useState(false)
   const [previewError, setPreviewError] = useState(null)
+  // Errors go to the notification at the top; the panel just says it's unavailable.
+  const failPreview = (msg) => {
+    toast.error(msg || 'Could not load the preview.', { id: 'preview' })
+    setPreviewError('Preview unavailable')
+  }
   const [selected, setSelected] = useState(() => new Set())
 
   const previewReq = useRef(0)
   const chapterReq = useRef(0)
   const playlistPosRef = useRef(playlistPos)
   const dlPassRef = useRef(1)
+  const dlDestRef = useRef(0)
+  const dlStatsRef = useRef(null)
   const dlLastPctRef = useRef(0)
   const dlShownRef = useRef(0)
   const extraDlRef = useRef(false)
@@ -469,6 +568,9 @@ export default function App() {
 
   const resetDownloadProgress = () => {
     dlPassRef.current = 1
+    dlDestRef.current = 0
+    dlStatsRef.current = null
+    setDlStats(null)
     dlLastPctRef.current = 0
     dlShownRef.current = 0
     extraDlRef.current = false
@@ -525,20 +627,30 @@ export default function App() {
         setPlaylistPos({ current: Number(item[1]), total: Number(item[2]) })
         playlistPosRef.current = { current: Number(item[1]), total: Number(item[2]) }
         dlPassRef.current = 1
+        dlDestRef.current = 0
+        dlStatsRef.current = null
         dlLastPctRef.current = 0
         extraDlRef.current = false
       }
 
       const streams = dlStreamsRef.current
 
-      // yt-dlp video = video stream then audio stream, each 0–100%. A later
-      // Destination (thumbnail, etc.) must not start a 3rd pass.
-      if (/\[download\].*Destination:/i.test(line) && dlLastPctRef.current > 8) {
-        if (dlPassRef.current < streams) {
-          dlPassRef.current += 1
-          dlLastPctRef.current = 0
-        } else {
+      // yt-dlp video = video stream then audio stream, each 0–100%. yt-dlp
+      // prints one "[download] Destination:" per stream, so that line (and only
+      // that line) moves to the next pass. Images and anything past the
+      // expected streams are extras and don't move the bar.
+      const dest = line.match(/\[download\]\s+Destination:\s*(.+)$/i)
+      if (dest) {
+        if (/\.(jpe?g|png|webp)$/i.test(dest[1].trim())) {
           extraDlRef.current = true
+        } else {
+          dlDestRef.current += 1
+          extraDlRef.current = dlDestRef.current > streams
+          if (!extraDlRef.current) {
+            dlPassRef.current = dlDestRef.current
+            dlLastPctRef.current = 0
+            dlStatsRef.current = null
+          }
         }
       }
 
@@ -548,27 +660,38 @@ export default function App() {
       } else if (!extraDlRef.current) {
         const dl = line.match(/\[download\]\s+(\d+(?:\.\d+)?)%/)
         if (dl) {
-          const raw = parseFloat(dl[1])
-          if (
-            raw + 12 < dlLastPctRef.current &&
-            dlLastPctRef.current > 55 &&
-            dlPassRef.current < streams
-          ) {
-            dlPassRef.current += 1
-          }
+          // Fragmented downloads estimate their size, so the % wobbles early
+          // on; the fragment counter is exact and only goes up.
+          const frag = line.match(/\(frag (\d+)\/(\d+)\)/)
+          const raw =
+            frag && Number(frag[2]) > 0
+              ? Math.min(100, (Number(frag[1]) / Number(frag[2])) * 100)
+              : parseFloat(dl[1])
           dlLastPctRef.current = raw
           const pass = Math.min(Math.max(dlPassRef.current, 1), streams)
-          const within = (pass - 1 + raw / 100) / streams
+          // Video ≈ 85% of the bytes, audio ≈ 15%: weight the bar the same way
+          // so it tracks what is really downloading.
+          const weights = streams === 2 ? [0.85, 0.15] : Array(streams).fill(1 / streams)
+          const within =
+            weights.slice(0, pass - 1).reduce((acc, w) => acc + w, 0) + weights[pass - 1] * (raw / 100)
           const pos = playlistPosRef.current
           const overall =
             pos && pos.total > 0
               ? ((Math.max(pos.current, 1) - 1 + within) / pos.total) * 100
               : within * 100
           applyProgress(overall)
+          const stats = parseDlStats(line)
+          if (stats) {
+            dlStatsRef.current = smoothDlStats(dlStatsRef.current, stats)
+            setDlStats(dlStatsRef.current)
+          }
         }
       }
-      if (/^ERROR:/.test(line) && /not found/.test(line)) {
-        toast.error(line.replace(/^ERROR:\s*/, ''))
+      // Post-processing (merge / convert / trim) has no speed — hide stale stats.
+      if (/\[(Merger|ExtractAudio|VideoConvertor|FixupM3u8|ffmpeg|SplitChapters)\]/.test(line)) { dlStatsRef.current = null; setDlStats(null) }
+      // Log lines start with "[hh:mm:ss] ", so match ERROR: after that prefix.
+      if (/^(?:\[[\d:]+\]\s*)?ERROR:/.test(line) && /not found/.test(line)) {
+        toast.error(line.replace(/^(?:\[[\d:]+\]\s*)?ERROR:\s*/, ''))
       } else if (/were skipped/.test(line)) {
         toast.warning('Some items could not be downloaded and were skipped')
       }
@@ -578,6 +701,8 @@ export default function App() {
       setDownloading(false)
       setStopping(false)
       setDlUi(null)
+      dlStatsRef.current = null
+      setDlStats(null)
       const finished = payload.success && !payload.alreadyDownloaded
       dlShownRef.current = finished ? 100 : 0
       setProgress(finished ? 100 : 0)
@@ -711,13 +836,13 @@ export default function App() {
             setPlaylistInfo(null)
             setMode('single')
           } else {
-            setPreviewError(info?.error || 'Could not load SoundCloud details.')
+            failPreview(info?.error || 'Could not load SoundCloud details.')
           }
         } else if (urlState === 'single') {
           const info = await window.api?.getVideoInfo(link)
           if (previewReq.current !== reqId) return
           if (info && !info.error) setVideoInfo(info)
-          else setPreviewError('Could not load video details.')
+          else failPreview(info?.error || 'Could not load video details.')
         } else {
           const info = await window.api?.getPlaylistInfo(link)
           if (previewReq.current !== reqId) return
@@ -725,11 +850,11 @@ export default function App() {
             setPlaylistInfo(info)
             setSelected(new Set(info.tracks.map((tr) => tr.id)))
           } else {
-            setPreviewError('Could not load playlist details.')
+            failPreview(info?.error || 'Could not load playlist details.')
           }
         }
       } catch (e) {
-        if (previewReq.current === reqId) setPreviewError(e.message)
+        if (previewReq.current === reqId) failPreview(e.message)
       } finally {
         if (previewReq.current === reqId) setPreviewLoading(false)
       }
@@ -757,8 +882,34 @@ export default function App() {
           ? 2800
           : 1400
       : audioFormat === 'wav'
-        ? 620
-        : 145
+        ? 606 // PCM 16-bit stereo 44.1 kHz = 176,400 B/s
+        : 137 // MP3 320 kbps = 40,000 B/s
+
+  // Why 2K / 4K can't be picked (null = available): H.264 stops at 1080p, and
+  // some videos simply don't exist that high.
+  const videoMaxHeight = mode === 'single' && !isSc ? videoInfo?.sizes?.maxHeight || null : null
+  const qualityLock = (q) => {
+    if (codec === 'h264') return 'H.264 on YouTube tops out at 1080p'
+    const need = q === '4k' ? 1440 : 1080
+    if (videoMaxHeight && videoMaxHeight <= need) return `This video tops out at ${videoMaxHeight}p`
+    return null
+  }
+
+  // A quality the video doesn't have falls back to the best one it does have.
+  useEffect(() => {
+    if (!videoMaxHeight || codec === 'h264') return
+    if (videoQuality === '4k' && videoMaxHeight <= 1440) setVideoQuality(videoMaxHeight > 1080 ? '2k' : '1080')
+    else if (videoQuality === '2k' && videoMaxHeight <= 1080) setVideoQuality('1080')
+  }, [videoMaxHeight, videoQuality, codec])
+
+  // Real size of the chosen video format (from yt-dlp's format list), so the
+  // preview matches the file that lands on disk. null → fall back to the rate.
+  const realVideoBytes =
+    !isSc && format === 'video' && videoInfo?.sizes
+      ? (codec === 'h264'
+        ? videoInfo.sizes.h264?.[1080]
+        : videoInfo.sizes.best?.[{ 1080: 1080, '2k': 1440, '4k': 2160 }[videoQuality]]) ?? null
+      : null
 
   const formatLabel = isSc
     ? scFormat === 'wav'
@@ -774,6 +925,15 @@ export default function App() {
     const mb = (seconds / 3600) * perHourMB
     const gb = mb / 1024
     return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(mb)} MB`
+  }
+
+  // Single video: the real format size (prorated for a trim), else the rate.
+  const singleSizeLabel = (seconds) => {
+    if (realVideoBytes && videoInfo?.duration > 0) {
+      const mb = (realVideoBytes * Math.min(1, seconds / videoInfo.duration)) / 1024 ** 2
+      return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`
+    }
+    return estSizeLabel(seconds)
   }
 
   const playlistTracks = playlistInfo?.tracks ?? []
@@ -795,18 +955,33 @@ export default function App() {
 
   const singleValid = Boolean(url.trim()) && (isYouTubeUrl(url) || isSoundCloudUrl(url))
   const canStart = mode === 'playlist' ? selected.size > 0 : singleValid
-  const canDownload = canStart && !downloading
+  // Busy = downloading, or pausing between two queued jobs.
+  const busy = downloading || Boolean(queueWait)
+  const canDownload = canStart && !busy
 
   const proxyOn = Boolean(proxy?.enabled && proxy?.host)
   const formatWord = formatLabel
   const queuedNote = queue.length ? ` · ${queue.length} queued` : ''
+  // Re-render every second while a queue pause counts down.
+  useEffect(() => {
+    if (!queueWait) return
+    const t = setInterval(() => setQueueTick((n) => n + 1), 1000)
+    return () => clearInterval(t)
+  }, [queueWait])
+  const waitLeft = queueWait ? Math.max(0, Math.ceil((queueWait.until - Date.now()) / 1000)) : 0
+
+  // While bytes are flowing, the live stats replace the "preparing …" label.
+  const liveStats = downloading && !stopping && dlStats ? dlStatsLabel(dlStats) : ''
   const statusText = downloading
     ? stopping
       ? 'Stopping…'
       : (dlUi?.playlist
-        ? `Downloading ${playlistPos ? `${playlistPos.current}/${playlistPos.total}` : `0/${dlUi.selectedCount}`} · ${dlUi.formatWord}`
-        : `Downloading · ${dlUi?.converting || 'preparing'}`) + queuedNote
-    : 'Idle — ready to download' + (proxyOn ? ` · via ${proxySummary(proxy)}` : '')
+        ? `Downloading ${playlistPos ? `${playlistPos.current}/${playlistPos.total}` : `0/${dlUi.selectedCount}`} · ${liveStats || dlUi.formatWord}`
+        : `Downloading · ${liveStats || dlUi?.converting || 'preparing'}`) + queuedNote
+    : queueWait
+      ? (queueWait.bot ? `Queue paused · YouTube bot check · next in ${waitLeft} s` : `Next download in ${waitLeft} s`) +
+        queuedNote
+      : 'Idle — ready to download' + (proxyOn ? ` · via ${proxySummary(proxy)}` : '')
 
   const activeBanner =
     appUpdate?.status === 'downloading'
@@ -1007,20 +1182,44 @@ export default function App() {
     setDlUi({ ...job.ui, label: job.label || job.params?.title || job.params?.url })
     setPlaylistPos(job.total ? { current: 0, total: job.total } : null)
     try {
-      await window.api?.[job.api](job.params)
+      return await window.api?.[job.api](job.params)
     } catch (e) {
       setDownloading(false)
       toast.error(e?.message || 'Download failed', { id: 'dl' })
+      return null
     }
   }
 
-  // One download at a time; each finished job pulls the next from the queue.
+  // Wait before the next queued job, showing a countdown. Stop ends the wait.
+  const waitBeforeNext = async (seconds, bot) => {
+    const until = Date.now() + seconds * 1000
+    setQueueWait({ until, bot })
+    while (Date.now() < until && !queueAbortRef.current) await new Promise((r) => setTimeout(r, 250))
+    setQueueWait(null)
+  }
+
+  // One download at a time; each finished job pulls the next from the queue,
+  // after a short pause so YouTube doesn't see a burst of requests. When
+  // YouTube blocks (bot check), the blocked job goes back to the front and the
+  // queue waits as long as the message says, instead of hammering it.
   const runQueue = async (first) => {
     let job = first
+    queueAbortRef.current = false
     while (job) {
-      await runJob(job)
+      const res = await runJob(job)
+      if (res?.botCheck && (job.botTries || 0) < 2 && !queueAbortRef.current) {
+        queueRef.current.unshift({ ...job, botTries: (job.botTries || 0) + 1 })
+        setQueue([...queueRef.current])
+      }
+      if (!queueRef.current.length || queueAbortRef.current) break
+      const wait = res?.botCheck ? res.retryAfterSec || 30 : QUEUE_GAP_SEC
+      if (res?.botCheck) toast.info(`Queue paused — YouTube bot check. Resuming in ${wait} s.`)
+      await waitBeforeNext(wait, !!res?.botCheck)
+      if (queueAbortRef.current) break
       job = queueRef.current.shift()
       setQueue([...queueRef.current])
+      // Queued jobs don't retry on their own: the queue's pause does that.
+      if (job) job = { ...job, params: { ...job.params, queued: true } }
     }
     currentJobKeyRef.current = null
   }
@@ -1029,7 +1228,7 @@ export default function App() {
     if (!canStart) return
     const job = buildJob()
     if (!job) return
-    if (downloading) {
+    if (busy) {
       const key = jobKey(job)
       if (key === currentJobKeyRef.current || queueRef.current.some((j) => jobKey(j) === key)) {
         toast.info(key === currentJobKeyRef.current ? 'Already downloading' : 'Already in the queue')
@@ -1056,6 +1255,12 @@ export default function App() {
   }
 
   const handleStop = async () => {
+    // Between two queued jobs there is nothing to cancel: just stop waiting
+    // (the remaining items stay in the queue).
+    if (!downloading && queueWait) {
+      queueAbortRef.current = true
+      return
+    }
     setStopping(true)
     await window.api?.cancelDownload()
   }
@@ -1332,8 +1537,8 @@ export default function App() {
                       compact={compact}
                       group="quality"
                       active={videoQuality === '2k'}
-                      disabled={codec === 'h264'}
-                      title={codec === 'h264' ? 'H.264 on YouTube tops out at 1080p' : undefined}
+                      disabled={qualityLock('2k') != null}
+                      title={qualityLock('2k') ?? undefined}
                       onClick={() => setVideoQuality('2k')}
                     >
                       2K · 1440p
@@ -1343,8 +1548,8 @@ export default function App() {
                       compact={compact}
                       group="quality"
                       active={videoQuality === '4k'}
-                      disabled={codec === 'h264'}
-                      title={codec === 'h264' ? 'H.264 on YouTube tops out at 1080p' : undefined}
+                      disabled={qualityLock('4k') != null}
+                      title={qualityLock('4k') ?? undefined}
                       onClick={() => setVideoQuality('4k')}
                     >
                       4K · 2160p
@@ -1358,8 +1563,8 @@ export default function App() {
                     <Pill
                       group="v"
                       active={videoQuality === '2k'}
-                      disabled={codec === 'h264'}
-                      title={codec === 'h264' ? 'H.264 on YouTube tops out at 1080p' : undefined}
+                      disabled={qualityLock('2k') != null}
+                      title={qualityLock('2k') ?? undefined}
                       onClick={() => setVideoQuality('2k')}
                     >
                       2K · 1440p
@@ -1367,8 +1572,8 @@ export default function App() {
                     <Pill
                       group="v"
                       active={videoQuality === '4k'}
-                      disabled={codec === 'h264'}
-                      title={codec === 'h264' ? 'H.264 on YouTube tops out at 1080p' : undefined}
+                      disabled={qualityLock('4k') != null}
+                      title={qualityLock('4k') ?? undefined}
                       onClick={() => setVideoQuality('4k')}
                     >
                       4K · 2160p
@@ -1521,7 +1726,7 @@ export default function App() {
                   </div>
                 </div>
 
-                {downloading ? (
+                {busy ? (
                   <div className="flex gap-2">
                     {canStart ? (
                       <motion.button
@@ -1535,7 +1740,7 @@ export default function App() {
                     ) : (
                       <div className={`glass-soft flex flex-1 items-center justify-center gap-2 rounded-2xl text-sm font-bold tracking-wide text-text-secondary ${compact ? 'h-10' : 'h-[46px]'}`}>
                         <Loader2 size={16} className="animate-spin" />
-                        DOWNLOADING…
+                        {downloading ? 'DOWNLOADING…' : 'WAITING…'}
                       </div>
                     )}
                     {queue.length > 0 && (
@@ -1614,7 +1819,7 @@ export default function App() {
                       clipSecs={clipSecs}
                       sizeLabel={
                         clipSecs || videoInfo?.duration
-                          ? `~${estSizeLabel(clipSecs || videoInfo.duration)} ${formatLabel}`
+                          ? `~${singleSizeLabel(clipSecs || videoInfo.duration)} ${formatLabel}`
                           : null
                       }
                     />
@@ -1649,11 +1854,24 @@ export default function App() {
             </div>
           </div>
 
-          <div className={`flex shrink-0 items-center gap-3 ${compact ? 'mt-1' : 'mt-2'}`}>
-            <span className="shrink-0 font-mono text-[11px] text-[var(--text-faint)]">
-              {statusText}
+          {/* Same columns as the content above: the text sits under the
+              controls and the bar starts exactly where the Preview panel does. */}
+          <div
+            className={`grid shrink-0 items-center ${compact ? 'mt-1 grid-cols-2 gap-2' : 'mt-2 grid-cols-[462px_minmax(0,1fr)] gap-[22px]'}`}
+          >
+            <span
+              title={statusText}
+              className="min-w-0 truncate font-mono text-[11px] tabular-nums text-[var(--text-faint)]"
+            >
+              {/* "·" separators in the theme's accent color. */}
+              {statusText.split(' · ').map((part, i) => (
+                <Fragment key={i}>
+                  {i > 0 && <span className="text-[var(--accent)]"> · </span>}
+                  {part}
+                </Fragment>
+              ))}
             </span>
-            <div className="relative min-w-0 flex-1">
+            <div className="relative min-w-0">
               <div className={`overflow-hidden rounded-full ${spec ? 'h-[3px] bg-[var(--border)]' : 'h-1.5 bg-white/10'}`}>
                 <motion.div
                   className="h-full rounded-full bg-accent-gradient"

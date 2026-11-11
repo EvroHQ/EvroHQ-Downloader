@@ -136,8 +136,11 @@ function isYtdlpBinary(binPath) {
 // Prepend --proxy for yt-dlp when a proxy is active. Other binaries untouched.
 function withProxyArgs(binPath, args) {
   if (!isYtdlpBinary(binPath)) return args
+  // yt-dlp ignores PYTHONIOENCODING for its own output: without this, text
+  // like "you’re" or "‘80s" reaches us in the Windows code page as "�".
+  const base = ['--encoding', 'utf-8', ...args]
   const cfg = activeProxy()
-  return cfg ? ['--proxy', ytdlpProxyUrl(cfg), ...args] : args
+  return cfg ? ['--proxy', ytdlpProxyUrl(cfg), ...base] : base
 }
 
 // Hide proxy credentials in anything shown in the log.
@@ -164,6 +167,61 @@ function proxyFailureMessage(errText) {
 }
 
 let lastYtdlpError = ''
+
+// Short, actionable explanation for the yt-dlp errors users actually hit.
+// Consecutive bot-check failures. The suggested wait grows (30 s → 60 s →
+// 2 min) because retrying quickly is what keeps YouTube blocking; it resets
+// as soon as a yt-dlp call succeeds.
+let botStrikes = 0
+let botStrikePending = false // preview gave up on a bot check; counted once its message is built
+const botWaitLabel = () => ['30 seconds', '60 seconds', '2 minutes'][Math.min(botStrikes, 2)]
+
+function ytdlpErrorHint(msg) {
+  if (/confirm you.?re not a bot|Sign in to confirm/i.test(msg)) {
+    return `YouTube is blocking this connection as a bot. Try again in ${botWaitLabel()}.`
+  }
+  if (/HTTP Error 429|Too Many Requests/i.test(msg)) {
+    return 'YouTube is rate-limiting this connection. Wait a while or try another network.'
+  }
+  if (/HTTP Error 403|Forbidden/i.test(msg)) {
+    return 'YouTube refused the download (HTTP 403). Try again, or use another network or proxy.'
+  }
+  if (/available in your country|geo.?restrict|blocked it in your country/i.test(msg)) {
+    return 'This video is not available in your country. A proxy may help.'
+  }
+  if (/timed out|Connection reset|RemoteDisconnected|IncompleteRead|Connection aborted|WinError 1005[34]|WinError 10060/i.test(msg)) {
+    return 'The connection dropped during the download. Check your network or proxy.'
+  }
+  return null
+}
+
+// The last "ERROR:" line yt-dlp printed, cleaned up (plus a hint when we know
+// the cause). null when yt-dlp printed no error line.
+function ytdlpErrorMessage(stderr) {
+  const lines = String(stderr || '')
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => /^ERROR:/.test(l))
+  if (!lines.length) return null
+  let msg = lines[lines.length - 1]
+    .replace(/^ERROR:\s*/, '')
+    .replace(/^\[[^\]]+\]\s*[\w-]{6,}:\s*/, '')
+    .replace(/^\[[^\]]+\]\s*/, '')
+    .replace(/[;.]?\s*please report this issue.*$/i, '')
+    .replace(/\s*Use --cookies-from-browser.*$/i, '')
+    .trim()
+  if (msg.length > 180) msg = `${msg.slice(0, 177)}…`
+  const hint = ytdlpErrorHint(msg)
+  // The bot check's own text is long and adds nothing: keep just the hint.
+  if (hint && isBotCheck(msg)) {
+    if (botStrikePending) {
+      botStrikePending = false
+      botStrikes += 1
+    }
+    return hint
+  }
+  return hint ? `${hint} — ${msg}` : msg
+}
 
 // Electron's own requests. Chromium can't send SOCKS credentials, so a SOCKS
 // proxy that needs a login is only applied to yt-dlp (which can).
@@ -946,11 +1004,27 @@ function downloadFile(url, dest, label = 'file') {
 }
 
 // Run a binary just to capture its stdout (e.g. `yt-dlp --version`) without
-// streaming to the renderer log. Resolves null if it can't be run.
-function getProcessOutput(binPath, args) {
+// streaming to the renderer log. Resolves null if it can't be run. yt-dlp
+// calls that hit YouTube's (intermittent) bot check are retried.
+async function getProcessOutput(binPath, args) {
+  for (let attempt = 0; ; attempt++) {
+    const out = await getProcessOutputOnce(binPath, args)
+    if (out && isYtdlpBinary(binPath)) botStrikes = 0
+    if (!out && isYtdlpBinary(binPath) && isBotCheck(lastYtdlpError) && attempt >= BOT_RETRIES) botStrikePending = true
+    if (out || !isYtdlpBinary(binPath) || !isBotCheck(lastYtdlpError) || attempt >= BOT_RETRIES) return out
+    await sleep(2000 * (attempt + 1))
+  }
+}
+
+function getProcessOutputOnce(binPath, args) {
   return new Promise((resolve) => {
     if (!existsSync(binPath)) return resolve(null)
-    const child = spawn(binPath, withProxyArgs(binPath, args), { windowsHide: true })
+    // UTF-8 like runBinary: otherwise titles and error text (e.g. "you’re")
+    // arrive in the Windows code page and show as "�".
+    const child = spawn(binPath, withProxyArgs(binPath, args), {
+      windowsHide: true,
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8' }
+    })
     let out = ''
     let err = ''
     child.stdout.on('data', (c) => (out += c.toString('utf-8')))
@@ -958,7 +1032,9 @@ function getProcessOutput(binPath, args) {
     child.on('error', () => resolve(null))
     child.on('close', () => {
       if (isYtdlpBinary(binPath)) lastYtdlpError = err
-      resolve(out.trim() || null)
+      const text = out.trim()
+      // On failure (e.g. the bot check) --dump-single-json prints "null".
+      resolve(text && text !== 'null' ? text : null)
     })
   })
 }
@@ -1022,60 +1098,174 @@ function sanitizeFilename(name, fallback = 'file') {
   return s.slice(0, 120).trim() || fallback
 }
 
-// Ask yt-dlp (without downloading) for the video title and its chapter list.
+// ---------------------------------------------------------------------------
+// One YouTube request per video. Every "give me this video's info" call is a
+// chance for YouTube's bot check, so the preview asks ONCE for everything
+// (--dump-single-json), keeps it on disk, and the chapter list and the
+// download reuse it (--load-info-json) instead of asking again.
+// ---------------------------------------------------------------------------
+
+// Stream URLs inside the info expire after ~6 h; stay well under that.
+const INFO_TTL_MS = 2 * 60 * 60 * 1000
+const infoCache = new Map() // videoId -> { promise, file, at, ok }
+
+function youTubeVideoId(value) {
+  const u = parseHttpUrl(value)
+  if (!u) return null
+  const host = u.hostname.toLowerCase().replace(/^(www|m|music)\./, '')
+  let id = null
+  if (host === 'youtu.be') id = u.pathname.split('/')[1]
+  else if (/(^|\.)youtube(-nocookie)?\.com$/.test(host)) {
+    id = u.searchParams.get('v') || (u.pathname.match(/^\/(?:shorts|live|embed|v)\/([^/?#]+)/) || [])[1]
+  }
+  return id && /^[\w-]{6,}$/.test(id) ? id : null
+}
+
+// Full info JSON for a single video, shared by every caller while fresh.
+function getInfoJson(ytdlp, url) {
+  const id = youTubeVideoId(url)
+  if (!id) return Promise.resolve(null)
+  const cached = infoCache.get(id)
+  if (cached && Date.now() - cached.at < INFO_TTL_MS) return cached.promise
+  const file = join(app.getPath('temp'), `evrohq-info-${id}.json`)
+  const entry = { file, at: Date.now(), ok: false }
+  entry.promise = (async () => {
+    const out = await getProcessOutput(ytdlp, [
+      ...getJsRuntimeArgs(),
+      '--no-playlist',
+      '--no-warnings',
+      '--dump-single-json',
+      url
+    ])
+    try {
+      if (!out) throw new Error('no info')
+      const info = JSON.parse(out)
+      if (!info || typeof info !== 'object' || !info.id) throw new Error('no info')
+      writeFileSync(file, out, 'utf8')
+      entry.ok = true
+      return info
+    } catch (e) {
+      if (infoCache.get(id) === entry) infoCache.delete(id)
+      return null
+    }
+  })()
+  infoCache.set(id, entry)
+  return entry.promise
+}
+
+// Saved info file for this video if it's fresh, else null (→ use the URL).
+function cachedInfoFile(url) {
+  const entry = infoCache.get(youTubeVideoId(url) || '')
+  if (!entry?.ok || Date.now() - entry.at >= INFO_TTL_MS || !existsSync(entry.file)) return null
+  return entry.file
+}
+
+function forgetInfo(url) {
+  const id = youTubeVideoId(url)
+  const entry = id && infoCache.get(id)
+  if (!entry) return
+  infoCache.delete(id)
+  try {
+    if (existsSync(entry.file)) unlinkSync(entry.file)
+  } catch (e) {
+    // locked — ignore
+  }
+}
+
+function clearInfoCache() {
+  for (const entry of infoCache.values()) {
+    try {
+      if (existsSync(entry.file)) unlinkSync(entry.file)
+    } catch (e) {
+      // ignore
+    }
+  }
+  infoCache.clear()
+}
+
+// Run a yt-dlp download from the saved preview info (no new YouTube request).
+// If that info no longer works (e.g. expired links), ask YouTube once more.
+async function runYtdlpFor(ytdlp, args, url, cwd) {
+  const file = cachedInfoFile(url)
+  if (file) {
+    try {
+      return await runBinary(ytdlp, [...args, '--load-info-json', file], cwd)
+    } catch (err) {
+      if (err.message === CANCELLED || cancelRequested || err.botCheck || err.exitCode == null) throw err
+      sendLog('The saved video info did not work, asking YouTube again…')
+      forgetInfo(url)
+    }
+  }
+  return runBinary(ytdlp, [...args, url], cwd)
+}
+
+// The video title and its chapter list, from the shared info.
 // Returns { title, chapters:[{start,end,title}] } — chapters is [] when none.
 async function fetchChapters(ytdlp, url) {
-  const out = await getProcessOutput(ytdlp, [
-    ...getJsRuntimeArgs(),
-    '--skip-download',
-    '--no-playlist',
-    '--no-warnings',
-    '--print',
-    '%(chapters)j',
-    '--print',
-    '%(title)s',
-    url
-  ])
-  if (!out) return { title: null, chapters: [] }
-  const lines = out.split(/\r?\n/)
-  const chaptersRaw = (lines[0] || '').trim()
-  const title = lines.slice(1).join(' ').trim() || null
-  let chapters = []
-  try {
-    const parsed = JSON.parse(chaptersRaw)
-    if (Array.isArray(parsed)) {
-      chapters = parsed
-        .map((c) => ({
-          start: Number(c.start_time),
-          end: c.end_time == null ? null : Number(c.end_time),
-          title: c.title ? String(c.title) : null
-        }))
-        .filter((c) => Number.isFinite(c.start))
-    }
-  } catch (e) {
-    chapters = []
+  const info = await getInfoJson(ytdlp, url)
+  if (!info) return { title: null, chapters: [] }
+  const chapters = (Array.isArray(info.chapters) ? info.chapters : [])
+    .map((c) => ({
+      start: Number(c.start_time),
+      end: c.end_time == null ? null : Number(c.end_time),
+      title: c.title ? String(c.title) : null
+    }))
+    .filter((c) => Number.isFinite(c.start))
+  return { title: info.title || null, chapters }
+}
+
+// Size in bytes of what videoFormatSelector() will download, for every quality
+// the UI offers. yt-dlp lists formats worst → best, so "best matching" is the
+// last match — the same pick yt-dlp makes. null when sizes are unknown.
+function videoSizes(formats, duration) {
+  const list = (Array.isArray(formats) ? formats : []).filter((f) => f && f.ext !== 'mhtml')
+  const hasV = (f) => f.vcodec && f.vcodec !== 'none'
+  const hasA = (f) => f.acodec && f.acodec !== 'none'
+  // HLS (m3u8) formats carry no size, only a *peak* bitrate: real files came
+  // out at 0.40–0.53× of tbr × duration, so scale it down.
+  const fromRate = (f) =>
+    f.tbr > 0 && duration > 0 ? f.tbr * 125 * duration * (/^m3u8/.test(f.protocol || '') ? 0.45 : 1) : null
+  const size = (f) => (f ? (f.filesize ?? f.filesize_approx ?? fromRate(f)) : null)
+  const last = (pred) => {
+    for (let i = list.length - 1; i >= 0; i--) if (pred(list[i])) return list[i]
+    return null
   }
-  return { title, chapters }
+  const sum = (...fs) => (fs.every((f) => f && size(f) != null) ? fs.reduce((n, f) => n + size(f), 0) : null)
+  const upTo = (h) => (f) => f.height != null && f.height <= h
+  const avc = (f) => /^avc1/.test(f.vcodec || '')
+
+  // bv*[height<=H]+ba / b[height<=H]
+  const best = (h) => {
+    const v = last((f) => hasV(f) && upTo(h)(f))
+    const a = last((f) => hasA(f) && !hasV(f))
+    if (v && a) return sum(v, a)
+    return sum(last((f) => hasV(f) && hasA(f) && upTo(h)(f)))
+  }
+  // bv[avc1][height<=h]+ba[mp4a] / bv[avc1][height<=h]+ba / b[avc1][height<=h]
+  const h264 = () => {
+    const v = last((f) => hasV(f) && !hasA(f) && avc(f) && upTo(1080)(f))
+    const aac = last((f) => hasA(f) && !hasV(f) && /^mp4a/.test(f.acodec))
+    const a = last((f) => hasA(f) && !hasV(f))
+    if (v && (aac || a)) return sum(v, aac || a)
+    return sum(last((f) => hasV(f) && hasA(f) && avc(f) && upTo(1080)(f)))
+  }
+  // Tallest video available, so the UI can grey out 2K / 4K when they don't exist.
+  const maxHeight = list.reduce((m, f) => (hasV(f) && f.height > m ? f.height : m), 0) || null
+  return {
+    maxHeight,
+    best: { 1080: best(1080), 1440: best(1440), 2160: best(2160) },
+    h264: { 1080: h264() }
+  }
 }
 
 // Ask yt-dlp (without downloading) for a single video's display metadata.
 // Returns { id, title, channel, views, duration, thumbnail, uploadDate } or null.
 async function fetchVideoInfo(ytdlp, url) {
-  const out = await getProcessOutput(ytdlp, [
-    ...getJsRuntimeArgs(),
-    '--skip-download',
-    '--no-playlist',
-    '--no-warnings',
-    '--print',
-    '%(.{id,title,channel,uploader,view_count,duration,thumbnail,upload_date})j',
-    url
-  ])
-  if (!out) return null
-  const line = out.split(/\r?\n/).find((l) => l.trim().startsWith('{'))
-  if (!line) return null
+  const j = await getInfoJson(ytdlp, url)
+  if (!j) return null
   try {
-    const j = JSON.parse(line)
     return {
+      sizes: videoSizes(j.formats, Number(j.duration)),
       id: j.id || null,
       title: j.title || null,
       channel: j.channel || j.uploader || null,
@@ -1502,7 +1692,34 @@ function soundCloudPlaylistOutputTemplate(params, ext) {
  * Spawn a bundled binary and stream stdout/stderr line by line to the renderer.
  * Resolves with the process exit code.
  */
-function runBinary(binPath, args, cwd) {
+// YouTube's bot check is intermittent: the same request often passes a few
+// seconds later. Retry yt-dlp up to BOT_RETRIES times before giving up
+// (yt-dlp resumes partial downloads, so nothing is lost).
+const BOT_RETRIES = 2
+const isBotCheck = (text) => /confirm you.?re not a bot/i.test(String(text || ''))
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+// Off for downloads started by the queue: there the queue itself pauses and
+// waits, instead of hammering YouTube with quick retries.
+let botRetriesAllowed = true
+
+async function runBinary(binPath, args, cwd) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const code = await runBinaryOnce(binPath, args, cwd)
+      if (isYtdlpBinary(binPath)) botStrikes = 0
+      return code
+    } catch (err) {
+      const giveUp = !err.botCheck || attempt >= BOT_RETRIES || cancelRequested || !botRetriesAllowed
+      if (err.botCheck && giveUp) botStrikes += 1
+      if (giveUp) throw err
+      sendLog(`YouTube asked for a bot check, retrying (${attempt + 1}/${BOT_RETRIES})…`)
+      await sleep(3000 * (attempt + 1))
+      if (cancelRequested) throw new Error(CANCELLED)
+    }
+  }
+}
+
+function runBinaryOnce(binPath, args, cwd) {
   return new Promise((resolve, reject) => {
     if (!existsSync(binPath)) {
       reject(new Error(`Binary not found: ${binPath}`))
@@ -1510,6 +1727,10 @@ function runBinary(binPath, args, cwd) {
     }
 
     args = withProxyArgs(binPath, args)
+    // Fragmented formats (HLS/DASH) otherwise download one fragment at a time,
+    // capped near 10 MB/s whatever the connection. 4 in parallel ≈ 4× faster;
+    // more brings little and raises the risk of YouTube throttling (429).
+    if (isYtdlpBinary(binPath)) args = ['--concurrent-fragments', '4', ...args]
     sendLog(redactProxy(`$ ${binPath.split(/[\\/]/).pop()} ${args.join(' ')}`))
 
     const child = spawn(binPath, args, {
@@ -1561,8 +1782,14 @@ function runBinary(binPath, args, cwd) {
       } else if (code === 0) {
         resolve(code)
       } else {
-        const proxyMsg = isYtdlpBinary(binPath) ? proxyFailureMessage(stderrAll) : null
-        reject(new Error(proxyMsg || `Process exited with code ${code}`))
+        const isYtdlp = isYtdlpBinary(binPath)
+        const detail = isYtdlp ? proxyFailureMessage(stderrAll) || ytdlpErrorMessage(stderrAll) : null
+        const error = new Error(detail || `Process exited with code ${code}`)
+        error.exitCode = code
+        error.botCheck = isYtdlp && isBotCheck(stderrAll)
+        // Same wait the message suggests, so the queue can pause that long.
+        if (error.botCheck) error.retryAfterSec = [30, 60, 120][Math.min(botStrikes, 2)]
+        reject(error)
       }
     })
   })
@@ -1777,9 +2004,9 @@ async function handleDownload(params) {
 
     // 1. download the full media once to a temp file
     if (format === 'audio') {
-      await runBinary(ytdlp, [...jsArgs, '-f', '251', '--no-playlist', '-o', 'temp_%(id)s.%(ext)s', url], outputFolder)
+      await runYtdlpFor(ytdlp, [...jsArgs, '-f', '251', '--no-playlist', '-o', 'temp_%(id)s.%(ext)s'], url, outputFolder)
     } else {
-      await runBinary(
+      await runYtdlpFor(
         ytdlp,
         [
           ...jsArgs,
@@ -1791,9 +2018,9 @@ async function handleDownload(params) {
           '--ffmpeg-location',
           ffmpeg,
           '-o',
-          'temp_%(id)s.%(ext)s',
-          url
+          'temp_%(id)s.%(ext)s'
         ],
+        url,
         outputFolder
       )
     }
@@ -1867,14 +2094,14 @@ async function handleDownload(params) {
       sendLog(`Embedding metadata${audioFormat === 'mp3' ? ' + cover art' : ''}.`)
     }
     args.push('--windows-filenames', '--trim-filenames', '200', '--no-overwrites')
-    args.push('-o', mediaOutputTemplate(false, audioFormat), url)
-    await runBinary(ytdlp, args, outputFolder)
+    args.push('-o', mediaOutputTemplate(false, audioFormat))
+    await runYtdlpFor(ytdlp, args, url, outputFolder)
     return
   }
 
   if (format === 'audio' && useRange) {
     // 1. download best audio stream to a temp file
-    await runBinary(ytdlp, [...jsArgs, '-f', '251', '--no-playlist', '-o', 'temp_%(id)s.%(ext)s', url], outputFolder)
+    await runYtdlpFor(ytdlp, [...jsArgs, '-f', '251', '--no-playlist', '-o', 'temp_%(id)s.%(ext)s'], url, outputFolder)
     try {
       // 2. locate temp file
       const temp = findTempFile(outputFolder, ['.webm', '.m4a', '.opus'])
@@ -1901,7 +2128,7 @@ async function handleDownload(params) {
       sendLog(`${already} has already been downloaded`)
       return
     }
-    await runBinary(
+    await runYtdlpFor(
       ytdlp,
       [
         ...jsArgs,
@@ -1917,16 +2144,16 @@ async function handleDownload(params) {
         '200',
         '--no-overwrites',
         '-o',
-        mediaOutputTemplate(false, 'mp4'),
-        url
+        mediaOutputTemplate(false, 'mp4')
       ],
+      url,
       outputFolder
     )
     return
   }
 
   if (format === 'video' && useRange) {
-    await runBinary(
+    await runYtdlpFor(
       ytdlp,
       [
         ...jsArgs,
@@ -1938,9 +2165,9 @@ async function handleDownload(params) {
         '--ffmpeg-location',
         ffmpeg,
         '-o',
-        'temp_%(id)s.%(ext)s',
-        url
+        'temp_%(id)s.%(ext)s'
       ],
+      url,
       outputFolder
     )
     try {
@@ -2054,7 +2281,7 @@ async function handlePlaylistDownload(params) {
     if (err.message === CANCELLED || cancelRequested) throw err
     // With --ignore-errors, a non-zero exit means some items were skipped
     // (private/deleted/region-locked). Treat that as completed-with-warnings.
-    if (/exited with code/i.test(err.message)) {
+    if (err.exitCode != null) {
       sendLog('Some items could not be downloaded and were skipped — see the log above.')
       return
     }
@@ -2190,7 +2417,7 @@ async function handleSoundCloudDownload(params, { playlist } = { playlist: false
     await runBinary(ytdlp, args, outputFolder)
   } catch (err) {
     if (err.message === CANCELLED || cancelRequested) throw err
-    if (playlist && /exited with code/i.test(err.message)) {
+    if (playlist && err.exitCode != null) {
       sendLog('Some items could not be downloaded and were skipped — see the log above.')
       return
     }
@@ -2200,6 +2427,7 @@ async function handleSoundCloudDownload(params, { playlist } = { playlist: false
 
 async function runSoundCloudIpc(params, { playlist }) {
   cancelRequested = false
+  botRetriesAllowed = !params?.queued
   const itemCount = playlist
     ? Number.isFinite(params?.itemCount)
       ? params.itemCount
@@ -2240,9 +2468,9 @@ async function runSoundCloudIpc(params, { playlist }) {
       return { success: false, cancelled: true }
     }
     sendLog(`ERROR: ${err.message}`)
-    sendComplete({ success: false, message: err.message })
+    sendComplete({ success: false, message: err.message, botCheck: !!err.botCheck, retryAfterSec: err.retryAfterSec || null })
     sendTelemetry('download', { ...details, success: false, error: err.message })
-    return { success: false, error: err.message }
+    return { success: false, error: err.message, botCheck: !!err.botCheck, retryAfterSec: err.retryAfterSec || null }
   }
 }
 
@@ -2334,6 +2562,7 @@ ipcMain.handle('track-link', (_event, which) => {
 
 ipcMain.handle('start-download', async (_event, params) => {
   cancelRequested = false
+  botRetriesAllowed = !params?.queued
   const details = {
     platform: telemetryPlatform(params?.url),
     url: params?.url || null,
@@ -2368,14 +2597,15 @@ ipcMain.handle('start-download', async (_event, params) => {
       return { success: false, cancelled: true }
     }
     sendLog(`ERROR: ${err.message}`)
-    sendComplete({ success: false, message: err.message })
+    sendComplete({ success: false, message: err.message, botCheck: !!err.botCheck, retryAfterSec: err.retryAfterSec || null })
     sendTelemetry('download', { ...details, success: false, error: err.message })
-    return { success: false, error: err.message }
+    return { success: false, error: err.message, botCheck: !!err.botCheck, retryAfterSec: err.retryAfterSec || null }
   }
 })
 
 ipcMain.handle('start-playlist-download', async (_event, params) => {
   cancelRequested = false
+  botRetriesAllowed = !params?.queued
   const itemCount = Number.isFinite(params?.itemCount)
     ? params.itemCount
     : typeof params?.playlistItems === 'string'
@@ -2416,9 +2646,9 @@ ipcMain.handle('start-playlist-download', async (_event, params) => {
       return { success: false, cancelled: true }
     }
     sendLog(`ERROR: ${err.message}`)
-    sendComplete({ success: false, message: err.message })
+    sendComplete({ success: false, message: err.message, botCheck: !!err.botCheck, retryAfterSec: err.retryAfterSec || null })
     sendTelemetry('download', { ...details, success: false, error: err.message })
-    return { success: false, error: err.message }
+    return { success: false, error: err.message, botCheck: !!err.botCheck, retryAfterSec: err.retryAfterSec || null }
   }
 })
 
@@ -2451,7 +2681,8 @@ ipcMain.handle('get-video-info', async (_event, url) => {
     if (!isYouTubeUrl(url)) return null
     const ytdlp = getBinPath('yt-dlp.exe')
     if (!existsSync(ytdlp)) return null
-    return await fetchVideoInfo(ytdlp, url)
+    const info = await fetchVideoInfo(ytdlp, url)
+    return info || { error: proxyFailureMessage(lastYtdlpError) || ytdlpErrorMessage(lastYtdlpError) || 'Could not load video details.' }
   } catch (e) {
     return { error: e.message }
   }
@@ -2463,7 +2694,8 @@ ipcMain.handle('get-playlist-info', async (_event, url) => {
     if (!isPlaylistUrl(url)) return null
     const ytdlp = getBinPath('yt-dlp.exe')
     if (!existsSync(ytdlp)) return null
-    return await fetchPlaylistInfo(ytdlp, url)
+    const info = await fetchPlaylistInfo(ytdlp, url)
+    return info || { error: proxyFailureMessage(lastYtdlpError) || ytdlpErrorMessage(lastYtdlpError) || 'Could not load playlist details.' }
   } catch (e) {
     return { error: e.message }
   }
@@ -2479,18 +2711,18 @@ ipcMain.handle('fetch-metadata', async (_event, params) => {
     if (platform === 'soundcloud') {
       if (!isSoundCloudUrl(url)) return { error: 'Please paste a valid SoundCloud link.' }
       const meta = await fetchSoundCloudMeta(ytdlp, url)
-      if (!meta) return { error: proxyFailureMessage(lastYtdlpError) || 'Could not load SoundCloud details.' }
+      if (!meta) return { error: proxyFailureMessage(lastYtdlpError) || ytdlpErrorMessage(lastYtdlpError) || 'Could not load SoundCloud details.' }
       return meta
     }
 
     if (isPlaylistUrl(url)) {
       const info = await fetchPlaylistInfo(ytdlp, url)
-      if (!info) return { error: proxyFailureMessage(lastYtdlpError) || 'Could not load playlist details.' }
+      if (!info) return { error: proxyFailureMessage(lastYtdlpError) || ytdlpErrorMessage(lastYtdlpError) || 'Could not load playlist details.' }
       return { kind: 'playlist', ...info }
     }
     if (!isYouTubeUrl(url)) return { error: 'Please paste a valid YouTube link.' }
     const info = await fetchVideoInfo(ytdlp, url)
-    if (!info) return { error: proxyFailureMessage(lastYtdlpError) || 'Could not load video details.' }
+    if (!info) return { error: proxyFailureMessage(lastYtdlpError) || ytdlpErrorMessage(lastYtdlpError) || 'Could not load video details.' }
     return { kind: 'track', ...info, artist: info.channel }
   } catch (e) {
     return { error: e.message }
@@ -2552,6 +2784,9 @@ ipcMain.handle('set-proxy', async (_event, cfg) => {
   }
   writeProxy(next)
   await applySessionProxy()
+  // Saved video info holds stream links tied to the IP that fetched them;
+  // after a proxy change they'd fail, so fetch fresh info next time.
+  clearInfoCache()
   const saved = readProxy()
   sendLog(saved.enabled ? `Proxy on: ${saved.type.toUpperCase()} ${proxyLabel(saved)}` : 'Proxy off')
   return { ok: true, proxy: saved }
@@ -2668,6 +2903,8 @@ app.whenReady().then(() => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
 })
+
+app.on('will-quit', clearInfoCache)
 
 app.on('window-all-closed', () => {
   if (currentChild) {
