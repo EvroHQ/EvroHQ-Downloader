@@ -14,7 +14,9 @@
   <a href="https://buymeacoffee.com/evrohq"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-support-orange?logo=buymeacoffee&logoColor=white" alt="Buy me a coffee"></a>
 </p>
 
-Everything is built in — no extra tools, no terminal, no setup. Free, no ads, no account.
+<p align="center">
+  Everything is built in — no extra tools, no terminal, no setup. Free, no ads, no account.
+</p>
 
 ## Features
 
