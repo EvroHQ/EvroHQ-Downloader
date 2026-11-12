@@ -550,7 +550,26 @@ export default function App() {
       }
       try {
         let src = null
-        if (link.kind === 'vid' || link.kind === 'plvid') {
+        if (link.kind === 'plvid') {
+          // A link with a list opens the whole playlist (the switch still
+          // offers "This video only").
+          const info = await window.api.getPlaylistInfo(link.listUrl)
+          if (readReq.current !== req) return
+          if (info && !info.error && info.tracks?.length) {
+            src = ytListSource(info, link)
+            src.videoUrl = link.videoUrl
+          } else {
+            // The list can't be read (private, removed…): fall back to the video.
+            const v = await window.api.getVideoInfo(link.videoUrl)
+            if (readReq.current !== req) return
+            if (!v || v.error) return fail(info?.error || v?.error, 'playlist')
+            const ch = await window.api.getChapters(link.videoUrl).catch(() => null)
+            if (readReq.current !== req) return
+            src = videoSource(v, ch?.chapters, link)
+            src.listUrl = link.listUrl
+            toastMsg('warning', 'Couldn’t read the playlist, so only this video is shown.')
+          }
+        } else if (link.kind === 'vid') {
           const info = await window.api.getVideoInfo(link.videoUrl)
           if (readReq.current !== req) return
           if (!info || info.error) return fail(info?.error, 'video')
@@ -606,7 +625,7 @@ export default function App() {
       setEd((e) => ({ ...e, src: e.alt, alt: e.src, sel: e.alt.tracks.map((t) => t.id), cfg: { ...e.cfg, trimOn: false, split: false } }))
       return
     }
-    setAltLoading(true)
+    setAltLoading('list')
     const info = await window.api.getPlaylistInfo(ed.src.listUrl).catch(() => null)
     setAltLoading(false)
     if (!info || info.error || !info.tracks?.length) {
@@ -614,11 +633,29 @@ export default function App() {
       return
     }
     const list = ytListSource(info, { listUrl: ed.src.listUrl })
+    list.videoUrl = ed.src.url
     setEd((e) => ({ ...e, src: list, alt: e.src, sel: list.tracks.map((t) => t.id), cfg: { ...e.cfg, trimOn: false, split: false } }))
   }
-  const switchToVideo = () => {
-    if (ed.src?.type === 'video' || ed.alt?.type !== 'video') return
-    setEd((e) => ({ ...e, src: e.alt, alt: e.src, sel: e.alt.tracks.map((t) => t.id) }))
+  // "This video only": reuse the video if it was already read, else read it.
+  const switchToVideo = async () => {
+    if (ed.src?.type === 'video' || altLoading) return
+    if (ed.alt?.type === 'video') {
+      setEd((e) => ({ ...e, src: e.alt, alt: e.src, sel: e.alt.tracks.map((t) => t.id) }))
+      return
+    }
+    const videoUrl = ed.src?.videoUrl
+    if (!videoUrl) return
+    setAltLoading('video')
+    const info = await window.api.getVideoInfo(videoUrl).catch(() => null)
+    const ch = info && !info.error ? await window.api.getChapters(videoUrl).catch(() => null) : null
+    setAltLoading(false)
+    if (!info || info.error) {
+      toastMsg('error', info?.error || 'Couldn’t read this video.')
+      return
+    }
+    const video = videoSource(info, ch?.chapters, { kind: 'plvid', videoUrl })
+    video.listUrl = ed.src.url
+    setEd((e) => ({ ...e, src: video, alt: e.src, sel: video.tracks.map((t) => t.id), cfg: { ...makeCfg(video, lastCfgRef.current), folder: e.cfg.folder } }))
   }
 
   /* --- editing ------------------------------------------------------------------ */

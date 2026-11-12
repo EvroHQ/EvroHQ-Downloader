@@ -223,11 +223,11 @@ export function HeadActions({ a }) {
     <>
       {a.switch ? (
         <div className="seg2" role="tablist">
-          <button type="button" className={a.switch.list ? 'on' : ''} onClick={a.switch.toList} disabled={a.switch.loading}>
-            {a.switch.loading ? 'Loading…' : 'Whole playlist'}
+          <button type="button" className={a.switch.list ? 'on' : ''} onClick={a.switch.toList} disabled={!!a.switch.loading}>
+            {a.switch.loading === 'list' ? 'Loading…' : 'Whole playlist'}
           </button>
-          <button type="button" className={!a.switch.list ? 'on' : ''} onClick={a.switch.toVideo}>
-            This video only
+          <button type="button" className={!a.switch.list ? 'on' : ''} onClick={a.switch.toVideo} disabled={!!a.switch.loading}>
+            {a.switch.loading === 'video' ? 'Loading…' : 'This video only'}
           </button>
         </div>
       ) : null}
