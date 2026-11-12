@@ -135,7 +135,7 @@ export function UrlBar({ url, chip, state, placeholder, inputRef, onChange, onKe
 }
 
 /* ---------- Main states (spec §5.2) ----------------------------------------- */
-export function EmptyState({ onExample }) {
+export function EmptyState() {
   return (
     <div className="empty">
       <div className="empty-row">
@@ -152,9 +152,6 @@ export function EmptyState({ onExample }) {
           <span className="kbd">Ctrl</span>
           <span className="kbd">V</span> works anywhere in this window
         </div>
-        <button type="button" className="linkbtn" onClick={onExample}>
-          Try an example playlist →
-        </button>
       </div>
     </div>
   )

@@ -37,7 +37,6 @@ import {
 } from './ui'
 import { SettingsSheet } from './settings'
 
-const EXAMPLE_PLAYLIST = 'https://www.youtube.com/playlist?list=PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI'
 const QUEUE_GAP_SEC = 5 // pause between two queued downloads
 const TOAST_MS = 3800
 const LINKS = {
@@ -1502,7 +1501,7 @@ export default function App() {
       />
 
       <div className="main">
-        {mode === 'empty' ? <EmptyState onExample={() => readLink(EXAMPLE_PLAYLIST)} /> : null}
+        {mode === 'empty' ? <EmptyState /> : null}
         {mode === 'fetching' ? <Reading /> : null}
         {mode === 'error' && ed.err ? (
           <ErrorCard
