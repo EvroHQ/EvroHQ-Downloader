@@ -910,6 +910,19 @@ export default function App() {
     window.api?.setConfig({ whatsNewAck: ack, ...(version ? { lastSeenVersion: version } : {}) })
   }
 
+  // A click anywhere outside an open menu / the queue popover closes it (the
+  // dock sits above the click-catching layer, so that layer alone misses it).
+  useEffect(() => {
+    if (!pop && !qOpen) return
+    const onDown = (e) => {
+      if (e.target.closest?.('.menu, .tok, .qpop, .qchip')) return
+      setPop(null)
+      setQOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [pop, qOpen])
+
   // Esc closes popovers, then the sheet, then dialogs.
   useEffect(() => {
     const onKey = (e) => {
