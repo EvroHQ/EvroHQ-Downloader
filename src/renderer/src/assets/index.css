@@ -467,27 +467,29 @@ button.chk { cursor: pointer; }
 .sizeline b { color: var(--ink); font-weight: 600; }
 .btnrow { display: flex; gap: 8px; height: 52px; }
 .qchip {
-  flex: none; padding: 0 12px; border-radius: 8px; border: 1px solid var(--line2); background: var(--surf2); color: var(--ink);
+  flex: none; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line2); background: var(--surf2); color: var(--ink);
   display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 3px; cursor: pointer;
 }
 .qchip:hover { border-color: var(--ink3); }
 .qchip.open { border-color: var(--acc); background: var(--accSoft); }
 .qchip .q1 { font-size: 13px; font-weight: 700; white-space: nowrap; }
 .qchip .q2 { font-family: var(--mono); font-size: 10px; color: var(--ink2); white-space: nowrap; }
+/* Primary action: flat accent fill, centered label, same 10px radius as the
+   URL bar and menus. */
 .pbtn {
-  flex: 1; min-width: 0; border-radius: 8px; background: var(--accGrad); color: var(--accInk); border: none; display: flex;
-  align-items: center; justify-content: space-between; gap: 8px; padding: 0 16px; font-size: 15.5px; font-weight: 750;
-  letter-spacing: -0.01em; cursor: pointer; white-space: nowrap;
+  flex: 1; min-width: 0; border-radius: 10px; background: var(--accGrad); color: var(--accInk); border: none;
+  display: flex; align-items: center; justify-content: center; padding: 0 16px; font-size: 15.5px; font-weight: 750;
+  letter-spacing: -0.01em; cursor: pointer; white-space: nowrap; transition: filter 0.12s ease;
 }
-.pbtn:hover { filter: brightness(1.08); }
+.pbtn:hover { filter: brightness(1.07); }
+.pbtn:active { filter: brightness(0.95); }
 .pbtn .lbl { overflow: hidden; text-overflow: ellipsis; }
-.pbtn .gl { font-size: 18px; }
 .pbtn-dis {
-  flex: 1; min-width: 0; border-radius: 8px; background: var(--surf2); border: 1px solid var(--line); color: var(--ink2);
-  display: flex; align-items: center; padding: 0 16px; font-size: 14.5px; font-weight: 600; white-space: nowrap; overflow: hidden;
+  flex: 1; min-width: 0; border-radius: 10px; background: var(--surf2); border: 1px solid var(--line); color: var(--ink2);
+  display: flex; align-items: center; justify-content: center; padding: 0 16px; font-size: 14.5px; font-weight: 600; white-space: nowrap; overflow: hidden;
 }
 .pbtn-prog {
-  flex: 1; min-width: 0; border-radius: 8px; background: var(--surf2); border: 1px solid var(--line2); position: relative;
+  flex: 1; min-width: 0; border-radius: 10px; background: var(--surf2); border: 1px solid var(--line2); position: relative;
   overflow: hidden; display: flex; align-items: center; box-sizing: border-box;
 }
 .pbtn-prog .fill { position: absolute; left: 0; top: 0; bottom: 0; transition: width 0.2s linear; }
@@ -496,7 +498,7 @@ button.chk { cursor: pointer; }
 .pbtn-prog .t1 { font-family: var(--mono); font-size: 14px; font-weight: 600; white-space: nowrap; }
 .pbtn-prog .t2 { font-family: var(--mono); font-size: 10px; color: var(--ink2); white-space: nowrap; }
 .pbtn-prog .act {
-  height: 32px; padding: 0 11px; border: 1px solid var(--line2); background: var(--bg); color: var(--ink); border-radius: 6px;
+  height: 38px; padding: 0 12px; border: 1px solid var(--line2); background: var(--bg); color: var(--ink); border-radius: 8px;
   font-size: 12.5px; font-weight: 600; cursor: pointer; flex: none;
 }
 

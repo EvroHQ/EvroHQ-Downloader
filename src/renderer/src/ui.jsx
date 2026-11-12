@@ -551,7 +551,6 @@ export function PrimaryButton({ b }) {
     return (
       <button type="button" className="pbtn" onClick={b.onClick}>
         <span className="lbl">{b.label}</span>
-        <span className="gl">{b.glyph}</span>
       </button>
     )
   return (

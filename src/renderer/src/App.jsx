@@ -1245,7 +1245,7 @@ export default function App() {
       T(' as ')
       ;['video', '1080p', 'H.264', 'with metadata', 'Downloads'].forEach((l, i, arr) => {
         out.push({ label: l, locked: true })
-        T(i === 0 ? ' in ' : i === arr.length - 1 ? '.' : i === arr.length - 2 ? ', into ' : ', ')
+        T(i === 0 ? ' in ' : i === arr.length - 1 ? '.' : i === arr.length - 2 ? ' into ' : ' ')
       })
       return out
     }
@@ -1266,22 +1266,22 @@ export default function App() {
     else if (cfg.format === 'audio') K('afmt', cfg.afmt === 'wav' ? 'WAV' : 'MP3 · 320 kbps')
     else {
       K('res', `${cfg.res}p`)
-      T(', ')
+      T(' ')
       K('codec', cfg.codec === 'h264' ? 'H.264' : 'best quality')
     }
     if (single && cfg.trimOn) {
-      T(', from ')
+      T(' from ')
       K('trimS', cfg.tStart)
       T(' to ')
       K('trimE', cfg.tEnd)
     }
     if (single && cfg.split && src.chapters?.length) {
-      T(', ')
+      T(' ')
       K('split', `split into ${src.chapters.length} chapters`)
     }
-    T(', ')
+    T(' ')
     K('meta', cfg.meta ? 'with metadata' : 'without metadata')
-    T(', into ')
+    T(' into ')
     K('folder', folderName(cfg.folder))
     T('.')
     return out
