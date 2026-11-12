@@ -319,16 +319,32 @@ function RowIcon({ r }) {
 
 function RowStatus({ r }) {
   if (r.st === 'on' || r.st === 'off') return <span style={{ color: 'var(--ink2)' }}>{r.size}</span>
-  if (r.st === 'drm') return <span style={{ color: 'var(--ink3)' }}>DRM</span>
+  if (r.st === 'drm') {
+    const [label, why] =
+      r.reason === 'preview'
+        ? ['Go+ only', 'SoundCloud Go+ track: only a 30-second preview streams, so it can’t be downloaded']
+        : r.reason === 'geo'
+          ? ['Geo-blocked', 'Not available in your country']
+          : ['DRM', 'DRM-protected on SoundCloud, so it can’t be downloaded']
+    return (
+      <span style={{ color: 'var(--ink3)' }} title={why}>
+        {label}
+      </span>
+    )
+  }
   if (r.st === 'wait') return <span style={{ color: 'var(--ink3)' }}>waiting</span>
   if (r.st === 'done') return <span style={{ color: 'var(--grn)', fontWeight: 600 }}>saved</span>
   const c = r.st === 'paused' ? 'var(--yel)' : 'var(--acc)'
   return (
     <>
-      <div className="minibar">
-        <div style={{ width: `${r.pct}%`, background: c }} />
-      </div>
-      <span style={{ color: c, fontWeight: 600, minWidth: 30, textAlign: 'right' }}>{r.pct}%</span>
+      {r.phase === 'prep' || r.phase === 'post' ? null : (
+        <div className="minibar">
+          <div style={{ width: `${r.pct}%`, background: c }} />
+        </div>
+      )}
+      <span style={{ color: c, fontWeight: 600, minWidth: 30, textAlign: 'right' }}>
+        {r.phase === 'prep' ? 'starting' : r.phase === 'post' ? 'converting' : `${r.pct}%`}
+      </span>
     </>
   )
 }
@@ -500,7 +516,7 @@ export function MoreOptions({ m }) {
       </button>
       {m.open && m.note ? <div className="more-note">{m.note}</div> : null}
       {m.open && m.trim ? (
-        <div className="cards" style={{ gridTemplateColumns: m.split ? 'minmax(0,1.3fr) minmax(0,1fr)' : 'minmax(0,1fr)' }}>
+        <div className="cards" style={{ gridTemplateColumns: m.split ? 'minmax(0,1fr) minmax(0,1fr)' : 'minmax(0,1fr)' }}>
           <div className={`card${m.trim.err ? ' bad' : m.trim.on ? ' on' : ''}`}>
             <div className="card-head">
               <Toggle on={m.trim.on} onClick={m.trim.toggle} label="Trim a range" />
@@ -560,7 +576,7 @@ export function PrimaryButton({ b }) {
       <div className="inner">
         <span style={{ display: 'flex', flexDirection: 'column', gap: 2, minWidth: 0 }}>
           <span className="t1">{b.t1}</span>
-          <span className="t2">{b.t2}</span>
+          {b.t2 ? <span className="t2">{b.t2}</span> : null}
         </span>
         <button type="button" className="act" onClick={b.onAct} disabled={b.actDisabled}>
           {b.act}
@@ -579,16 +595,19 @@ export function QueuePopover({ q }) {
       </div>
       {q.cur ? (
         <div className="qcur">
-          <div className="top">
-            <span className="n">1 · {q.cur.title}</span>
-            <span className="p" style={{ color: q.cur.color }}>
-              {q.cur.pct}%
-            </span>
+          <span className="qn" style={{ color: q.cur.color }}>1</span>
+          <div className="tt">
+            <div className="top">
+              <span className="n">{q.cur.title}</span>
+              <span className="p" style={{ color: q.cur.color }}>
+                {q.cur.pct}%
+              </span>
+            </div>
+            <div className="qbar">
+              <div style={{ width: `${q.cur.pct}%`, background: q.cur.color }} />
+            </div>
+            <div className="qmeta">{q.cur.meta}</div>
           </div>
-          <div className="qbar">
-            <div style={{ width: `${q.cur.pct}%`, background: q.cur.color }} />
-          </div>
-          <div className="qmeta">{q.cur.meta}</div>
         </div>
       ) : null}
       {q.note ? <div className="qnote">{q.note}</div> : null}
@@ -645,23 +664,56 @@ export function Toast({ toast, top, onClose }) {
 }
 
 /* ---------- What's new (spec §5.8) ---------------------------------------------- */
-export function WhatsNew({ block, prevVersion, onClose }) {
+export function WhatsNew({ block, prevVersion, onClose, onLink }) {
   const ref = useRef(null)
   useEffect(() => ref.current?.focus(), [])
   const v = String(block.version).replace(/\.0$/, '')
   return (
     <div className="wn-scrim">
       <div className="wn" role="dialog" aria-modal="true" aria-labelledby="wn-title" ref={ref} tabIndex={-1} style={{ outline: 'none' }}>
-        <div className="wn-head">
-          <AppIcon size={40} />
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+        {block.welcome ? (
+          <div className="wn-hero">
+            <AppIcon size={56} />
+            <div className="k">VERSION {v}</div>
             <div className="t" id="wn-title">
-              What&apos;s new in {v}
+              {block.welcome.lead}
+              <span className="acc">{block.welcome.name}</span>
             </div>
-            {prevVersion ? <div className="k">UPDATED FROM {prevVersion}</div> : null}
           </div>
-        </div>
+        ) : (
+          <div className="wn-head">
+            <AppIcon size={40} />
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+              <div className="t" id="wn-title">
+                What&apos;s new in {v}
+              </div>
+              {prevVersion ? <div className="k">UPDATED FROM {prevVersion}</div> : null}
+            </div>
+          </div>
+        )}
         <div className="wn-list">
+          {block.welcome ? (
+            <p className="wn-intro">
+              {[].concat(block.welcome.body).map((part, i) =>
+                typeof part === 'string' ? (
+                  part
+                ) : (
+                  <a
+                    key={i}
+                    href="#"
+                    className="wn-link"
+                    onClick={(e) => {
+                      e.preventDefault()
+                      onLink?.(part.link)
+                    }}
+                  >
+                    {part.text}
+                  </a>
+                )
+              )}
+            </p>
+          ) : null}
+          {block.welcome ? <div className="wn-sub">WHAT&apos;S NEW</div> : null}
           {block.items.map((it, i) => (
             <div key={i} className="wn-card">
               <span className="k">{it.kicker || String(it.title).toUpperCase()}</span>
@@ -671,6 +723,16 @@ export function WhatsNew({ block, prevVersion, onClose }) {
           ))}
         </div>
         <div className="wn-foot">
+          {block.support ? (
+            <div className="wn-support">
+              <button type="button" className="wn-cta" onClick={() => onLink?.('star')}>
+                ★ Star on GitHub
+              </button>
+              <button type="button" className="wn-cta" onClick={() => onLink?.('coffee')}>
+                ☕ Buy me a coffee
+              </button>
+            </div>
+          ) : null}
           <button type="button" className="btn btn-acc" style={{ height: 38, padding: '0 22px', fontSize: 14, fontWeight: 750, borderRadius: 8 }} onClick={onClose}>
             Got it
           </button>

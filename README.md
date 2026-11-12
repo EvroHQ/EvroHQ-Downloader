@@ -23,12 +23,12 @@
 **Download**
 
 - 🎵 **Audio** — WAV (44.1 kHz, uncompressed) or MP3 (320 kbps)
-- 🎬 **Video** — MP4 up to **1080p / 2K / 4K** (best available, sound included)
-- 🎞️ **Compatible (H.264 + AAC)** — native YouTube streams, 1080p max, no re-encode (works in editors and players that choke on AV1)
-- ☁️ **SoundCloud** — tracks and sets, in the original quality or converted to WAV
+- 🎬 **Video** — MP4 up to **1080p / 2K / 4K** in **Best quality** (VP9 / AV1, sound included)
+- 🎞️ **H.264 + AAC** — native YouTube streams, 1080p max, no re-encode (works in editors and players that choke on AV1)
+- ☁️ **SoundCloud** — tracks and sets, in the original quality or converted to WAV; tracks that can't be saved (DRM, Go+ previews, blocked in your country) are marked before you download
 - 📋 **Playlists** — preview every track, pick the ones you want, download into a folder named after the playlist
 - 🧾 **Download queue** — add more videos or playlists while a download is running; they start one after another, each with its own settings
-- 📊 **Live progress** — open the queue next to **Stop** to watch the current file fill up and remove anything still waiting
+- 📊 **Live progress** — percentage, size, speed and time left; in a playlist each track shows its own progress
 - 🚫 **No duplicates** — the same download can't be queued twice (the same video in another format still can)
 
 **Edit while you download**
@@ -39,14 +39,15 @@
 
 **Comfort**
 
+- ✍️ **One sentence** — _Save this as video in 1080p H.264 with metadata into Downloads._ Click any highlighted word to change it
 - 🖼️ **Live preview** — thumbnail, title, channel, duration and estimated file size (or the size of your trimmed selection) before you download
 - 🔗 **Smart links** — timestamps (`&t=`) and extra params are stripped; Mix and Music albums stay playlists
 - 🛡️ **Proxy** — route downloads through a SOCKS5, SOCKS4 or HTTP proxy (Psiphon, Tor, your own…), with optional login and a connection test
-- 🪟 **Compact window** — switch between Default and Compact from the header
+- 🪟 **Compact window** — switch between Default and Compact in Settings
 - 🖱️ **Right-click** the link field for Cut, Copy, Paste and Select all
-- 🔔 **Clear notifications** — colored by type; errors stay on screen longer
-- 🎨 **Themes** — seven looks (dark and light); your pick is remembered next time
-- 🔄 **Updates** — the app and yt-dlp update in place so YouTube downloads keep working
+- 🔔 **Clear notifications** — colored by type, with the real reason when something fails
+- 🎨 **Themes** — seven looks (dark and light), or follow Windows; your pick is remembered next time
+- 🔄 **Updates** — yt-dlp updates itself in the background so YouTube downloads keep working; app updates download in place
 - 📦 **All-in-one** — yt-dlp, ffmpeg and a tiny JS runtime are bundled; nothing else to install
 
 ## Download
@@ -55,7 +56,7 @@ Get the latest version from the [**Releases page**](https://github.com/EvroHQ/Ev
 
 ## Themes
 
-Open **Themes** in the header to switch. The last choice is restored when you reopen the app.
+Open **Settings** → **Appearance** to switch, or pick **System** to follow Windows' light or dark mode. The last choice is restored when you reopen the app.
 
 ### Dark
 
@@ -83,36 +84,35 @@ Open **Themes** in the header to switch. The last choice is restored when you re
 
 ### Single video or track
 
-1. **Paste a YouTube or SoundCloud link** (or click the clipboard button). The preview on the right fills in automatically.
-2. **Choose the format**:
-   - **Audio** → **WAV** (44.1 kHz, uncompressed) or **MP3** (320 kbps). On SoundCloud: **Original** (best available) or **WAV**.
-   - **Video** → **1080p**, **2K** or **4K**, then **Best quality** or **Compatible (H.264)** for editors and older players. Video always includes sound.
-3. _(Optional)_ Turn on **Trim a specific range** to grab only a portion.
-   - Just type the digits — the field formats itself: typing `001030` becomes `00:10:30` (hh:mm:ss).
-   - The preview shows the length and estimated size of your selection.
-4. _(Optional)_ **Split by chapters** saves one file per chapter when the video has chapters.
-5. _(Optional, audio)_ Leave **Embed metadata** on to write title, artist and cover into the file. Cover art is embedded for MP3 only.
-6. **Choose the output folder** with **Change** (it's remembered next time). Default is your **Downloads** folder.
-7. Click **Download**. Follow progress in the status line and the bar. Need to cancel? Click **Stop**.
+1. **Paste a YouTube or SoundCloud link** — press **Ctrl+V** anywhere in the window, or click **Paste**. The preview fills in automatically.
+2. **Read the sentence at the bottom**, e.g. _Save this as video in 1080p H.264 with metadata into Downloads._ Click any highlighted word to change it:
+   - **video / audio** — Audio gives **WAV** (44.1 kHz) or **MP3** (320 kbps). On SoundCloud: **Original** (best available) or **WAV**.
+   - **1080p / 1440p / 2160p** — 2K and 4K need **Best quality**.
+   - **H.264 / Best quality** — H.264 plays everywhere (1080p max); Best quality (VP9 / AV1) goes up to 4K with smaller files.
+   - **with / without metadata** — title, artist and cover art written into the file.
+   - **Downloads** — your Downloads, Music or Videos folder, a recent folder, or **Choose folder…** (remembered next time).
+3. _(Optional)_ Open **More options**:
+   - **Trim a range** — type the start and end; `001030` becomes `00:10:30` (hh:mm:ss). The size of your selection updates as you type.
+   - **Split by chapters** — one file per chapter, named after the chapter titles.
+4. Click **Download video**. Progress, speed and time left show in the preview; **Cancel** stops it.
+5. When it's done, **Open folder** shows the file. The settings stay editable, so you can grab another quality or the audio without pasting the link again.
 
 ### Playlist
 
-1. **Paste a playlist or SoundCloud set link.** The app switches to playlist mode and loads the track list with thumbnails.
-2. **Select the tracks** you want (or use **Select all** / **Deselect all**). The footer shows how many are selected, the total length and the estimated size.
-3. Pick **Audio** or **Video** as usual. Trim is not available in playlist mode.
-4. Click **Download all**. Files land in a **subfolder named after the playlist**. The status line shows `Downloading 2/12` so you always know where you are.
+1. **Paste a playlist or SoundCloud set link.** A video link with `&list=…` opens the whole playlist; use **This video only** to keep just that clip.
+2. **Pick the tracks** — click rows to select them, or use the checkbox in the header for all / none. The sentence and the button show how many are selected and the estimated size.
+3. Click **Download N tracks**. Files land in a **subfolder named after the playlist**, and each row shows its own progress.
 
 ### Queue
 
-While a download is running, paste another link, pick its settings and click **Add to queue**. It starts automatically when the current one finishes. Open the queue button next to **Stop** to see the current file's progress and remove items that haven't started yet.
+While a download is running, paste another link, set it up and click **Add to queue**. It starts by itself when the current one finishes, keeping its own settings. Once something is waiting, a **Queue** button appears next to the progress: open it to see what's coming and remove items that haven't started yet.
 
 ### Proxy
 
-1. Click **Proxy** in the header.
-2. Turn on **Use a proxy**, pick **SOCKS5**, **SOCKS4** or **HTTP**, and enter the address and port. You can also paste a full proxy link like `socks5://user:pass@127.0.0.1:1080` into the address field — every field fills in.
-3. _(Optional)_ Open **Authentication** for a username and password (SOCKS5 and HTTP). The password is stored encrypted.
-4. Click **Test connection** — `Working` means YouTube is reachable through the proxy.
-5. Click **Save**. A dot on the **Proxy** button and `via SOCKS5 …` in the status line show it's active.
+1. Open **Settings** → **Network proxy**.
+2. Turn it on, pick **SOCKS5**, **SOCKS4** or **HTTP**, and enter the address and port — or paste a full link like `socks5://user:pass@127.0.0.1:1080` and every field fills in.
+3. _(Optional)_ Add a username and password (SOCKS5 and HTTP). The password is stored encrypted.
+4. Click **Test connection** — it tells you whether YouTube is reachable through the proxy. Changes are saved automatically.
 
 All downloads and previews then go through the proxy. With **Psiphon**, use SOCKS5, `127.0.0.1` and the port shown in Psiphon's settings under _Local proxy ports_.
 
@@ -121,10 +121,11 @@ All downloads and previews then go through the proxy. With **Psiphon**, use SOCK
 ## Good to know
 
 - **Nothing else to install** — yt-dlp, ffmpeg and the JS runtime used for YouTube are already inside the app.
-- **A video link with `&list=…`** is treated as a playlist. Switch to **Single video** in the preview if you only want that one clip.
-- **yt-dlp updates** keep the app working when YouTube changes. When a new yt-dlp (or app) version is available, a banner appears at the top — the rest of the UI is locked until you update.
+- **A video link with `&list=…`** opens as a playlist. Switch to **This video only** in the preview if you only want that one clip.
+- **yt-dlp updates itself** at startup and every few hours while nothing is downloading, so the app keeps working when YouTube changes. App updates show a banner at the top.
 - **Proxy with a login (SOCKS5)** is used for downloads; app and yt-dlp updates then connect directly. HTTP proxies with a login cover both.
-- **DRM-protected SoundCloud tracks** can't be downloaded; the app tells you when that's the case.
+- **Some SoundCloud tracks can't be downloaded** — DRM-protected ones, Go+ tracks (only a 30-second preview streams) and tracks blocked in your country. They're marked in the list and skipped.
+- **YouTube sometimes asks to confirm you're not a bot.** The app waits and tries again on its own; if it keeps happening, a proxy helps.
 - **Antivirus false positives**: some antivirus software flags download tools. The app is safe; if needed, allow it in your antivirus.
 - Downloading copyrighted content may be against YouTube's and SoundCloud's Terms of Service — use responsibly and only for content you have the right to download.
 

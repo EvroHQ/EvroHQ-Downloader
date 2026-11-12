@@ -139,7 +139,7 @@ export function ratePerMin(isSc, cfg) {
 export function containerOf(isSc, cfg) {
   if (isSc) return cfg.scfmt === 'wav' ? 'WAV' : 'M4A'
   if (cfg.format === 'audio') return cfg.afmt === 'wav' ? 'WAV' : 'MP3'
-  return cfg.codec === 'best' ? 'MKV' : 'MP4'
+  return 'MP4'
 }
 
 // Short quality text for summaries: "1080p · H.264", "WAV", "Original".

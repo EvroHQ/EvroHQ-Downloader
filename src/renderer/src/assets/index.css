@@ -468,14 +468,16 @@ button.chk { cursor: pointer; }
 .sizeline { display: flex; justify-content: space-between; gap: 8px; font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.06em; color: var(--ink2); }
 .sizeline b { color: var(--ink); font-weight: 600; }
 .btnrow { display: flex; gap: 8px; height: 52px; }
+/* With the queue button: two exactly equal halves. */
+.btnrow:has(.qchip) { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
 .qchip {
-  flex: none; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line2); background: var(--surf2); color: var(--ink);
+  flex: 1 1 0; min-width: 0; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line2); background: var(--surf2); color: var(--ink);
   display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 3px; cursor: pointer;
 }
 .qchip:hover { border-color: var(--ink3); }
 .qchip.open { border-color: var(--acc); background: var(--accSoft); }
-.qchip .q1 { font-size: 13px; font-weight: 700; white-space: nowrap; }
-.qchip .q2 { font-family: var(--mono); font-size: 10px; color: var(--ink2); white-space: nowrap; }
+.qchip .q1 { font-size: 13px; font-weight: 700; white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.qchip .q2 { font-family: var(--mono); font-size: 10px; color: var(--ink2); white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
 /* Primary action: flat accent fill, centered label, same 10px radius as the
    URL bar and menus. */
 .pbtn {
@@ -497,8 +499,8 @@ button.chk { cursor: pointer; }
 .pbtn-prog .fill { position: absolute; left: 0; top: 0; bottom: 0; transition: width 0.2s linear; }
 .pbtn-prog .line { position: absolute; left: 0; bottom: 0; height: 3px; transition: width 0.2s linear; }
 .pbtn-prog .inner { position: relative; display: flex; justify-content: space-between; align-items: center; gap: 8px; width: 100%; padding: 0 7px 0 14px; }
-.pbtn-prog .t1 { font-family: var(--mono); font-size: 14px; font-weight: 600; white-space: nowrap; }
-.pbtn-prog .t2 { font-family: var(--mono); font-size: 10px; color: var(--ink2); white-space: nowrap; }
+.pbtn-prog .t1 { font-family: var(--mono); font-size: 14px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pbtn-prog .t2 { font-family: var(--mono); font-size: 10px; color: var(--ink2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pbtn-prog .act {
   height: 38px; padding: 0 12px; border: 1px solid var(--line2); background: var(--bg); color: var(--ink); border-radius: 8px;
   font-size: 12.5px; font-weight: 600; cursor: pointer; flex: none;
@@ -512,7 +514,13 @@ button.chk { cursor: pointer; }
 .qpop-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px 8px; }
 .qpop-head .t { font-size: 15px; font-weight: 750; letter-spacing: -0.01em; }
 .qpop-head .k { font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em; color: var(--ink3); }
-.qcur { padding: 10px 14px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; background: var(--surf2); }
+/* Same columns as .qitem so the titles line up. */
+.qcur {
+  display: grid; grid-template-columns: 20px minmax(0, 1fr) 28px; gap: 8px; align-items: start; padding: 10px 8px 10px 14px;
+  border-top: 1px solid var(--line); background: var(--surf2);
+}
+.qcur .qn { font-family: var(--mono); font-size: 11px; font-weight: 600; line-height: 21px; }
+.qcur .tt { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .qcur .top { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
 .qcur .top .n { font-size: 14px; font-weight: 650; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .qcur .top .p { font-family: var(--mono); font-size: 11.5px; font-weight: 600; }
@@ -609,9 +617,24 @@ button.chk { cursor: pointer; }
 .wn-head { display: flex; align-items: center; gap: 14px; padding: 18px 20px 14px; flex: none; }
 .wn-head .t { font-size: 22px; font-weight: 750; letter-spacing: -0.03em; }
 .wn-head .k { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.1em; color: var(--ink2); }
+/* Welcome header (2.6 redesign): centered icon, version kicker, two-line title. */
+.wn-hero { display: flex; flex-direction: column; align-items: center; text-align: center; gap: 10px; padding: 26px 24px 18px; flex: none; }
+.wn-hero .k { font-family: var(--mono); font-size: 10.5px; letter-spacing: 0.12em; color: var(--accText); margin-top: 4px; }
+.wn-hero .t { font-size: 26px; font-weight: 750; letter-spacing: -0.035em; line-height: 1.12; color: var(--ink); }
+.wn-hero .t .acc { display: block; color: var(--accText); }
 .wn-list { flex: 1; min-height: 0; overflow: auto; padding: 0 20px; display: flex; flex-direction: column; gap: 8px; }
 .wn-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; background: var(--bg); }
 .wn-card .k { font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em; color: var(--accText); }
 .wn-card .t { font-size: 15.5px; font-weight: 700; }
 .wn-card .b { font-size: 13.5px; line-height: 1.45; color: var(--ink2); }
-.wn-foot { flex: none; display: flex; justify-content: flex-end; padding: 14px 20px; border-top: 1px solid var(--line); margin-top: 12px; }
+.wn-foot { flex: none; display: flex; justify-content: flex-end; align-items: center; gap: 8px; padding: 14px 20px; border-top: 1px solid var(--line); margin-top: 12px; flex-wrap: wrap; }
+.wn-support { display: flex; gap: 8px; margin-right: auto; flex-wrap: wrap; }
+.wn-cta {
+  height: 38px; padding: 0 16px; border-radius: 8px; border: 1px solid var(--accLine); background: var(--accSoft); color: var(--accText);
+  font: inherit; font-size: 14px; font-weight: 700; cursor: pointer; white-space: nowrap; transition: border-color 0.12s, box-shadow 0.12s;
+}
+.wn-cta:hover { border-color: var(--acc); box-shadow: 0 0 0 3px var(--accSoft); }
+.wn-intro { margin: 0 0 6px; font-size: 14px; line-height: 1.55; color: var(--ink); }
+.wn-link { color: var(--accText); font-weight: 650; text-decoration: underline; text-decoration-color: var(--accLine); text-underline-offset: 3px; cursor: pointer; }
+.wn-link:hover { text-decoration-color: var(--accText); }
+.wn-sub { font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em; color: var(--ink2); margin-top: 4px; }

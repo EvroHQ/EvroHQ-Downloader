@@ -28,12 +28,24 @@ export const WHATS_NEW = [
   { id: '2.5.1', version: '2.5.1', items: [
     { kicker: 'SPEED', title: 'Faster downloads', body: 'Videos sent in fragments now download about 4× faster.' }
   ] },
-  // Design spec §5.8.
-  { id: '2.6.0', version: '2.6.0', items: [
-    { kicker: 'QUEUE', title: 'Line up downloads', body: 'While something is downloading, paste another link and press Add to queue. Each item keeps its own settings.' },
-    { kicker: 'TRIM & CHAPTERS', title: 'Download only the part you need', body: 'Open More options to set a start and end time, or to split a video into one file per chapter.' },
-    { kicker: 'THEMES', title: 'Seven themes, dark by default', body: 'Graphite & Amber is the new default. For a light look, choose Paper & Rust or Bone & Forest.' },
-    { kicker: 'PROXY', title: 'Test your proxy before you download', body: 'Paste one socks5:// link to fill in every field, then press Test connection to check it.' }
+  // Design spec §5.8, plus a welcome note for the redesign and support links.
+  { id: '2.6.0', version: '2.6.0',
+    welcome: {
+      lead: 'Welcome to the new',
+      name: 'EvroHQ Downloader',
+      // Strings, plus { link, text } for the clickable parts.
+      body: [
+        'Version 2.6 is a complete redesign. I reworked the whole experience to make every download simpler, while keeping everything you already used. The app is free, open source and made by one person. If it saves you time, ',
+        { link: 'star', text: 'a star on GitHub' },
+        ' or ',
+        { link: 'coffee', text: 'a coffee' },
+        ' really helps keep it going.'
+      ]
+    },
+    items: [
+    { kicker: 'DESIGN', title: 'One sentence sets up your download', body: 'Paste a link, then click any highlighted word to change the format, quality or folder.' },
+    { kicker: 'YT-DLP', title: 'The download engine updates itself', body: 'yt-dlp now updates in the background, so you no longer have to stop and update it by hand.' },
+    { kicker: 'SOUNDCLOUD', title: 'Clearer SoundCloud sets', body: 'Tracks that can’t be saved (Go+ previews, blocked in your country) are marked in the list instead of failing during the download.' }
   ] }
 ]
 

@@ -1,7 +1,7 @@
 import { app, shell, BrowserWindow, ipcMain, dialog, net, Menu, MenuItem, screen, session, safeStorage } from 'electron'
 import { Socket } from 'net'
 import { join, basename, extname } from 'path'
-import { existsSync, readdirSync, unlinkSync, mkdirSync, renameSync, createWriteStream, copyFileSync, cpSync, writeFileSync } from 'fs'
+import { existsSync, readdirSync, unlinkSync, rmSync, mkdirSync, renameSync, createWriteStream, copyFileSync, cpSync, writeFileSync } from 'fs'
 import { spawn } from 'child_process'
 import { randomUUID } from 'crypto'
 import Store from 'electron-store'
@@ -177,6 +177,10 @@ let botStrikePending = false // preview gave up on a bot check; counted once its
 const botWaitLabel = () => ['30 seconds', '60 seconds', '2 minutes'][Math.min(botStrikes, 2)]
 
 function ytdlpErrorHint(msg) {
+  // Age-restricted videos need a signed-in account; that's not a bot check.
+  if (/confirm your age|age.?restricted|inappropriate for some users/i.test(msg)) {
+    return 'This video is age-restricted: YouTube only plays it to signed-in accounts, so it can’t be downloaded.'
+  }
   if (/confirm you.?re not a bot|Sign in to confirm/i.test(msg)) {
     return `YouTube is blocking this connection as a bot. Try again in ${botWaitLabel()}.`
   }
@@ -186,8 +190,8 @@ function ytdlpErrorHint(msg) {
   if (/HTTP Error 403|Forbidden/i.test(msg)) {
     return 'YouTube refused the download (HTTP 403). Try again, or use another network or proxy.'
   }
-  if (/available in your country|geo.?restrict|blocked it in your country/i.test(msg)) {
-    return 'This video is not available in your country. A proxy may help.'
+  if (/available in your country|geo.?restrict|blocked it in your country|from your location/i.test(msg)) {
+    return 'This is not available in your country. A proxy may help.'
   }
   if (/timed out|Connection reset|RemoteDisconnected|IncompleteRead|Connection aborted|WinError 1005[34]|WinError 10060/i.test(msg)) {
     return 'The connection dropped during the download. Check your network or proxy.'
@@ -949,6 +953,8 @@ function getInstallId() {
 function sendTelemetry(event, extra = {}) {
   try {
     if (store.get('telemetryEnabled') === false) return
+    // Dev runs (npm run dev) would show up as real users of the current version.
+    if (!app.isPackaged) return
     const payload = {
       install_id: getInstallId(),
       event,
@@ -1047,7 +1053,12 @@ function getProcessOutputOnce(binPath, args) {
     let err = ''
     child.stdout.on('data', (c) => (out += c.toString('utf-8')))
     child.stderr.on('data', (c) => (err += c.toString('utf-8')))
-    child.on('error', () => resolve(null))
+    child.on('error', (e) => {
+      const fallback = bundledFallback(binPath, e)
+      if (fallback) return resolve(getProcessOutputOnce(fallback, args))
+      if (isYtdlpBinary(binPath)) lastYtdlpError = `ERROR: yt-dlp couldn't start (${e.code}). An antivirus may have blocked or removed it.`
+      resolve(null)
+    })
     child.on('close', () => {
       if (isYtdlpBinary(binPath)) lastYtdlpError = err
       const text = out.trim()
@@ -1543,10 +1554,12 @@ async function fetchSoundCloudSetFromWeb(url) {
     raw.map((t) => soundCloudTrackIsProtected(clientId, t))
   )
 
-  const tracks = raw.map((e, i) => ({
-    ...soundCloudTrackFromApi(e, i),
-    protected: !!protectedFlags[i]
-  }))
+  // Tracks that can't be saved, and why: DRM streams, GO+ tracks that only
+  // stream a 30 s preview (policy SNIP), tracks blocked in this country (BLOCK).
+  const tracks = raw.map((e, i) => {
+    const reason = protectedFlags[i] ? 'drm' : e.policy === 'SNIP' ? 'preview' : e.policy === 'BLOCK' ? 'geo' : null
+    return { ...soundCloudTrackFromApi(e, i), protected: !!reason, reason }
+  })
   const totalPlays = tracks.reduce((n, t) => n + (t.plays || 0), 0)
   return {
     kind: 'playlist',
@@ -1663,8 +1676,11 @@ async function fetchSoundCloudMeta(ytdlp, url) {
 
   if (asPlaylist) return mergeSoundCloudPlaylist(flat, full)
 
+  const fmts = Array.isArray(src.formats) ? src.formats : []
   return {
     kind: 'track',
+    // GO+ tracks only stream a 30 s preview to non-subscribers.
+    previewOnly: fmts.length > 0 && fmts.every((f) => /preview/i.test(String(f.format_id || ''))),
     id: src.id || null,
     title: src.title || null,
     artist: src.uploader || src.artist || src.creator || src.channel || null,
@@ -1721,6 +1737,23 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 // waits, instead of hammering YouTube with quick retries.
 let botRetriesAllowed = true
 
+// An antivirus sometimes quarantines the updated yt-dlp in userDatain (seen
+// in telemetry as "spawn …yt-dlp.exe ENOENT"). Drop that copy and fall back to
+// the one shipped with the app; the next auto-update fetches a fresh one.
+const SPAWN_FAILURES = new Set(['ENOENT', 'EPERM', 'EACCES', 'UNKNOWN'])
+function bundledFallback(binPath, err) {
+  if (!err || !SPAWN_FAILURES.has(err.code)) return null
+  if (!binPath.startsWith(getUserBinDir())) return null
+  const bundled = getBundledBinPath(basename(binPath))
+  if (!existsSync(bundled)) return null
+  try {
+    rmSync(binPath, { force: true })
+  } catch (e) {
+    // still use the bundled copy
+  }
+  return bundled
+}
+
 async function runBinary(binPath, args, cwd) {
   for (let attempt = 0; ; attempt++) {
     try {
@@ -1728,6 +1761,15 @@ async function runBinary(binPath, args, cwd) {
       if (isYtdlpBinary(binPath)) botStrikes = 0
       return code
     } catch (err) {
+      const fallback = bundledFallback(binPath, err)
+      if (fallback) {
+        sendLog(`${basename(binPath)} couldn't start (${err.code}), using the copy shipped with the app.`)
+        binPath = fallback
+        continue
+      }
+      if (err && SPAWN_FAILURES.has(err.code)) {
+        throw new Error(`${basename(binPath)} couldn't start (${err.code}). An antivirus may have blocked or removed it — reinstall the app or allow it in your antivirus.`)
+      }
       const giveUp = !err.botCheck || attempt >= BOT_RETRIES || cancelRequested || !botRetriesAllowed
       if (err.botCheck && giveUp) botStrikes += 1
       if (giveUp) throw err
@@ -1923,8 +1965,8 @@ async function handleDownload(params) {
   const requestedHeight = videoQuality === '4k' ? 2160 : videoQuality === '2k' ? 1440 : 1080
   const maxHeight = codec === 'h264' ? Math.min(requestedHeight, 1080) : requestedHeight
   const videoSelector = videoFormatSelector(maxHeight, codec)
-  // H.264 stays MP4; Best quality (VP9/AV1 + Opus) goes in MKV, which carries it everywhere.
-  const videoExt = codec === 'h264' ? 'mp4' : 'mkv'
+  // Every video is saved as MP4, as in earlier versions.
+  const videoExt = 'mp4'
 
   // ffmpeg audio encode args for the chosen audio format.
   const audioEncodeArgs =
@@ -2249,8 +2291,8 @@ async function handlePlaylistDownload(params) {
   const requestedHeight = videoQuality === '4k' ? 2160 : videoQuality === '2k' ? 1440 : 1080
   const maxHeight = codec === 'h264' ? Math.min(requestedHeight, 1080) : requestedHeight
   const videoSelector = videoFormatSelector(maxHeight, codec)
-  // H.264 stays MP4; Best quality (VP9/AV1 + Opus) goes in MKV, which carries it everywhere.
-  const videoExt = codec === 'h264' ? 'mp4' : 'mkv'
+  // Every video is saved as MP4, as in earlier versions.
+  const videoExt = 'mp4'
 
   const args = [
     ...jsArgs,
@@ -2386,7 +2428,7 @@ async function handleSoundCloudDownload(params, { playlist } = { playlist: false
     : []
   if (playlist && skippedNames.length) {
     sendLog(
-      `${skippedNames.length} track${skippedNames.length === 1 ? '' : 's'} skipped — DRM-protected on SoundCloud (not downloadable): ${skippedNames.join(', ')}`
+      `${skippedNames.length} track${skippedNames.length === 1 ? '' : 's'} skipped — not downloadable (DRM, GO+ preview only or blocked in this country): ${skippedNames.join(', ')}`
     )
   }
   const label = params?.title
@@ -2426,11 +2468,11 @@ async function handleSoundCloudDownload(params, { playlist } = { playlist: false
     args.push('--no-playlist')
   }
 
+  // Never save GO+ 30 s previews as if they were the track.
+  args.push('-f', 'bestaudio[format_id!*=preview]/best[format_id!*=preview]')
   if (format === 'wav') {
     args.push('-x', '--audio-format', 'wav', '--ffmpeg-location', ffmpeg)
     args.push('--postprocessor-args', 'ffmpeg:-ar 44100 -ac 2 -c:a pcm_s16le')
-  } else {
-    args.push('-f', 'bestaudio/best')
   }
 
   const outTmpl = playlist
@@ -2771,7 +2813,26 @@ ipcMain.handle('get-chapters', async (_event, url) => {
 
 // Fetch a single video's display metadata (title, channel, duration, thumbnail)
 // so the renderer can show a real preview before downloading.
-ipcMain.handle('get-video-info', async (_event, url) => {
+// Reading a pasted link failed (private video, bot check, no network…): same
+// table as downloads, event "read".
+function reportRead(platform, url, playlist, result) {
+  if (!result?.error) return result
+  sendTelemetry('read', { platform, url: url || null, playlist, success: false, error: String(result.error).slice(0, 500) })
+  return result
+}
+
+ipcMain.handle('get-video-info', async (_event, url) => reportRead('youtube', url, false, await getVideoInfoIpc(url)))
+ipcMain.handle('get-playlist-info', async (_event, url) => reportRead('youtube', url, true, await getPlaylistInfoIpc(url)))
+ipcMain.handle('fetch-metadata', async (_event, params) =>
+  reportRead(
+    params?.platform === 'soundcloud' ? 'soundcloud' : 'youtube',
+    params?.url,
+    params?.platform === 'soundcloud' ? isSoundCloudCollectionUrl(params?.url) : isPlaylistUrl(params?.url),
+    await fetchMetadataIpc(params)
+  )
+)
+
+async function getVideoInfoIpc(url) {
   try {
     if (!isYouTubeUrl(url)) return null
     const ytdlp = getBinPath('yt-dlp.exe')
@@ -2781,10 +2842,10 @@ ipcMain.handle('get-video-info', async (_event, url) => {
   } catch (e) {
     return { error: e.message }
   }
-})
+}
 
 // Fetch a playlist's title and flat track list for the preview panel.
-ipcMain.handle('get-playlist-info', async (_event, url) => {
+async function getPlaylistInfoIpc(url) {
   try {
     if (!isPlaylistUrl(url)) return null
     const ytdlp = getBinPath('yt-dlp.exe')
@@ -2794,9 +2855,9 @@ ipcMain.handle('get-playlist-info', async (_event, url) => {
   } catch (e) {
     return { error: e.message }
   }
-})
+}
 
-ipcMain.handle('fetch-metadata', async (_event, params) => {
+async function fetchMetadataIpc(params) {
   try {
     const url = params?.url
     const platform = params?.platform === 'soundcloud' ? 'soundcloud' : 'youtube'
@@ -2822,7 +2883,7 @@ ipcMain.handle('fetch-metadata', async (_event, params) => {
   } catch (e) {
     return { error: e.message }
   }
-})
+}
 
 ipcMain.handle('start-soundcloud-download', (_event, params) =>
   runSoundCloudIpc(params, { playlist: false })

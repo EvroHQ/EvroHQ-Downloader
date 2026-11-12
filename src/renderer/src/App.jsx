@@ -110,7 +110,8 @@ function scSource(meta, url) {
       dur: Number(t.duration) || 0,
       thumb: t.thumbnail || null,
       url: t.url,
-      protected: !!t.protected
+      protected: !!t.protected,
+      reason: t.reason || (t.protected ? 'drm' : null)
     }))
     return { kind: 'sc', type: 'list', label: 'SoundCloud set', title: meta.title || 'Set', by: meta.artist || '', thumbnail: meta.cover || null, url, tracks }
   }
@@ -248,6 +249,13 @@ const jobKey = (j) => `${j.api}|${j.src.url}|${JSON.stringify(j.cfg)}|${j.sel.jo
 function errorCard(message, noun, url) {
   const msg = String(message || 'Could not read this link.')
   const raw = /^ERROR/.test(msg) ? msg : `ERROR: ${msg}`
+  if (/age-restricted|confirm your age|inappropriate for some users/i.test(msg)) {
+    return {
+      title: 'This video is age-restricted.',
+      body: 'YouTube only plays it to signed-in accounts, so it can’t be downloaded.',
+      raw
+    }
+  }
   if (/as a bot|not a bot/i.test(msg)) {
     return {
       title: 'YouTube is blocking this connection for now.',
@@ -257,6 +265,20 @@ function errorCard(message, noun, url) {
   }
   if (/Proxy unreachable/i.test(msg)) {
     return { title: 'Your proxy isn’t answering.', body: 'Check that your proxy app is running, or turn the proxy off in Settings.', raw }
+  }
+  if (/GO\+ preview only/i.test(msg)) {
+    return {
+      title: 'This track is for SoundCloud Go+ subscribers.',
+      body: 'SoundCloud only streams a 30-second preview of it, so it can’t be downloaded.',
+      raw
+    }
+  }
+  if (/geo.?restrict|from your location|in your country/i.test(msg)) {
+    return {
+      title: `This ${noun} isn't available in your country.`,
+      body: 'The uploader blocked it here. A proxy in a country where it plays can get around it.',
+      raw
+    }
   }
   if (/private|unavailable|does not exist|removed|deleted|not available|no longer|HTTP Error 40[04]/i.test(msg)) {
     return {
@@ -338,16 +360,15 @@ export default function App() {
   const [active, setActive] = useState(null)
   const [queue, setQueue] = useState([])
   const [wait, setWait] = useState(null) // { until, bot }
-  const [doneJob, setDoneJob] = useState(null)
   const [stopping, setStopping] = useState(false)
-  const [live, setLive] = useState({ progress: 0, item: 0, itemPct: 0, speed: null })
+  const [live, setLive] = useState({ progress: 0, item: 0, itemPct: 0, speed: null, phase: 'prep' })
   const [, setTick] = useState(0)
   const queueRef = useRef([])
   const activeRef = useRef(null)
   const seqRef = useRef(0)
   const skipRef = useRef(false)
   const abortRef = useRef(false)
-  const liveRef = useRef({ progress: 0, item: 0, itemPct: 0, speed: null })
+  const liveRef = useRef({ progress: 0, item: 0, itemPct: 0, speed: null, phase: 'prep' })
   const speedRef = useRef(null)
   const flushRef = useRef(0)
   const dl = useRef({ pass: 1, dest: 0, extracts: 0, extra: false })
@@ -465,6 +486,10 @@ export default function App() {
         d.dest = 0
         d.extra = false
         speedRef.current = null
+        // The next row starts at 0 %, not at the previous item's 100 %.
+        liveRef.current.itemPct = 0
+        // Reading the page + YouTube's few-second wait come before any bytes.
+        liveRef.current.phase = 'prep'
       }
       const item = line.match(/Downloading (?:item|video) (\d+) of (\d+)/i)
       if (item) {
@@ -502,6 +527,7 @@ export default function App() {
           const within = w.slice(0, pass - 1).reduce((a, x) => a + x, 0) + w[pass - 1] * (raw / 100)
           const overall = job.total ? ((liveRef.current.item + within) / total) * 100 : within * 100
           liveRef.current.itemPct = within * 100
+          liveRef.current.phase = 'dl'
           liveRef.current.progress = Math.max(liveRef.current.progress, Math.min(99.9, overall))
           const st = parseDlStats(line)
           if (st?.speed != null) {
@@ -511,6 +537,8 @@ export default function App() {
         }
       }
       if (/\[(Merger|ExtractAudio|VideoConvertor|FixupM3u8|ffmpeg|SplitChapters)\]/.test(line)) liveRef.current.speed = null
+      // Conversion / tagging after the bytes are in.
+      if (/^\[(Merger|ExtractAudio|VideoConvertor|Metadata|EmbedThumbnail)\]/.test(line)) liveRef.current.phase = 'post'
       if (/were skipped/.test(line)) skippedRef.current = true
       schedule()
     })
@@ -598,6 +626,7 @@ export default function App() {
           const meta = await window.api.fetchMetadata({ platform: 'soundcloud', url: link.url })
           if (readReq.current !== req) return
           if (!meta || meta.error) return fail(meta?.error, link.kind === 'sc' ? 'set' : 'track')
+          if (meta.previewOnly) return fail('GO+ preview only: SoundCloud streams just 30 seconds of this track.', 'track')
           src = scSource(meta, link.url)
         }
         const sel = src.tracks.filter((t) => !t.protected).map((t) => t.id)
@@ -633,7 +662,7 @@ export default function App() {
   const switchToList = async () => {
     if (ed.src?.type === 'list' || !ed.src?.listUrl || altLoading) return
     if (ed.alt?.type === 'list') {
-      setEd((e) => ({ ...e, src: e.alt, alt: e.src, sel: e.alt.tracks.map((t) => t.id), cfg: { ...e.cfg, trimOn: false, split: false } }))
+      setEd((e) => ({ ...e, saved: null, src: e.alt, alt: e.src, sel: e.alt.tracks.map((t) => t.id), cfg: { ...e.cfg, trimOn: false, split: false } }))
       return
     }
     setAltLoading('list')
@@ -645,13 +674,13 @@ export default function App() {
     }
     const list = ytListSource(info, { listUrl: ed.src.listUrl })
     list.videoUrl = ed.src.url
-    setEd((e) => ({ ...e, src: list, alt: e.src, sel: list.tracks.map((t) => t.id), cfg: { ...e.cfg, trimOn: false, split: false } }))
+    setEd((e) => ({ ...e, saved: null, src: list, alt: e.src, sel: list.tracks.map((t) => t.id), cfg: { ...e.cfg, trimOn: false, split: false } }))
   }
   // "This video only": reuse the video if it was already read, else read it.
   const switchToVideo = async () => {
     if (ed.src?.type === 'video' || altLoading) return
     if (ed.alt?.type === 'video') {
-      setEd((e) => ({ ...e, src: e.alt, alt: e.src, sel: e.alt.tracks.map((t) => t.id) }))
+      setEd((e) => ({ ...e, saved: null, src: e.alt, alt: e.src, sel: e.alt.tracks.map((t) => t.id) }))
       return
     }
     const videoUrl = ed.src?.videoUrl
@@ -666,7 +695,7 @@ export default function App() {
     }
     const video = videoSource(info, ch?.chapters, { kind: 'plvid', videoUrl })
     video.listUrl = ed.src.url
-    setEd((e) => ({ ...e, src: video, alt: e.src, sel: video.tracks.map((t) => t.id), cfg: { ...makeCfg(video, lastCfgRef.current), folder: e.cfg.folder } }))
+    setEd((e) => ({ ...e, saved: null, src: video, alt: e.src, sel: video.tracks.map((t) => t.id), cfg: { ...makeCfg(video, lastCfgRef.current), folder: e.cfg.folder } }))
   }
 
   /* --- editing ------------------------------------------------------------------ */
@@ -675,7 +704,7 @@ export default function App() {
       const cfg = { ...e.cfg, ...patch }
       lastCfgRef.current = { ...lastCfgRef.current, format: cfg.format, res: cfg.res, codec: cfg.codec, afmt: cfg.afmt, scfmt: cfg.scfmt, meta: cfg.meta, folder: cfg.folder }
       if (patch.codec) window.api?.setConfig({ codec: cfg.codec })
-      return { ...e, cfg }
+      return { ...e, cfg, saved: null }
     })
 
   const chooseFolder = async () => {
@@ -694,7 +723,7 @@ export default function App() {
 
   /* --- queue & downloads ------------------------------------------------------- */
   const resetLive = () => {
-    liveRef.current = { progress: 0, item: 0, itemPct: 0, speed: null }
+    liveRef.current = { progress: 0, item: 0, itemPct: 0, speed: null, phase: 'prep' }
     speedRef.current = null
     dl.current = { pass: 1, dest: 0, extracts: 0, extra: false }
     setLive({ ...liveRef.current })
@@ -702,12 +731,19 @@ export default function App() {
 
   // A cancelled / failed item comes back into the editor with its settings —
   // unless the user is already editing another link.
-  const reopenInEditor = (job) => {
+  const reopenInEditor = (job, saved = null) => {
     setEd((e) =>
       e.view === 'empty'
-        ? { view: 'ready', url: job.url, src: job.src, alt: job.alt, sel: job.sel, cfg: job.cfg, fromWatch: job.fromWatch, err: null }
+        ? { view: 'ready', url: job.url, src: job.src, alt: job.alt, sel: job.sel, cfg: job.cfg, fromWatch: job.fromWatch, err: null, saved }
         : e
     )
+  }
+
+  // A finished download stays on screen with its settings editable, so another
+  // quality or the audio can be grabbed without pasting the link again.
+  const finishJob = (job) => {
+    const e = estimate(job.src, job.sel, job.cfg)
+    reopenInEditor(job, { text: `${e.unit}, ${fmtMB(e.mb)}`, folder: job.cfg.folder })
   }
 
   const runJob = async (job) => {
@@ -743,7 +779,6 @@ export default function App() {
   const runQueue = async (first) => {
     let job = first
     abortRef.current = false
-    setDoneJob(null)
     while (job) {
       const { res, snapshot } = await runJob(job)
       const ok = res.success || res.alreadyDownloaded
@@ -751,13 +786,13 @@ export default function App() {
         setQueueBoth([{ ...job, botTries: (job.botTries || 0) + 1, last: snapshot, params: { ...job.params, queued: true } }, ...queueRef.current])
       }
       if (!queueRef.current.length || abortRef.current) {
-        if (ok) setDoneJob(job)
+        if (ok) finishJob(job)
         else if (!abortRef.current) reopenInEditor(job)
         break
       }
       await waitBeforeNext(res.botCheck ? res.retryAfterSec || 30 : QUEUE_GAP_SEC, !!res.botCheck)
       if (abortRef.current || !queueRef.current.length) {
-        if (ok) setDoneJob(job)
+        if (ok) finishJob(job)
         break
       }
       const [next, ...rest] = queueRef.current
@@ -807,12 +842,6 @@ export default function App() {
     if (!activeRef.current) abortRef.current = true
     toastMsg('info', 'Queue cleared')
   }
-  const downloadAgain = () => {
-    if (!doneJob || busy) return
-    const job = { ...doneJob, id: ++seqRef.current, botTries: 0, last: null, params: { ...doneJob.params, queued: false } }
-    runQueue(job)
-  }
-
   /* --- settings: window, proxy, engine --------------------------------------- */
   const selectWindow = (k) => {
     setWindowSize(k)
@@ -922,6 +951,11 @@ export default function App() {
     return () => document.removeEventListener('mousedown', onDown)
   }, [pop, qOpen])
 
+  // Close the queue popover when the queue empties.
+  useEffect(() => {
+    if (!queue.length) setQOpen(false)
+  }, [queue.length])
+
   // Esc closes popovers, then the sheet, then dialogs.
   useEffect(() => {
     const onKey = (e) => {
@@ -950,9 +984,7 @@ export default function App() {
         ? wait.bot
           ? 'paused'
           : 'next'
-        : doneJob
-          ? 'done'
-          : 'empty'
+        : 'empty'
 
   // The thing the main area and the dock describe.
   let subj = null
@@ -963,9 +995,6 @@ export default function App() {
     locked = true
   } else if (mode === 'paused' || mode === 'next') {
     subj = queue[0] || null
-    locked = true
-  } else if (mode === 'done') {
-    subj = doneJob
     locked = true
   }
   const src = subj?.src || null
@@ -1003,6 +1032,13 @@ export default function App() {
       hMeta = single
         ? [hms(src.duration), cap, src.chapters?.length ? `${src.chapters.length} chapters` : ''].filter(Boolean).join(' · ')
         : [`${src.tracks.length} ${src.tracks.length === 1 ? 'track' : 'tracks'}`, hms(tot), cap].filter(Boolean).join(' · ')
+      // Just finished: say so until the user changes something.
+      if (ed.saved && single) {
+        hHead = 'Saved. '
+        hAcc = ed.saved.text
+        hAccC = 'var(--grn)'
+        hMeta = `→ ${ed.saved.folder}`
+      } else if (ed.saved) hMeta = `Saved · ${ed.saved.text} → ${ed.saved.folder}`
     } else if (mode === 'active') {
       hK = src.title.toUpperCase()
       hHead = 'Downloading '
@@ -1035,7 +1071,6 @@ export default function App() {
     else toastMsg('error', `Couldn't open ${cfg?.folder || 'the folder'}.`)
   }
   const newDownload = () => {
-    setDoneJob(null)
     clearEditor()
     setTimeout(() => inputRef.current?.focus(), 0)
   }
@@ -1047,7 +1082,7 @@ export default function App() {
         : null,
     paused: mode === 'paused',
     next: mode === 'next',
-    done: mode === 'done',
+    done: mode === 'done' || (mode === 'ready' && !!ed.saved),
     onResume: startNow,
     onStartNow: startNow,
     onProxy: () => openSettings(true),
@@ -1065,6 +1100,7 @@ export default function App() {
       const i = src.tracks.indexOf(t)
       let st = 'wait'
       let rowPct = 0
+      let phase = null
       if (isReady) st = t.protected ? 'drm' : ed.sel.includes(t.id) ? 'on' : 'off'
       else if (mode === 'done') st = 'done'
       else if (mode === 'active' || mode === 'paused') {
@@ -1072,6 +1108,7 @@ export default function App() {
         else if (k === itemIdx) {
           st = mode === 'paused' ? 'paused' : 'active'
           rowPct = Math.floor(mode === 'paused' ? lastSnap?.itemPct || 0 : live.itemPct)
+          if (mode === 'active') phase = live.phase
         }
       }
       return {
@@ -1084,11 +1121,13 @@ export default function App() {
         dur: t.dur ? hms(t.dur) : '',
         size: `~${fmtMB(((t.dur || 0) / 60) * rate)}`,
         st,
+        reason: t.reason,
+        phase,
         pct: rowPct,
         dim: isReady && st !== 'on',
         onClick:
           isReady && !t.protected
-            ? () => setEd((e) => ({ ...e, sel: e.sel.includes(t.id) ? e.sel.filter((z) => z !== t.id) : src.tracks.filter((x) => x.id === t.id || e.sel.includes(x.id)).map((x) => x.id) }))
+            ? () => setEd((e) => ({ ...e, saved: null, sel: e.sel.includes(t.id) ? e.sel.filter((z) => z !== t.id) : src.tracks.filter((x) => x.id === t.id || e.sel.includes(x.id)).map((x) => x.id) }))
             : undefined
       }
     })
@@ -1107,7 +1146,7 @@ export default function App() {
       selectAll: isReady
         ? {
             state: all ? 'on' : none ? 'off' : 'part',
-            onClick: () => setEd((e) => ({ ...e, sel: all ? [] : selectable.map((t) => t.id) }))
+            onClick: () => setEd((e) => ({ ...e, saved: null, sel: all ? [] : selectable.map((t) => t.id) }))
           }
         : null,
       caption: isReady ? `${ed.sel.length} OF ${src.tracks.length} SELECTED` : 'TITLE',
@@ -1125,7 +1164,7 @@ export default function App() {
       kicker: mode === 'next' ? hK : src.label.toUpperCase(),
       title: src.title,
       by: src.by,
-      head: mode === 'ready' ? '' : mode === 'next' ? hHead : hHead,
+      head: mode === 'ready' && !ed.saved ? '' : hHead,
       acc: hAcc,
       accColor: hAccC,
       meta: hMeta,
@@ -1168,7 +1207,7 @@ export default function App() {
         return {
           title: 'FORMAT',
           opts: [
-            O('Video', `MP4 or MKV · up to ${src.max || (cfg.codec === 'h264' ? 1080 : 2160)}p`, !isSc && cfg.format === 'video', () => set({ format: 'video' }), isSc ? 'SoundCloud is audio only' : null),
+            O('Video', `MP4 · up to ${src.max || (cfg.codec === 'h264' ? 1080 : 2160)}p`, !isSc && cfg.format === 'video', () => set({ format: 'video' }), isSc ? 'SoundCloud is audio only' : null),
             O('Audio only', isSc ? 'Original or WAV' : 'WAV or MP3 · no picture', isSc || cfg.format === 'audio', () => set({ format: 'audio' }))
           ]
         }
@@ -1182,11 +1221,15 @@ export default function App() {
           ].map(([r, l]) =>
             O(
               `${r}p`,
-              r > 1080 && cfg.codec === 'h264' ? `${l} · switches to Best quality` : l,
+              l,
               cfg.res === r,
-              () => set(r > 1080 ? { res: r, codec: 'best' } : { res: r }),
+              () => set({ res: r }),
               // 1080p means "best up to 1080p", so it's always available.
-              src.max && r > 1080 && r > src.max ? `This ${what} tops out at ${src.max}p` : null
+              src.max && r > 1080 && r > src.max
+                ? `This ${what} tops out at ${src.max}p`
+                : r > 1080 && cfg.codec === 'h264'
+                  ? 'H.264 stops at 1080p · choose Best quality for 2K and 4K'
+                  : null
             )
           )
         }
@@ -1195,7 +1238,7 @@ export default function App() {
           title: 'ENCODING',
           opts: [
             O('H.264', cfg.res > 1080 ? 'Plays everywhere · max 1080p · drops to 1080p' : 'Plays everywhere · max 1080p · MP4', cfg.codec === 'h264', () => set({ codec: 'h264', res: Math.min(cfg.res, 1080) })),
-            O('Best quality', 'VP9 / AV1 · smaller files · MKV', cfg.codec === 'best', () => set({ codec: 'best' }))
+            O('Best quality', 'VP9 / AV1 · smaller files', cfg.codec === 'best', () => set({ codec: 'best' }))
           ]
         }
       case 'afmt':
@@ -1211,7 +1254,7 @@ export default function App() {
           title: 'SOUNDCLOUD QUALITY',
           opts: [
             O('Original', 'Best available · no re-encoding', cfg.scfmt === 'original', () => set({ scfmt: 'original' })),
-            O('WAV', 'Converted to WAV · lossless container', cfg.scfmt === 'wav', () => set({ scfmt: 'wav' }))
+            O('WAV', 'For DAWs and DJ software · same sound, bigger file', cfg.scfmt === 'wav', () => set({ scfmt: 'wav' }))
           ]
         }
       case 'meta':
@@ -1305,9 +1348,9 @@ export default function App() {
     const chCount = src.chapters?.length || 0
     let trimInfo = ''
     if (ytSingle) {
-      if (!cfg.trimOn) trimInfo = `Video length ${hms(src.duration)}`
+      if (!cfg.trimOn) trimInfo = `Video length ${hms6(src.duration)}`
       else if (est.terr) trimInfo = est.terr
-      else trimInfo = `Selection ${hms(est.secs)} · ≈ ${fmtMB(est.mb)}`
+      else trimInfo = `Selection ${hms6(est.secs)} · ≈ ${fmtMB(est.mb)}`
     }
     moreView = {
       open: more,
@@ -1388,14 +1431,15 @@ export default function App() {
     button = { kind: 'prog', pct: prog, fill: 'var(--yel)', t1: 'Paused', t2: `${pct}% · bot check`, act: 'Resume', onAct: startNow }
   } else if (mode === 'next') {
     button = { kind: 'prog', pct: 0, fill: 'var(--acc)', t1: `Next in ${waitLeft} s`, t2: `${queue.length} waiting`, act: 'Start now', onAct: startNow }
-  } else if (mode === 'done') {
-    button = { kind: 'ready', label: 'Download again', glyph: '↻', onClick: downloadAgain }
   } else if (mode === 'fetching') button = { kind: 'dis', label: 'Reading link…' }
   else button = { kind: 'dis', label: 'Paste a link first' }
 
   const qCount = (active ? 1 : 0) + queue.length
-  const showChip = busy || queue.length > 0
-  const chipSub = active ? `${Math.floor(live.progress)}%` : wait ? (wait.bot ? 'paused' : `next in ${waitLeft} s`) : ''
+  // The queue only shows up once a second link is waiting.
+  const showChip = queue.length > 0
+  const chipSub = active ? `${queue.length} waiting` : wait ? (wait.bot ? 'paused' : `next in ${waitLeft} s`) : ''
+  // Half width next to the queue button: keep just the percentage and the action.
+  if (showChip && button.kind === 'prog') button = { ...button, t2: '' }
   let qView = null
   if (qOpen && showChip) {
     const curJob = active || pausedItem
@@ -1536,7 +1580,14 @@ export default function App() {
         <div className="dock-left" style={{ opacity: dockDim ? 0.45 : 1 }}>
           <div className="dock-label">{dockLabel}</div>
           <Sentence segs={segs} />
-          {moreView ? <MoreOptions m={moreView} /> : null}
+          {moreView ? (
+            <MoreOptions m={moreView} />
+          ) : subj && locked ? (
+            // Keeps the dock height while a download runs, so the preview doesn't jump.
+            <div className="more" aria-hidden="true" style={{ visibility: 'hidden' }}>
+              <span className="morebtn">More options</span>
+            </div>
+          ) : null}
         </div>
         <div className="dock-right">
           <div className="sizeline">
@@ -1589,7 +1640,7 @@ export default function App() {
         />
       ) : null}
 
-      {whatsNew ? <WhatsNew block={whatsNew.block} prevVersion={whatsNew.prev} onClose={dismissWhatsNew} /> : null}
+      {whatsNew ? <WhatsNew block={whatsNew.block} prevVersion={whatsNew.prev} onClose={dismissWhatsNew} onLink={openLink} /> : null}
     </div>
   )
 }
