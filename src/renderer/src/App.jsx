@@ -1,3165 +1,1484 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
-import { createPortal } from 'react-dom'
-import { motion, AnimatePresence } from 'framer-motion'
-import { Toaster, toast as baseToast } from 'sonner'
+// EvroHQ Downloader 2.6 UI — implements design/EvroHQ-Downloader-Design-Spec.md
+// (the prototype in design/ is the reference). All downloading is done by the
+// main process through window.api; this file holds the UI state and logic.
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { applyTheme, resolveTheme } from './lib/themes'
 import {
-  Download,
-  Clipboard,
-  Music,
-  Video,
-  FolderOpen,
-  Loader2,
-  Check,
-  Coffee,
-  Star,
-  Film,
-  Square,
-  ChevronDown,
-  CheckCircle2,
-  XCircle,
-  Info,
-  AlertTriangle,
-  Scissors,
-  Lock,
-  Sparkles,
-  Maximize2,
-  Minimize2,
-  ListPlus,
-  ListOrdered,
-  Eye,
-  EyeOff,
-  ChevronRight,
-  X
-} from 'lucide-react'
-import proxyIconUrl from '../../../resources/proxy_icon.svg?url'
-import appIconUrl from '../../../resources/evrohq-icon-1024.svg?url'
+  detectLink,
+  hms,
+  hms6,
+  parseT,
+  fmtT,
+  trimError,
+  fmtMB,
+  ratePerMin,
+  containerOf,
+  qualityText,
+  splitTitle,
+  parseDlStats,
+  smoothSpeed
+} from './lib/util'
+import { pendingWhatsNew } from './lib/whatsnew'
+import {
+  TitleBar,
+  Banner,
+  UrlBar,
+  EmptyState,
+  Reading,
+  ErrorCard,
+  SingleView,
+  ListView,
+  Sentence,
+  MoreOptions,
+  PrimaryButton,
+  QueuePopover,
+  Toast,
+  WhatsNew
+} from './ui'
+import { SettingsSheet } from './settings'
 
-// Errors and warnings stay up longer than the 2s default so they can be read.
-const toast = Object.assign((...args) => baseToast(...args), baseToast, {
-  error: (msg, opts) => baseToast.error(msg, { duration: 6000, ...opts }),
-  warning: (msg, opts) => baseToast.warning(msg, { duration: 5000, ...opts })
+const EXAMPLE_PLAYLIST = 'https://www.youtube.com/playlist?list=PLFgquLnL59alCl_2TQvOiD5Vgm1hCaGSI'
+const QUEUE_GAP_SEC = 5 // pause between two queued downloads
+const TOAST_MS = 3800
+const LINKS = {
+  star: 'https://github.com/EvroHQ/EvroHQ-Downloader',
+  coffee: 'https://buymeacoffee.com/evrohq',
+  madeby: 'https://github.com/EvroHQ'
+}
+const RES_TO_QUALITY = { 1080: '1080', 1440: '2k', 2160: '4k' }
+
+/* -------------------------------------------------------------------------- */
+/*  Sources, settings, jobs                                                   */
+/* -------------------------------------------------------------------------- */
+
+function videoSource(info, chapters, link) {
+  return {
+    kind: 'yt',
+    type: 'video',
+    label: link.kind === 'plvid' ? 'YouTube video · from a playlist' : 'YouTube video',
+    title: info.title || 'Untitled video',
+    by: info.channel || '',
+    thumbnail: info.thumbnail || null,
+    duration: Number(info.duration) || 0,
+    chapters: Array.isArray(chapters) ? chapters : [],
+    max: info.sizes?.maxHeight || null,
+    sizes: info.sizes || null,
+    url: link.videoUrl,
+    tracks: [{ id: info.id || 'v', ...splitTitle(info.title, info.channel), full: info.title, dur: Number(info.duration) || 0, thumb: info.thumbnail }]
+  }
+}
+
+function ytListSource(info, link) {
+  const tracks = (info.tracks || []).map((t, i) => ({
+    id: String(t.id ?? i),
+    ...splitTitle(t.title),
+    full: t.title,
+    dur: Number(t.duration) || 0,
+    thumb: t.thumbnail || null,
+    url: t.url && /^https?:\/\//i.test(t.url) ? t.url : t.id ? `https://www.youtube.com/watch?v=${t.id}` : null
+  }))
+  return {
+    kind: 'yt',
+    type: 'list',
+    label: 'YouTube playlist',
+    title: info.title || 'Playlist',
+    by: info.by || '',
+    thumbnail: info.cover || tracks[0]?.thumb || null,
+    url: link.listUrl,
+    tracks
+  }
+}
+
+function scSource(meta, url) {
+  if (meta.kind === 'playlist') {
+    const tracks = (meta.tracks || []).map((t, i) => ({
+      id: String(t.id ?? i),
+      a: t.artist || meta.artist || 'Unknown artist',
+      t: t.title,
+      full: t.title,
+      dur: Number(t.duration) || 0,
+      thumb: t.thumbnail || null,
+      url: t.url,
+      protected: !!t.protected
+    }))
+    return { kind: 'sc', type: 'list', label: 'SoundCloud set', title: meta.title || 'Set', by: meta.artist || '', thumbnail: meta.cover || null, url, tracks }
+  }
+  return {
+    kind: 'sc',
+    type: 'video',
+    label: 'SoundCloud track',
+    title: meta.title || 'Track',
+    by: meta.artist || '',
+    thumbnail: meta.thumbnail || null,
+    duration: Number(meta.duration) || 0,
+    chapters: [],
+    max: null,
+    url,
+    tracks: [{ id: String(meta.id || 't'), a: meta.artist || '', t: meta.title, full: meta.title, dur: Number(meta.duration) || 0, thumb: meta.thumbnail }]
+  }
+}
+
+// Settings for a freshly read link: keep the user's last choices, reset trim.
+function makeCfg(src, last) {
+  let res = last.res
+  if (src.type === 'video' && src.max && res > src.max) res = src.max >= 1440 ? 1440 : 1080
+  return {
+    format: src.kind === 'sc' ? 'audio' : last.format,
+    res,
+    codec: res > 1080 ? 'best' : last.codec,
+    afmt: last.afmt,
+    scfmt: last.scfmt,
+    meta: last.meta,
+    folder: last.folder,
+    trimOn: false,
+    tStart: '00:00:00',
+    tEnd: hms6(src.duration || 0),
+    split: false
+  }
+}
+
+// Size / length of a selection (spec §5.3 "File size estimates"). Single
+// YouTube videos use the real format sizes from yt-dlp when they're known.
+function estimate(src, sel, cfg) {
+  const isSc = src.kind === 'sc'
+  const single = src.type === 'video'
+  const items = single ? src.tracks : src.tracks.filter((t) => sel.includes(t.id))
+  const terr = single && src.kind === 'yt' ? trimError(cfg, src.duration) : null
+  let secs = items.reduce((a, t) => a + (t.dur || 0), 0)
+  const trimmed = single && cfg.trimOn && !terr
+  if (trimmed) secs = parseT(cfg.tEnd).sec - parseT(cfg.tStart).sec
+  let mb = (secs / 60) * ratePerMin(isSc, cfg)
+  if (single && !isSc && cfg.format === 'video' && src.sizes) {
+    const bytes = cfg.codec === 'h264' ? src.sizes.h264?.[1080] : src.sizes.best?.[cfg.res]
+    if (bytes) mb = (bytes / 1024 ** 2) * (trimmed && src.duration ? secs / src.duration : 1)
+  }
+  const n = items.length
+  const unit = single
+    ? cfg.split && src.chapters?.length
+      ? `${src.chapters.length} chapters`
+      : isSc
+        ? '1 track'
+        : '1 video'
+    : `${n} ${n === 1 ? 'track' : 'tracks'}`
+  return { n, secs, mb, terr, unit, cont: containerOf(isSc, cfg) }
+}
+
+const summaryOf = (job) => {
+  const e = estimate(job.src, job.sel, job.cfg)
+  return `${e.unit} · ${qualityText(job.src.kind === 'sc', job.cfg)} · ~${fmtMB(e.mb)}${job.cfg.trimOn ? ' · trimmed' : ''}`
+}
+
+// Everything a download needs, frozen now (each queued item keeps its settings).
+function buildJob(ed, seq) {
+  const { src, sel, cfg } = ed
+  const isSc = src.kind === 'sc'
+  const est = estimate(src, sel, cfg)
+  const base = { id: seq, src, sel: [...sel], cfg: { ...cfg }, url: ed.url, fromWatch: ed.fromWatch, alt: ed.alt, est, label: src.title }
+  const outputFolder = cfg.folder
+  if (isSc && src.type === 'list') {
+    const chosen = src.tracks.filter((t) => sel.includes(t.id) && !t.protected)
+    return {
+      ...base,
+      api: 'startSoundCloudPlaylistDownload',
+      streams: 1,
+      total: chosen.length,
+      batch: true,
+      params: {
+        platform: 'soundcloud',
+        url: src.url,
+        format: cfg.scfmt,
+        selectedTracks: src.tracks.map((t, i) => (sel.includes(t.id) && !t.protected ? i + 1 : null)).filter(Boolean),
+        trackUrls: chosen.map((t) => t.url).filter((u) => typeof u === 'string' && /^https?:\/\//i.test(u)),
+        skippedTracks: src.tracks.filter((t) => t.protected).map((t) => t.full),
+        itemCount: chosen.length,
+        title: src.title,
+        artist: src.by,
+        outputFolder
+      }
+    }
+  }
+  if (isSc) {
+    return { ...base, api: 'startSoundCloudDownload', streams: 1, params: { platform: 'soundcloud', url: src.url, format: cfg.scfmt, title: src.title, artist: src.by, outputFolder } }
+  }
+  const common = { format: cfg.format, audioFormat: cfg.afmt, videoQuality: RES_TO_QUALITY[cfg.res], codec: cfg.codec, embedMeta: cfg.meta, outputFolder }
+  const streams = cfg.format === 'video' ? 2 : 1
+  if (src.type === 'list') {
+    const trackUrls = src.tracks.filter((t) => sel.includes(t.id)).map((t) => t.url).filter(Boolean)
+    return {
+      ...base,
+      api: 'startPlaylistDownload',
+      streams,
+      total: trackUrls.length,
+      batch: true,
+      params: { url: src.url, trackUrls, title: src.title, itemCount: trackUrls.length, ...common }
+    }
+  }
+  return {
+    ...base,
+    api: 'startDownload',
+    streams,
+    params: {
+      url: src.url,
+      ...common,
+      useRange: cfg.trimOn && !cfg.split,
+      byChapters: cfg.split && !cfg.trimOn,
+      chapterCount: src.chapters?.length || 0,
+      start: cfg.tStart,
+      end: cfg.tEnd,
+      title: src.title,
+      duration: src.duration
+    }
+  }
+}
+
+const jobKey = (j) => `${j.api}|${j.src.url}|${JSON.stringify(j.cfg)}|${j.sel.join(',')}`
+
+// Turn a preview failure into the error card text (spec §5.2 "Error card").
+function errorCard(message, noun, url) {
+  const msg = String(message || 'Could not read this link.')
+  const raw = /^ERROR/.test(msg) ? msg : `ERROR: ${msg}`
+  if (/as a bot|not a bot/i.test(msg)) {
+    return {
+      title: 'YouTube is blocking this connection for now.',
+      body: 'Wait about 30 seconds and try again. If it keeps happening, route downloads through a proxy.',
+      raw
+    }
+  }
+  if (/Proxy unreachable/i.test(msg)) {
+    return { title: 'Your proxy isn’t answering.', body: 'Check that your proxy app is running, or turn the proxy off in Settings.', raw }
+  }
+  if (/private|unavailable|does not exist|removed|deleted|not available|no longer|HTTP Error 40[04]/i.test(msg)) {
+    return {
+      title: `This ${noun} is private, or it doesn't exist.`,
+      body: "Check that it's set to Public or Unlisted and that the link is complete. If YouTube is blocked on your network, route downloads through a proxy.",
+      raw
+    }
+  }
+  return {
+    title: `Couldn't read this ${noun}.`,
+    body: 'Check the link and your connection, then try again. If YouTube is blocked on your network, route downloads through a proxy.',
+    raw: raw || `ERROR: ${url}`
+  }
+}
+
+const UNSUPPORTED = (url) => ({
+  title: "That isn't a YouTube or SoundCloud link.",
+  body: 'This app reads links from youtube.com, youtu.be and soundcloud.com. Check the link you pasted.',
+  raw: `ERROR: Unsupported URL: ${url}`
 })
 
-const spring = { type: 'spring', stiffness: 420, damping: 34 }
-
-const THEMES = [
-  { id: 'evrohq', name: 'EvroHQ' },
-  { id: 'graphite-amber', name: 'Graphite & Amber' },
-  { id: 'carbon-cyan', name: 'Carbon & Cyan' },
-  { id: 'obsidian-violet', name: 'Obsidian & Violet' },
-  { id: 'charcoal-red', name: 'Charcoal & Signal Red' },
-  { id: 'paper-rust', name: 'Paper & Rust' },
-  { id: 'bone-forest', name: 'Bone & Forest' }
-]
-
-const LIGHT_THEMES = new Set(['paper-rust', 'bone-forest'])
-
-/* What’s New — one block per app version. Add a new `{ id, version, items }`
-   whenever package.json is bumped. Shown until Got it; ids already in
-   whatsNewAck are skipped. Restart-to-update must not count as seen. */
-const WHATS_NEW = [
-  {
-    id: '2.3.2-soundcloud',
-    version: '2.3.0',
-    items: [
-      {
-        title: 'SoundCloud',
-        body: 'Paste a SoundCloud track or playlist in the same field as YouTube.'
-      },
-      {
-        title: 'New name',
-        body: 'The app is now EvroHQ Downloader — same app, YouTube plus SoundCloud.'
-      }
-    ]
-  },
-  {
-    id: '2.3.4',
-    version: '2.3.4',
-    items: [
-      {
-        title: 'Compact window',
-        body: 'Switch Default or Compact from the header icons. Embed and Split by chapters now share one row.'
-      },
-      {
-        title: 'Right-click',
-        body: 'Right-click the URL field for Cut, Copy, Paste, and Select All.'
-      },
-      {
-        title: 'About',
-        body: 'Open About next to Themes to read who I am, what this project is, and how to support it.'
-      }
-    ]
-  },
-  {
-    id: '2.3.5',
-    version: '2.3.5',
-    items: [
-      {
-        title: 'Smarter trim',
-        body: 'A trim range past the end of the video is caught before downloading, and the preview shows the length and size of your selection.'
-      },
-      {
-        title: 'Clearer notifications',
-        body: 'Notifications are colored by type and errors stay on screen longer.'
-      },
-      {
-        title: 'Small polish',
-        body: 'Steadier download percentage and full-width track highlight in playlists.'
-      }
-    ]
-  },
-  {
-    id: '2.4.0',
-    version: '2.4.0',
-    items: [
-      {
-        title: 'Download queue',
-        body: 'Add more videos or playlists while a download is running. They start one after another, each with the settings you picked.'
-      },
-      {
-        title: 'Live progress',
-        body: 'Open the queue next to Stop to see the current file filling up as it downloads, and remove anything still waiting.'
-      },
-      {
-        title: 'No duplicates',
-        body: 'The same download can’t be added twice. The same video in another format still can.'
-      }
-    ]
-  },
-  {
-    id: '2.4.1',
-    version: '2.4.1',
-    items: [
-      {
-        title: 'What’s new fix',
-        body: 'This window now fits any screen and only shows the latest changes, so it can always be closed.'
-      }
-    ]
-  },
-  {
-    id: '2.5.0',
-    version: '2.5.0',
-    items: [
-      {
-        title: 'Proxy',
-        body: 'Open Proxy in the header to route downloads through a SOCKS5, SOCKS4 or HTTP proxy, with optional login and a connection test.'
-      },
-      {
-        title: 'New look',
-        body: 'A brand-new app icon, and shorter notifications that fit their message.'
-      }
-    ]
-  },
-  {
-    id: '2.5.1',
-    version: '2.5.1',
-    items: [
-      {
-        title: 'Faster downloads',
-        body: 'Videos sent in fragments now download about 4× faster.'
-      },
-      {
-        title: 'Live progress',
-        body: 'Speed, size and time left under the bar. The preview shows the real file size, and 2K / 4K are greyed out when a video doesn’t have them.'
-      },
-      {
-        title: 'Fewer YouTube blocks',
-        body: 'The app asks YouTube once per video instead of three times, and the queue pauses between downloads. Errors now show at the top, with how long to wait if YouTube blocks.'
-      }
-    ]
-  }
-]
-
-function cmpVer(a, b) {
-  const pa = String(a || '0').split('.').map((n) => parseInt(n, 10) || 0)
-  const pb = String(b || '0').split('.').map((n) => parseInt(n, 10) || 0)
-  const len = Math.max(pa.length, pb.length)
-  for (let i = 0; i < len; i++) {
-    const x = pa[i] || 0
-    const y = pb[i] || 0
-    if (x > y) return 1
-    if (x < y) return -1
-  }
-  return 0
-}
-
-function unseenWhatsNew(ackIds, current) {
-  if (!current) return []
-  const seen = new Set(Array.isArray(ackIds) ? ackIds : [])
-  return WHATS_NEW.filter((n) => !seen.has(n.id) && cmpVer(current, n.version) >= 0)
-}
-
-/* -------------------------------------------------------------------------- */
-/*  URL helpers                                                               */
-/* -------------------------------------------------------------------------- */
-
-const YT_HOSTS = [
-  'youtube.com',
-  'm.youtube.com',
-  'music.youtube.com',
-  'youtu.be',
-  'youtube-nocookie.com'
-]
-
-function toUrl(value) {
-  let v = String(value ?? '').trim()
-  if (!v) return null
-  if (!/^https?:\/\//i.test(v)) v = `https://${v}`
-  try {
-    return new URL(v)
-  } catch {
-    return null
-  }
-}
-
-// A real single YouTube video link (lenient about a missing scheme).
-function isYouTubeUrl(value) {
-  const u = toUrl(value)
-  if (!u) return false
-  const host = u.hostname.toLowerCase().replace(/^www\./, '')
-  if (!YT_HOSTS.includes(host)) return false
-  if (host === 'youtu.be') return u.pathname.length > 1
-  if (u.pathname === '/watch') return u.searchParams.has('v')
-  return /^\/(shorts|live|embed|v)\/[\w-]+/.test(u.pathname)
-}
-
-// A playlist / mix link.
-function isPlaylistUrl(value) {
-  const u = toUrl(value)
-  if (!u) return false
-  const host = u.hostname.toLowerCase().replace(/^www\./, '')
-  if (!YT_HOSTS.includes(host)) return false
-  if (u.pathname === '/playlist' && u.searchParams.has('list')) return true
-  return u.searchParams.has('list') || u.searchParams.has('start_radio')
-}
-
-const SC_HOSTS = ['soundcloud.com', 'm.soundcloud.com', 'on.soundcloud.com', 'soundcloud.app.goo.gl']
-const SC_RESERVED = new Set([
-  'discover',
-  'stream',
-  'search',
-  'you',
-  'pages',
-  'charts',
-  'upload',
-  'signin',
-  'login',
-  'signup',
-  'feed',
-  'messages',
-  'notifications',
-  'settings'
-])
-
-function isSoundCloudUrl(value) {
-  const u = toUrl(value)
-  if (!u) return false
-  const host = u.hostname.toLowerCase().replace(/^www\./, '')
-  return SC_HOSTS.includes(host)
-}
-
-function isSoundCloudCollectionUrl(value) {
-  const u = toUrl(value)
-  if (!u || !isSoundCloudUrl(value)) return false
-  const host = u.hostname.toLowerCase().replace(/^www\./, '')
-  if (host === 'on.soundcloud.com' || host === 'soundcloud.app.goo.gl') return false
-  const parts = u.pathname.replace(/\/+$/, '').split('/').filter(Boolean)
-  if (!parts.length) return false
-  if (parts.includes('sets') || parts.includes('albums') || parts.includes('likes')) return true
-  if (parts[0] === 'you') return parts[1] === 'likes' || parts[1] === 'sets' || parts[1] === 'albums'
-  if (parts.length === 1) return !SC_RESERVED.has(parts[0].toLowerCase())
-  if (parts.length === 2) {
-    const second = parts[1].toLowerCase()
-    return ['tracks', 'popular-tracks', 'sets', 'albums', 'reposts', 'likes', 'comments'].includes(second)
-  }
-  return /\/(sets|albums|likes)(\/|$)/i.test(parts.join('/'))
-}
-
-// YouTube Mix / radio (list=RD…) and Music albums (list=OLAK…) — keep as playlist.
-function keepAsPlaylist(u) {
-  const list = u.searchParams.get('list') || ''
-  return u.searchParams.has('start_radio') || /^RD/i.test(list) || /^OLAK/i.test(list)
-}
-
-// Strip leftover extras from a watch URL so it stays a single video:
-// playlist leftovers (watch?v=…&list=PLxxx), start time (?t=74s), share junk.
-// Mix/radio, Music albums, and /playlist?list= are left alone.
-function cleanYouTubeUrl(value) {
-  const raw = String(value ?? '').trim()
-  if (!raw) return raw
-  const work = /^https?:\/\//i.test(raw) ? raw : `https://${raw}`
-  try {
-    const u = new URL(work)
-    const host = u.hostname.toLowerCase().replace(/^www\./, '')
-    if (!YT_HOSTS.includes(host)) return raw
-    if (u.pathname === '/playlist') return raw
-    if (keepAsPlaylist(u)) return raw
-    const extraKeys = [...u.searchParams.keys()].filter((k) => k !== 'v')
-    const hasJunk = extraKeys.length > 0 || (u.hash && u.hash.length > 1)
-    if (!hasJunk) return raw
-    if (u.pathname === '/watch') {
-      const id = u.searchParams.get('v')
-      return id ? `https://www.youtube.com/watch?v=${id}` : raw
-    }
-    if (host === 'youtu.be') {
-      const id = u.pathname.replace(/^\//, '').split('/')[0]
-      return id ? `https://youtu.be/${id}` : raw
-    }
-    const m = u.pathname.match(/^\/(shorts|live|embed|v)\/([\w-]+)/)
-    if (m) return `https://www.youtube.com/${m[1]}/${m[2]}`
-    return raw
-  } catch {
-    return raw
-  }
-}
-
-function urlCleanNote(raw, cleaned) {
-  if (!raw || raw === cleaned) return null
-  const u = toUrl(raw)
-  if (!u) return 'Extra parameters removed from the link.'
-  if (u.searchParams.has('list') || u.searchParams.has('index')) {
-    return 'Mix/playlist extras removed — this video only.'
-  }
-  if (
-    u.searchParams.has('t') ||
-    u.searchParams.has('start') ||
-    u.searchParams.has('time_continue') ||
-    /^#t=/i.test(u.hash || '')
-  ) {
-    return 'Start time removed from the link.'
-  }
-  return 'Extra parameters removed from the link.'
-}
-
-/* -------------------------------------------------------------------------- */
-/*  Duration + size helpers                                                   */
-/* -------------------------------------------------------------------------- */
-
-const pad2 = (n) => String(n).padStart(2, '0')
-
-// Pause between two queued downloads, so YouTube doesn't see a burst.
-const QUEUE_GAP_SEC = 5
-
-/* yt-dlp progress line → { done, total, speed, eta } in bytes / bytes per s.
-   e.g. "[download]  12.3% of ~ 120.50MiB at  2.31MiB/s ETA 00:45 (frag 3/40)" */
-const DL_UNITS = { B: 1, KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3, KB: 1e3, MB: 1e6, GB: 1e9 }
-
-function parseDlStats(line) {
-  const m = line.match(
-    /\[download\]\s+(\d+(?:\.\d+)?)%\s+of\s+~?\s*([\d.]+)\s*(B|KiB|MiB|GiB|KB|MB|GB)(?:\s+at\s+(?:([\d.]+)\s*(B|KiB|MiB|GiB|KB|MB|GB)\/s|Unknown))?(?:\s+ETA\s+([\d:]+))?/
-  )
+// "socks5://user:pass@host:port" → proxy fields (spec §5.9).
+function parseProxyLink(v) {
+  const m = String(v).match(/^(socks5h?|socks4a?|https?):\/\/(?:([^:@/]+)(?::([^@/]*))?@)?([^:/]+)(?::(\d+))?/i)
   if (!m) return null
-  const total = parseFloat(m[2]) * DL_UNITS[m[3]]
-  return {
-    done: (parseFloat(m[1]) / 100) * total,
-    total,
-    estimated: /\bof\s+~/.test(line),
-    speed: m[4] ? parseFloat(m[4]) * DL_UNITS[m[5]] : null
-  }
-}
-
-/* yt-dlp's numbers jump around: fragmented downloads only estimate the size,
-   and the speed is instantaneous. Average both, then derive the time left. */
-function smoothDlStats(prev, s, now = Date.now()) {
-  // Time-based: yt-dlp prints many lines per second, so a per-line factor
-  // would barely smooth anything. The memory grows from 0.3 s to 3 s over the
-  // first seconds, so a silly first reading is forgotten fast, then it's calm.
-  const t0 = prev?.t0 ?? now
-  const dt = prev?.t != null ? Math.max(0, (now - prev.t) / 1000) : 0
-  const tau = Math.min(3, Math.max(0.3, (now - t0) / 1000))
-  const k = prev ? 1 - Math.exp(-dt / tau) : 1
-  const total = Math.max(s.done, prev && s.estimated ? prev.total + k * (s.total - prev.total) : s.total)
-  const speed =
-    s.speed == null ? (prev?.speed ?? null) : prev?.speed ? prev.speed + k * (s.speed - prev.speed) : s.speed
-  return {
-    t: now,
-    t0,
-    done: s.done,
-    total,
-    estimated: s.estimated,
-    speed,
-    etaSec: speed ? Math.max(0, total - s.done) / speed : null
-  }
-}
-
-function fmtEta(sec) {
-  const t = Math.round(sec)
-  const h = Math.floor(t / 3600)
-  const m = Math.floor((t % 3600) / 60)
-  const s = String(t % 60).padStart(2, '0')
-  return h ? `${h}:${String(m).padStart(2, '0')}:${s}` : `${m}:${s}`
-}
-
-// Binary units, like Windows Explorer (1 MB = 1024 KB), so the numbers match
-// what users see on disk.
-function fmtBytes(n) {
-  if (!Number.isFinite(n)) return '–'
-  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)} GB`
-  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`
-  return `${Math.max(0, Math.round(n / 1024))} KB`
-}
-
-function dlStatsLabel(s) {
-  if (!s) return ''
-  const parts = [`${fmtBytes(s.done)} / ${s.estimated ? '~' : ''}${fmtBytes(s.total)}`]
-  if (s.speed) parts.push(`${fmtBytes(s.speed)}/s`)
-  if (s.etaSec != null && Number.isFinite(s.etaSec)) parts.push(`${fmtEta(s.etaSec)} left`)
-  return parts.join(' · ')
-}
-
-function fmtClock(sec) {
-  const h = Math.floor(sec / 3600)
-  const m = Math.floor((sec % 3600) / 60)
-  const s = Math.floor(sec % 60)
-  return h > 0 ? `${h}:${pad2(m)}:${pad2(s)}` : `${m}:${pad2(s)}`
-}
-
-function fmtLong(sec) {
-  const h = Math.floor(sec / 3600)
-  const m = Math.round((sec % 3600) / 60)
-  return h > 0 ? `${h}h ${pad2(m)}min` : `${m}min`
-}
-
-// Auto-insert colons as the user types digits: "001030" -> "00:10:30".
-function formatTimeInput(raw) {
-  const d = String(raw).replace(/\D/g, '').slice(0, 6)
-  if (d.length > 4) return `${d.slice(0, 2)}:${d.slice(2, 4)}:${d.slice(4)}`
-  if (d.length > 2) return `${d.slice(0, 2)}:${d.slice(2)}`
-  return d
-}
-
-function parseTimeToSeconds(value) {
-  const str = String(value ?? '').trim()
-  if (!str) return null
-  const parts = str.split(':')
-  if (parts.length > 3) return null
-  let seconds = 0
-  for (const part of parts) {
-    if (!/^\d*\.?\d+$/.test(part)) return null
-    seconds = seconds * 60 + parseFloat(part)
-  }
-  return seconds
-}
-
-// `duration` (seconds) is the video length when known, so a range past the end
-// is rejected before anything is downloaded.
-function trimRangeError(startValue, endValue, duration) {
-  const startSec = parseTimeToSeconds(startValue || '00:00:00')
-  const endSec = parseTimeToSeconds(endValue || '00:00:00')
-  if (startSec == null) return `Invalid Start time "${startValue}". Use hh:mm:ss, mm:ss or seconds.`
-  if (endSec == null) return `Invalid End time "${endValue}". Use hh:mm:ss, mm:ss or seconds.`
-  if (endSec <= startSec) {
-    return `End (${fmtClock(endSec)}) must be greater than Start (${fmtClock(startSec)}).`
-  }
-  if (Number.isFinite(duration) && duration > 0) {
-    if (startSec >= duration) {
-      return `Start (${fmtClock(startSec)}) is past the end of the video (${fmtClock(duration)}).`
-    }
-    if (endSec > duration + 0.5) {
-      return `End (${fmtClock(endSec)}) is beyond the video length (${fmtClock(duration)}).`
+  const s = m[1].toLowerCase()
+  const type = s.startsWith('socks5') ? 'socks5' : s.startsWith('socks4') ? 'socks4' : 'http'
+  const dec = (x) => {
+    try {
+      return decodeURIComponent(x || '')
+    } catch {
+      return x || ''
     }
   }
-  return null
+  return { type, host: m[4], port: m[5] || (type === 'http' ? '8080' : '1080'), username: dec(m[2]), password: dec(m[3]) }
 }
 
-// Compact view/like counts: 1200000 -> "1.2M".
-function formatCount(n) {
-  if (n == null || !Number.isFinite(n)) return null
-  if (n >= 1e9) return `${(n / 1e9).toFixed(1).replace(/\.0$/, '')}B`
-  if (n >= 1e6) return `${(n / 1e6).toFixed(1).replace(/\.0$/, '')}M`
-  if (n >= 1e3) return `${(n / 1e3).toFixed(1).replace(/\.0$/, '')}K`
-  return String(n)
-}
-
-// yt-dlp upload_date is "YYYYMMDD" — turn it into a rough "x months ago".
-function relativeDate(yyyymmdd) {
-  const s = String(yyyymmdd ?? '')
-  if (!/^\d{8}$/.test(s)) return null
-  const then = new Date(+s.slice(0, 4), +s.slice(4, 6) - 1, +s.slice(6, 8))
-  const days = Math.floor((Date.now() - then.getTime()) / 86400000)
-  if (days < 0) return null
-  if (days < 1) return 'today'
-  if (days < 7) return `${days} day${days > 1 ? 's' : ''} ago`
-  if (days < 30) {
-    const w = Math.floor(days / 7)
-    return `${w} week${w > 1 ? 's' : ''} ago`
-  }
-  if (days < 365) {
-    const mo = Math.floor(days / 30)
-    return `${mo} month${mo > 1 ? 's' : ''} ago`
-  }
-  const y = Math.floor(days / 365)
-  return `${y} year${y > 1 ? 's' : ''} ago`
-}
+const proxyValid = (p) => !!String(p.host || '').trim() && Number(p.port) > 0 && Number(p.port) < 65536
 
 /* -------------------------------------------------------------------------- */
 /*  App                                                                       */
 /* -------------------------------------------------------------------------- */
 
 export default function App() {
-  const [url, setUrl] = useState('')
-  const [mode, setMode] = useState('single') // 'single' | 'playlist'
-  const [format, setFormat] = useState('audio')
-  const [audioFormat, setAudioFormat] = useState('wav')
-  const [videoQuality, setVideoQuality] = useState('1080')
-  const [codec, setCodec] = useState('best')
-  const [useRange, setUseRange] = useState(false)
-  const [start, setStart] = useState('')
-  const [end, setEnd] = useState('')
-  const [chapters, setChapters] = useState([])
-  const [byChapters, setByChapters] = useState(false)
-  const [urlCleaned, setUrlCleaned] = useState(false)
-  const [urlCleanMsg, setUrlCleanMsg] = useState('')
-  const [embedMeta, setEmbedMeta] = useState(true)
-  const [outputFolder, setOutputFolder] = useState('')
+  /* --- config & chrome ------------------------------------------------------ */
   const [version, setVersion] = useState('')
-  const [downloading, setDownloading] = useState(false)
-  const [stopping, setStopping] = useState(false)
-  const [progress, setProgress] = useState(0)
-  const [playlistPos, setPlaylistPos] = useState(null)
-  const [ytdlpUpdate, setYtdlpUpdate] = useState(null)
-  const [updatingYtdlp, setUpdatingYtdlp] = useState(false)
-  const [appUpdate, setAppUpdate] = useState(null)
-  const [theme, setTheme] = useState('evrohq')
+  const [theme, setTheme] = useState('graphite-amber')
   const [windowSize, setWindowSize] = useState('default')
-  const [aboutOpen, setAboutOpen] = useState(false)
-  const [proxy, setProxy] = useState(null)
-  const [dlStats, setDlStats] = useState(null)
-  const [proxyOpen, setProxyOpen] = useState(false)
-  const themeReady = useRef(false)
-  const [whatsNew, setWhatsNew] = useState(null)
-  const seenVersionRef = useRef('')
-  const whatsNewAckRef = useRef([])
-  const [scFormat, setScFormat] = useState('original')
-  const [dlUi, setDlUi] = useState(null)
-  // Downloads waiting for the current one to finish (run one at a time).
+  const [folders, setFolders] = useState({ standard: [], recent: [] })
+  const [toast, setToast] = useState(null)
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [whatsNew, setWhatsNew] = useState(null) // { block, prev }
+  const [appUpdate, setAppUpdate] = useState(null)
+  const [ytdlpUpdate, setYtdlpUpdate] = useState(null)
+  const [bannerHidden, setBannerHidden] = useState(null) // key of a dismissed banner
+  const [engine, setEngine] = useState({ ytdlp: null, ffmpeg: null, msg: '', busy: false })
+  const lastCfgRef = useRef({ format: 'video', res: 1080, codec: 'h264', afmt: 'wav', scfmt: 'original', meta: true, folder: '' })
+  const ackRef = useRef([])
+  const toastTimer = useRef(null)
+  const inputRef = useRef(null)
+  const sheetBodyRef = useRef(null)
+  const proxyRef = useRef(null)
+
+  /* --- proxy (saved + the sheet's draft) ------------------------------------ */
+  const [proxySaved, setProxySaved] = useState(null)
+  const [pxDraft, setPxDraft] = useState({ on: false, type: 'socks5', host: '', port: '1080', username: '', password: '' })
+  const [pxTest, setPxTest] = useState(null)
+  const pxTimer = useRef(null)
+
+  /* --- editor (the link being read / configured) ---------------------------- */
+  const [ed, setEd] = useState({ view: 'empty', url: '', src: null, alt: null, sel: [], cfg: null, fromWatch: false, err: null })
+  const [more, setMore] = useState(false)
+  const [pop, setPop] = useState(null) // { id, right }
+  const [qOpen, setQOpen] = useState(false)
+  const readReq = useRef(0)
+
+  /* --- downloads ------------------------------------------------------------ */
+  const [active, setActive] = useState(null)
   const [queue, setQueue] = useState([])
+  const [wait, setWait] = useState(null) // { until, bot }
+  const [doneJob, setDoneJob] = useState(null)
+  const [stopping, setStopping] = useState(false)
+  const [live, setLive] = useState({ progress: 0, item: 0, itemPct: 0, speed: null })
+  const [, setTick] = useState(0)
   const queueRef = useRef([])
-  const queueAbortRef = useRef(false)
-  const [queueWait, setQueueWait] = useState(null) // { until, bot } between queued jobs
-  const [, setQueueTick] = useState(0)
-  const queueIdRef = useRef(0)
-  const dlStreamsRef = useRef(1)
-  // Identifies the running job so the same download can't be queued twice.
-  const currentJobKeyRef = useRef(null)
+  const activeRef = useRef(null)
+  const seqRef = useRef(0)
+  const skipRef = useRef(false)
+  const abortRef = useRef(false)
+  const liveRef = useRef({ progress: 0, item: 0, itemPct: 0, speed: null })
+  const speedRef = useRef(null)
+  const flushRef = useRef(0)
+  const dl = useRef({ pass: 1, dest: 0, extracts: 0, extra: false })
+  const skippedRef = useRef(false) // some playlist items failed and were skipped
 
-  // Real metadata for the preview panel (fetched via yt-dlp).
-  const [videoInfo, setVideoInfo] = useState(null)
-  const [playlistInfo, setPlaylistInfo] = useState(null)
-  const [previewLoading, setPreviewLoading] = useState(false)
-  const [previewError, setPreviewError] = useState(null)
-  // Errors go to the notification at the top; the panel just says it's unavailable.
-  const failPreview = (msg) => {
-    toast.error(msg || 'Could not load the preview.', { id: 'preview' })
-    setPreviewError('Preview unavailable')
-  }
-  const [selected, setSelected] = useState(() => new Set())
+  const toastMsg = useCallback((kind, text) => {
+    clearTimeout(toastTimer.current)
+    const id = Date.now()
+    setToast({ kind, text, id })
+    toastTimer.current = setTimeout(() => setToast((t) => (t && t.id === id ? null : t)), TOAST_MS)
+  }, [])
 
-  const previewReq = useRef(0)
-  const chapterReq = useRef(0)
-  const playlistPosRef = useRef(playlistPos)
-  const dlPassRef = useRef(1)
-  const dlDestRef = useRef(0)
-  const dlStatsRef = useRef(null)
-  const dlLastPctRef = useRef(0)
-  const dlShownRef = useRef(0)
-  const extraDlRef = useRef(false)
-  playlistPosRef.current = playlistPos
-
-  const resetDownloadProgress = () => {
-    dlPassRef.current = 1
-    dlDestRef.current = 0
-    dlStatsRef.current = null
-    setDlStats(null)
-    dlLastPctRef.current = 0
-    dlShownRef.current = 0
-    extraDlRef.current = false
-    setProgress(0)
+  const setQueueBoth = (q) => {
+    queueRef.current = q
+    setQueue(q)
   }
 
-  const urlState = useMemo(() => {
-    if (!url.trim()) return null
-    if (isSoundCloudUrl(url)) return isSoundCloudCollectionUrl(url) ? 'playlist' : 'single'
-    if (isPlaylistUrl(url)) return 'playlist'
-    if (isYouTubeUrl(url)) return 'single'
-    return 'invalid'
-  }, [url])
-  const isSc = Boolean(url.trim()) && isSoundCloudUrl(url)
-
-  /* --- lifecycle --------------------------------------------------------- */
+  /* --- startup ---------------------------------------------------------------- */
   useEffect(() => {
     let cancelled = false
     window.api?.getConfig().then((cfg) => {
-      if (cancelled) return
-      if (cfg?.outputFolder) setOutputFolder(cfg.outputFolder)
-      if (cfg?.version) setVersion(cfg.version)
-      if (cfg?.theme) setTheme(cfg.theme)
-      if (cfg?.windowSize === 'compact' || cfg?.windowSize === 'default') setWindowSize(cfg.windowSize)
-      if (cfg?.codec === 'h264' || cfg?.codec === 'best') setCodec(cfg.codec)
-      themeReady.current = true
-      window.api?.getProxy?.().then((p) => {
-        if (!cancelled && p) setProxy(p)
-      })
-      const pending = unseenWhatsNew(cfg?.whatsNewAck, cfg?.version)
-      if (pending.length) {
-        seenVersionRef.current = cfg.version
-        whatsNewAckRef.current = Array.isArray(cfg.whatsNewAck) ? cfg.whatsNewAck : []
-        /* Only show the newest block (fresh installs would otherwise get every
-           past release); acking all pending ids so older ones never resurface. */
-        const latest = pending.reduce((a, b) => (cmpVer(b.version, a.version) > 0 ? b : a))
-        setWhatsNew({
-          items: latest.items,
-          ids: pending.map((n) => n.id)
-        })
-      }
+      if (cancelled || !cfg) return
+      setVersion(cfg.version || '')
+      setTheme(cfg.theme || 'graphite-amber')
+      setWindowSize(cfg.windowSize === 'compact' ? 'compact' : 'default')
+      lastCfgRef.current = { ...lastCfgRef.current, codec: cfg.codec === 'best' ? 'best' : 'h264', folder: cfg.outputFolder || '' }
+      ackRef.current = Array.isArray(cfg.whatsNewAck) ? cfg.whatsNewAck : []
+      const block = pendingWhatsNew(cfg.whatsNewAck, cfg.version)
+      if (block) setWhatsNew({ block, prev: cfg.lastSeenVersion || '' })
     })
-
-    const applyProgress = (value) => {
-      const next = Math.min(99.9, Math.max(0, value))
-      if (next + 0.05 < dlShownRef.current) return
-      dlShownRef.current = next
-      setProgress(next)
-    }
-
-    const offLog = window.api?.onLog((line) => {
-      const item = line.match(/Downloading (?:item|video) (\d+) of (\d+)/i)
-      if (item) {
-        setPlaylistPos({ current: Number(item[1]), total: Number(item[2]) })
-        playlistPosRef.current = { current: Number(item[1]), total: Number(item[2]) }
-        dlPassRef.current = 1
-        dlDestRef.current = 0
-        dlStatsRef.current = null
-        dlLastPctRef.current = 0
-        extraDlRef.current = false
-      }
-
-      const streams = dlStreamsRef.current
-
-      // yt-dlp video = video stream then audio stream, each 0–100%. yt-dlp
-      // prints one "[download] Destination:" per stream, so that line (and only
-      // that line) moves to the next pass. Images and anything past the
-      // expected streams are extras and don't move the bar.
-      const dest = line.match(/\[download\]\s+Destination:\s*(.+)$/i)
-      if (dest) {
-        if (/\.(jpe?g|png|webp)$/i.test(dest[1].trim())) {
-          extraDlRef.current = true
-        } else {
-          dlDestRef.current += 1
-          extraDlRef.current = dlDestRef.current > streams
-          if (!extraDlRef.current) {
-            dlPassRef.current = dlDestRef.current
-            dlLastPctRef.current = 0
-            dlStatsRef.current = null
-          }
-        }
-      }
-
-      const chapterPct = line.match(/Splitting chapter .*?\((\d+(?:\.\d+)?)%\)/)
-      if (chapterPct) {
-        applyProgress(parseFloat(chapterPct[1]))
-      } else if (!extraDlRef.current) {
-        const dl = line.match(/\[download\]\s+(\d+(?:\.\d+)?)%/)
-        if (dl) {
-          // Fragmented downloads estimate their size, so the % wobbles early
-          // on; the fragment counter is exact and only goes up.
-          const frag = line.match(/\(frag (\d+)\/(\d+)\)/)
-          const raw =
-            frag && Number(frag[2]) > 0
-              ? Math.min(100, (Number(frag[1]) / Number(frag[2])) * 100)
-              : parseFloat(dl[1])
-          dlLastPctRef.current = raw
-          const pass = Math.min(Math.max(dlPassRef.current, 1), streams)
-          // Video ≈ 85% of the bytes, audio ≈ 15%: weight the bar the same way
-          // so it tracks what is really downloading.
-          const weights = streams === 2 ? [0.85, 0.15] : Array(streams).fill(1 / streams)
-          const within =
-            weights.slice(0, pass - 1).reduce((acc, w) => acc + w, 0) + weights[pass - 1] * (raw / 100)
-          const pos = playlistPosRef.current
-          const overall =
-            pos && pos.total > 0
-              ? ((Math.max(pos.current, 1) - 1 + within) / pos.total) * 100
-              : within * 100
-          applyProgress(overall)
-          const stats = parseDlStats(line)
-          if (stats) {
-            dlStatsRef.current = smoothDlStats(dlStatsRef.current, stats)
-            setDlStats(dlStatsRef.current)
-          }
-        }
-      }
-      // Post-processing (merge / convert / trim) has no speed — hide stale stats.
-      if (/\[(Merger|ExtractAudio|VideoConvertor|FixupM3u8|ffmpeg|SplitChapters)\]/.test(line)) { dlStatsRef.current = null; setDlStats(null) }
-      // Log lines start with "[hh:mm:ss] ", so match ERROR: after that prefix.
-      if (/^(?:\[[\d:]+\]\s*)?ERROR:/.test(line) && /not found/.test(line)) {
-        toast.error(line.replace(/^(?:\[[\d:]+\]\s*)?ERROR:\s*/, ''))
-      } else if (/were skipped/.test(line)) {
-        toast.warning('Some items could not be downloaded and were skipped')
-      }
+    window.api?.getFolders?.().then((f) => !cancelled && f && setFolders(f))
+    window.api?.getProxy?.().then((p) => {
+      if (cancelled || !p) return
+      setProxySaved(p)
+      setPxDraft({ on: p.enabled, type: p.type, host: p.host, port: String(p.port || ''), username: p.username || '', password: p.password || '' })
     })
-
-    const offComplete = window.api?.onComplete((payload) => {
-      setDownloading(false)
-      setStopping(false)
-      setDlUi(null)
-      dlStatsRef.current = null
-      setDlStats(null)
-      const finished = payload.success && !payload.alreadyDownloaded
-      dlShownRef.current = finished ? 100 : 0
-      setProgress(finished ? 100 : 0)
-      setPlaylistPos(null)
-      if (payload.cancelled) toast.info(payload.message || 'Download cancelled', { id: 'dl' })
-      else if (payload.alreadyDownloaded) toast.info(payload.message || 'File already downloaded', { id: 'dl' })
-      else if (payload.success) toast.success(payload.message || 'Download complete', { id: 'dl' })
-      else toast.error(payload.message || 'Download failed', { id: 'dl' })
-    })
-
-    const offAppUpdate = window.api?.onAppUpdate((payload) => {
-      setAppUpdate(payload)
-      if (payload?.status === 'available' && payload.version) {
-        toast.info(`App update ${payload.version} available`)
-      } else if (payload?.status === 'downloaded' && payload.version) {
-        toast.success(`Version ${payload.version} ready — restart to install`)
-      }
-    })
-
-    window.api?.checkYtdlpUpdate().then((res) => {
-      if (res?.updateAvailable) setYtdlpUpdate(res)
-    })
-
+    window.api?.checkYtdlpUpdate?.().then((r) => !cancelled && r?.updateAvailable && setYtdlpUpdate(r))
+    const offUpd = window.api?.onAppUpdate((p) => setAppUpdate(p))
     return () => {
       cancelled = true
-      offLog && offLog()
-      offComplete && offComplete()
-      offAppUpdate && offAppUpdate()
+      offUpd && offUpd()
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
+  // Theme: apply now, follow the OS for "System", remember the choice.
+  const themeLoaded = useRef(false)
   useEffect(() => {
-    document.documentElement.setAttribute('data-theme', theme)
-    document.documentElement.style.colorScheme = LIGHT_THEMES.has(theme) ? 'light' : 'dark'
-    if (themeReady.current) window.api?.setConfig({ theme })
+    applyTheme(theme)
+    if (themeLoaded.current) window.api?.setConfig({ theme })
+    themeLoaded.current = true
+    if (theme !== 'system') return
+    const mq = window.matchMedia?.('(prefers-color-scheme: light)')
+    const on = () => applyTheme('system')
+    mq?.addEventListener?.('change', on)
+    return () => mq?.removeEventListener?.('change', on)
   }, [theme])
 
+  /* --- progress from yt-dlp's log --------------------------------------------- */
   useEffect(() => {
-    if (themeReady.current) window.api?.setConfig({ codec })
-  }, [codec])
-
-  const selectCodec = (next) => {
-    setCodec(next)
-    if (next === 'h264' && (videoQuality === '2k' || videoQuality === '4k')) {
-      setVideoQuality('1080')
+    const flush = () => {
+      flushRef.current = 0
+      setLive({ ...liveRef.current })
     }
-  }
-
-  // Follow the pasted URL into the matching preview mode.
-  useEffect(() => {
-    if (urlState === 'playlist') setMode('playlist')
-    else if (urlState === 'single') setMode('single')
-  }, [urlState])
-
-  // Detect chapters on single videos only (debounced). Trim and chapter-split
-  // are mutually exclusive.
-  useEffect(() => {
-    setChapters([])
-    setByChapters(false)
-    if (urlState !== 'single' || isSoundCloudUrl(url)) return
-    const reqId = ++chapterReq.current
-    const t = setTimeout(async () => {
-      const res = await window.api?.getChapters(url.trim())
-      if (chapterReq.current !== reqId) return
-      setChapters(Array.isArray(res?.chapters) ? res.chapters : [])
-    }, 600)
-    return () => clearTimeout(t)
-  }, [url, urlState])
-
-  useEffect(() => {
-    if (useRange) setByChapters(false)
-  }, [useRange])
-
-  const applyUrl = (raw) => {
-    const next = String(raw ?? '').trim()
-    if (isSoundCloudUrl(next)) {
-      setUrl(next)
-      setUrlCleaned(false)
-      setUrlCleanMsg('')
-      return
+    const schedule = () => {
+      if (!flushRef.current) flushRef.current = requestAnimationFrame(flush)
     }
-    const cleaned = cleanYouTubeUrl(next)
-    setUrl(cleaned)
-    const note = urlCleanNote(next, cleaned)
-    setUrlCleaned(Boolean(note))
-    setUrlCleanMsg(note || '')
-  }
-
-  // Fetch real preview metadata whenever a valid URL settles (debounced, with a
-  // request guard so a slow response can't overwrite a newer URL).
-  useEffect(() => {
-    const reqId = ++previewReq.current
-    setPreviewError(null)
-    if (urlState !== 'single' && urlState !== 'playlist') {
-      setVideoInfo(null)
-      setPlaylistInfo(null)
-      setPreviewLoading(false)
-      return
-    }
-    setPreviewLoading(true)
-    if (urlState === 'single') {
-      setVideoInfo(null)
-    } else {
-      setPlaylistInfo(null)
-      setSelected(new Set())
-    }
-
-    const link = url.trim()
-    const t = setTimeout(async () => {
-      try {
-        if (isSoundCloudUrl(link)) {
-          const info = await window.api?.fetchMetadata({ platform: 'soundcloud', url: link })
-          if (previewReq.current !== reqId) return
-          if (info && !info.error && info.kind === 'playlist' && info.tracks?.length) {
-            setPlaylistInfo(info)
-            setVideoInfo(null)
-            setSelected(new Set(info.tracks.filter((tr) => !tr.protected).map((tr) => tr.id)))
-            setMode('playlist')
-          } else if (info && !info.error && info.kind !== 'playlist') {
-            setVideoInfo({
-              id: info.id,
-              title: info.title,
-              channel: info.artist,
-              duration: info.duration,
-              thumbnail: info.thumbnail,
-              genre: info.genre || null,
-              views: info.plays ?? null,
-              source: 'soundcloud'
-            })
-            setPlaylistInfo(null)
-            setMode('single')
-          } else {
-            failPreview(info?.error || 'Could not load SoundCloud details.')
-          }
-        } else if (urlState === 'single') {
-          const info = await window.api?.getVideoInfo(link)
-          if (previewReq.current !== reqId) return
-          if (info && !info.error) setVideoInfo(info)
-          else failPreview(info?.error || 'Could not load video details.')
-        } else {
-          const info = await window.api?.getPlaylistInfo(link)
-          if (previewReq.current !== reqId) return
-          if (info && !info.error && info.tracks?.length) {
-            setPlaylistInfo(info)
-            setSelected(new Set(info.tracks.map((tr) => tr.id)))
-          } else {
-            failPreview(info?.error || 'Could not load playlist details.')
+    const off = window.api?.onLog((line) => {
+      const job = activeRef.current
+      if (!job) return
+      const d = dl.current
+      const total = job.total || 1
+      const resetItem = () => {
+        d.pass = 1
+        d.dest = 0
+        d.extra = false
+        speedRef.current = null
+      }
+      const item = line.match(/Downloading (?:item|video) (\d+) of (\d+)/i)
+      if (item) {
+        liveRef.current.item = Number(item[1]) - 1
+        resetItem()
+      } else if (job.batch && /\[[\w:]+\] Extracting URL:/.test(line)) {
+        // Batch downloads (selected tracks) print one "Extracting URL" per item.
+        liveRef.current.item = Math.min(total - 1, d.extracts)
+        d.extracts += 1
+        resetItem()
+      }
+      const streams = job.streams || 1
+      // One "[download] Destination:" per stream; images are extras.
+      const dest = line.match(/\[download\]\s+Destination:\s*(.+)$/i)
+      if (dest) {
+        if (/\.(jpe?g|png|webp)$/i.test(dest[1].trim())) d.extra = true
+        else {
+          d.dest += 1
+          d.extra = d.dest > streams
+          if (!d.extra) d.pass = d.dest
+        }
+      }
+      const chapterPct = line.match(/Splitting chapter .*?\((\d+(?:\.\d+)?)%\)/)
+      if (chapterPct) {
+        liveRef.current.progress = Math.max(liveRef.current.progress, parseFloat(chapterPct[1]))
+      } else if (!d.extra) {
+        const m = line.match(/\[download\]\s+(\d+(?:\.\d+)?)%/)
+        if (m) {
+          // Fragmented formats estimate their size; the fragment counter is exact.
+          const frag = line.match(/\(frag (\d+)\/(\d+)\)/)
+          const raw = frag && Number(frag[2]) > 0 ? Math.min(100, (Number(frag[1]) / Number(frag[2])) * 100) : parseFloat(m[1])
+          const pass = Math.min(Math.max(d.pass, 1), streams)
+          // Video ≈ 85 % of the bytes, audio ≈ 15 %.
+          const w = streams === 2 ? [0.85, 0.15] : Array(streams).fill(1 / streams)
+          const within = w.slice(0, pass - 1).reduce((a, x) => a + x, 0) + w[pass - 1] * (raw / 100)
+          const overall = job.total ? ((liveRef.current.item + within) / total) * 100 : within * 100
+          liveRef.current.itemPct = within * 100
+          liveRef.current.progress = Math.max(liveRef.current.progress, Math.min(99.9, overall))
+          const st = parseDlStats(line)
+          if (st?.speed != null) {
+            speedRef.current = smoothSpeed(speedRef.current, st.speed)
+            liveRef.current.speed = speedRef.current.speed
           }
         }
-      } catch (e) {
-        if (previewReq.current === reqId) failPreview(e.message)
-      } finally {
-        if (previewReq.current === reqId) setPreviewLoading(false)
       }
-    }, 550)
-    return () => clearTimeout(t)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [url, urlState])
-
-  useEffect(() => {
-    if (!isSc) return
-    setFormat('audio')
-    setUseRange(false)
-    setByChapters(false)
-  }, [isSc])
-
-  /* --- derived ----------------------------------------------------------- */
-  const perHourMB = isSc
-    ? scFormat === 'wav'
-      ? 620
-      : 58
-    : format === 'video'
-      ? videoQuality === '4k'
-        ? 6000
-        : videoQuality === '2k'
-          ? 2800
-          : 1400
-      : audioFormat === 'wav'
-        ? 606 // PCM 16-bit stereo 44.1 kHz = 176,400 B/s
-        : 137 // MP3 320 kbps = 40,000 B/s
-
-  // Why 2K / 4K can't be picked (null = available): H.264 stops at 1080p, and
-  // some videos simply don't exist that high.
-  const videoMaxHeight = mode === 'single' && !isSc ? videoInfo?.sizes?.maxHeight || null : null
-  const qualityLock = (q) => {
-    if (codec === 'h264') return 'H.264 on YouTube tops out at 1080p'
-    const need = q === '4k' ? 1440 : 1080
-    if (videoMaxHeight && videoMaxHeight <= need) return `This video tops out at ${videoMaxHeight}p`
-    return null
-  }
-
-  // A quality the video doesn't have falls back to the best one it does have.
-  useEffect(() => {
-    if (!videoMaxHeight || codec === 'h264') return
-    if (videoQuality === '4k' && videoMaxHeight <= 1440) setVideoQuality(videoMaxHeight > 1080 ? '2k' : '1080')
-    else if (videoQuality === '2k' && videoMaxHeight <= 1080) setVideoQuality('1080')
-  }, [videoMaxHeight, videoQuality, codec])
-
-  // Real size of the chosen video format (from yt-dlp's format list), so the
-  // preview matches the file that lands on disk. null → fall back to the rate.
-  const realVideoBytes =
-    !isSc && format === 'video' && videoInfo?.sizes
-      ? (codec === 'h264'
-        ? videoInfo.sizes.h264?.[1080]
-        : videoInfo.sizes.best?.[{ 1080: 1080, '2k': 1440, '4k': 2160 }[videoQuality]]) ?? null
-      : null
-
-  const formatLabel = isSc
-    ? scFormat === 'wav'
-      ? 'WAV'
-      : 'Original'
-    : format === 'video'
-      ? 'MP4'
-      : audioFormat === 'wav'
-        ? 'WAV'
-        : 'MP3'
-
-  const estSizeLabel = (seconds) => {
-    const mb = (seconds / 3600) * perHourMB
-    const gb = mb / 1024
-    return gb >= 1 ? `${gb.toFixed(1)} GB` : `${Math.round(mb)} MB`
-  }
-
-  // Single video: the real format size (prorated for a trim), else the rate.
-  const singleSizeLabel = (seconds) => {
-    if (realVideoBytes && videoInfo?.duration > 0) {
-      const mb = (realVideoBytes * Math.min(1, seconds / videoInfo.duration)) / 1024 ** 2
-      return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`
+      if (/\[(Merger|ExtractAudio|VideoConvertor|FixupM3u8|ffmpeg|SplitChapters)\]/.test(line)) liveRef.current.speed = null
+      if (/were skipped/.test(line)) skippedRef.current = true
+      schedule()
+    })
+    return () => {
+      off && off()
+      if (flushRef.current) cancelAnimationFrame(flushRef.current)
     }
-    return estSizeLabel(seconds)
-  }
+  }, [])
 
-  const playlistTracks = playlistInfo?.tracks ?? []
-  const totalSecs = playlistTracks.reduce((a, t) => a + (t.duration || 0), 0)
-  const selectedSecs = playlistTracks
-    .filter((t) => selected.has(t.id))
-    .reduce((a, t) => a + (t.duration || 0), 0)
-
-  // Length of the trimmed selection (clamped to the video), or null when the
-  // whole video is downloaded or the range isn't valid yet.
-  const clipSecs = (() => {
-    if (isSc || mode !== 'single' || !useRange || byChapters) return null
-    const s = parseTimeToSeconds(start || '00:00:00')
-    let e = parseTimeToSeconds(end || '00:00:00')
-    if (s == null || e == null) return null
-    if (Number.isFinite(videoInfo?.duration)) e = Math.min(e, videoInfo.duration)
-    return e > s ? e - s : null
-  })()
-
-  const singleValid = Boolean(url.trim()) && (isYouTubeUrl(url) || isSoundCloudUrl(url))
-  const canStart = mode === 'playlist' ? selected.size > 0 : singleValid
-  // Busy = downloading, or pausing between two queued jobs.
-  const busy = downloading || Boolean(queueWait)
-  const canDownload = canStart && !busy
-
-  const proxyOn = Boolean(proxy?.enabled && proxy?.host)
-  const formatWord = formatLabel
-  const queuedNote = queue.length ? ` · ${queue.length} queued` : ''
-  // Re-render every second while a queue pause counts down.
+  // Download finished / failed / cancelled → notification (spec §5.6).
   useEffect(() => {
-    if (!queueWait) return
-    const t = setInterval(() => setQueueTick((n) => n + 1), 1000)
+    const off = window.api?.onComplete((p) => {
+      setStopping(false)
+      if (p.cancelled) toastMsg('info', 'Download cancelled')
+      else if (p.alreadyDownloaded) toastMsg('info', p.message || 'File already downloaded')
+      else if (p.success && skippedRef.current) toastMsg('warning', 'Done, but some items couldn’t be downloaded and were skipped.')
+      else if (p.success) toastMsg('success', 'Download complete')
+      else toastMsg(p.botCheck ? 'warning' : 'error', p.message || 'Download failed')
+    })
+    return () => off && off()
+  }, [toastMsg])
+
+  // Countdown re-render while waiting between queued items.
+  useEffect(() => {
+    if (!wait) return
+    const t = setInterval(() => setTick((n) => n + 1), 500)
     return () => clearInterval(t)
-  }, [queueWait])
-  const waitLeft = queueWait ? Math.max(0, Math.ceil((queueWait.until - Date.now()) / 1000)) : 0
+  }, [wait])
 
-  // While bytes are flowing, the live stats replace the "preparing …" label.
-  const liveStats = downloading && !stopping && dlStats ? dlStatsLabel(dlStats) : ''
-  const statusText = downloading
-    ? stopping
-      ? 'Stopping…'
-      : (dlUi?.playlist
-        ? `Downloading ${playlistPos ? `${playlistPos.current}/${playlistPos.total}` : `0/${dlUi.selectedCount}`} · ${liveStats || dlUi.formatWord}`
-        : `Downloading · ${liveStats || dlUi?.converting || 'preparing'}`) + queuedNote
-    : queueWait
-      ? (queueWait.bot ? `Queue paused · YouTube bot check · next in ${waitLeft} s` : `Next download in ${waitLeft} s`) +
-        queuedNote
-      : 'Idle — ready to download' + (proxyOn ? ` · via ${proxySummary(proxy)}` : '')
-
-  const activeBanner =
-    appUpdate?.status === 'downloading'
-      ? {
-        key: 'app-dl',
-        title: 'Downloading update…',
-        subtitle: `Version ${appUpdate.version || ''} — installing automatically when ready.`.trim(),
-        progress: appUpdate.percent ?? 0
-      }
-      : appUpdate?.status === 'downloaded'
-        ? {
-          key: 'app',
-          title: 'App update ready',
-          subtitle: `Version ${appUpdate.version} downloaded — restart to install.`,
-          actionLabel: 'Restart now',
-          onAction: () => window.api?.installUpdate()
-        }
-        : appUpdate?.status === 'portable-available'
-          ? {
-            key: 'app-portable',
-            title: 'App update available',
-            subtitle: `Version ${appUpdate.version || ''} — download the portable .exe. This build will not install.`.trim(),
-            actionLabel: 'Download',
-            onAction: () => {
-              const href =
-                appUpdate.downloadUrl ||
-                'https://github.com/EvroHQ/EvroHQ-Downloader/releases/latest'
-              window.open(href, '_blank', 'noopener,noreferrer')
-            }
-          }
-          : ytdlpUpdate
-            ? {
-              key: 'ytdlp',
-              title: 'yt-dlp update available',
-              subtitle: `Installed ${ytdlpUpdate.current} · latest ${ytdlpUpdate.latest} — keeps YouTube downloads working.`,
-              actionLabel: updatingYtdlp ? 'Updating…' : 'Update now',
-              busy: updatingYtdlp,
-              onAction: handleUpdateYtdlp
-            }
-            : null
-
-  /* --- handlers ---------------------------------------------------------- */
-  const handlePaste = async () => {
-    try {
-      const text = await navigator.clipboard.readText()
-      if (text) applyUrl(text)
-    } catch {
-      toast.error('Could not read clipboard')
-    }
-  }
-
-  const handleChangeFolder = async () => {
-    const folder = await window.api?.selectFolder()
-    if (folder) setOutputFolder(folder)
-  }
-
-  // Snapshot everything a download needs now, so later edits to the URL or
-  // options (while it waits in the queue) don't change it.
-  const buildJob = () => {
-    const link = url.trim()
-    const label = (mode === 'playlist' ? playlistInfo?.title : videoInfo?.title) || link
-
-    if (isSc) {
-      const ui = {
-        playlist: mode === 'playlist',
-        formatWord: scFormat === 'wav' ? 'WAV' : 'Original',
-        converting: scFormat === 'wav' ? 'converting to WAV' : 'downloading original',
-        selectedCount: selected.size
-      }
-      if (mode === 'playlist') {
-        const chosen = playlistTracks.filter((t) => selected.has(t.id) && !t.protected)
-        const selectedTracks = playlistTracks
-          .map((t, i) => (selected.has(t.id) && !t.protected ? i + 1 : null))
-          .filter(Boolean)
-        const trackUrls = chosen
-          .map((t) => {
-            if (typeof t.url === 'string' && /^https?:\/\//i.test(t.url)) return t.url
-            if (t.id && /^\d+$/.test(String(t.id))) {
-              return `https://api-v2.soundcloud.com/tracks/${t.id}`
-            }
-            return null
-          })
-          .filter(Boolean)
-        const skippedTracks = playlistTracks.filter((t) => t.protected).map((t) => t.title)
-        return {
-          label,
-          api: 'startSoundCloudPlaylistDownload',
-          streams: 1,
-          ui,
-          total: selectedTracks.length,
-          params: {
-            platform: 'soundcloud',
-            url: link,
-            format: scFormat,
-            selectedTracks,
-            trackUrls,
-            skippedTracks,
-            itemCount: selectedTracks.length,
-            title: playlistInfo?.title,
-            artist: playlistInfo?.artist
-          }
-        }
-      }
-      return {
-        label,
-        api: 'startSoundCloudDownload',
-        streams: 1,
-        ui,
-        params: {
-          platform: 'soundcloud',
-          url: link,
-          format: scFormat,
-          title: videoInfo?.title,
-          artist: videoInfo?.channel
-        }
-      }
-    }
-
-    const streams = format === 'video' ? 2 : 1
-    if (mode === 'single' && useRange && !byChapters) {
-      const err = trimRangeError(start, end, videoInfo?.duration)
-      if (err) {
-        toast.error(err)
-        return null
-      }
-    }
-    if (mode === 'playlist') {
-      const chosen = playlistTracks.filter((t) => selected.has(t.id))
-      const trackUrls = chosen
-        .map((t) => {
-          if (t.url && /^https?:\/\//i.test(t.url)) return t.url
-          return t.id ? `https://www.youtube.com/watch?v=${t.id}` : null
-        })
-        .filter(Boolean)
-      if (!trackUrls.length) {
-        toast.error('Could not resolve the selected tracks.')
-        return null
-      }
-      return {
-        label,
-        api: 'startPlaylistDownload',
-        streams,
-        ui: { playlist: true, formatWord, selectedCount: trackUrls.length },
-        total: trackUrls.length,
-        params: {
-          url: link,
-          trackUrls,
-          title: playlistInfo?.title,
-          itemCount: trackUrls.length,
-          format,
-          audioFormat,
-          videoQuality,
-          codec,
-          embedMeta
-        }
-      }
-    }
-    return {
-      label,
-      api: 'startDownload',
-      streams,
-      ui: {
-        playlist: false,
-        formatWord,
-        converting:
-          format === 'video'
-            ? 'preparing MP4'
-            : audioFormat === 'wav'
-              ? 'converting to WAV'
-              : 'converting to MP3'
-      },
-      params: {
-        url: link,
-        format,
-        audioFormat,
-        videoQuality,
-        codec,
-        useRange: useRange && !byChapters,
-        byChapters: byChapters && !useRange,
-        chapterCount: chapters.length,
-        embedMeta,
-        start: start || '00:00:00',
-        end: end || '00:00:00',
-        title: videoInfo?.title,
-        duration: videoInfo?.duration
-      }
-    }
-  }
-
-  // Uses only setters, refs and the job itself: it also runs from the queue
-  // loop, long after the render that created it.
-  const runJob = async (job) => {
-    currentJobKeyRef.current = jobKey(job)
-    setDownloading(true)
-    setStopping(false)
-    resetDownloadProgress()
-    dlStreamsRef.current = job.streams
-    setDlUi({ ...job.ui, label: job.label || job.params?.title || job.params?.url })
-    setPlaylistPos(job.total ? { current: 0, total: job.total } : null)
-    try {
-      return await window.api?.[job.api](job.params)
-    } catch (e) {
-      setDownloading(false)
-      toast.error(e?.message || 'Download failed', { id: 'dl' })
-      return null
-    }
-  }
-
-  // Wait before the next queued job, showing a countdown. Stop ends the wait.
-  const waitBeforeNext = async (seconds, bot) => {
-    const until = Date.now() + seconds * 1000
-    setQueueWait({ until, bot })
-    while (Date.now() < until && !queueAbortRef.current) await new Promise((r) => setTimeout(r, 250))
-    setQueueWait(null)
-  }
-
-  // One download at a time; each finished job pulls the next from the queue,
-  // after a short pause so YouTube doesn't see a burst of requests. When
-  // YouTube blocks (bot check), the blocked job goes back to the front and the
-  // queue waits as long as the message says, instead of hammering it.
-  const runQueue = async (first) => {
-    let job = first
-    queueAbortRef.current = false
-    while (job) {
-      const res = await runJob(job)
-      if (res?.botCheck && (job.botTries || 0) < 2 && !queueAbortRef.current) {
-        queueRef.current.unshift({ ...job, botTries: (job.botTries || 0) + 1 })
-        setQueue([...queueRef.current])
-      }
-      if (!queueRef.current.length || queueAbortRef.current) break
-      const wait = res?.botCheck ? res.retryAfterSec || 30 : QUEUE_GAP_SEC
-      if (res?.botCheck) toast.info(`Queue paused — YouTube bot check. Resuming in ${wait} s.`)
-      await waitBeforeNext(wait, !!res?.botCheck)
-      if (queueAbortRef.current) break
-      job = queueRef.current.shift()
-      setQueue([...queueRef.current])
-      // Queued jobs don't retry on their own: the queue's pause does that.
-      if (job) job = { ...job, params: { ...job.params, queued: true } }
-    }
-    currentJobKeyRef.current = null
-  }
-
-  const handleDownload = () => {
-    if (!canStart) return
-    const job = buildJob()
-    if (!job) return
-    if (busy) {
-      const key = jobKey(job)
-      if (key === currentJobKeyRef.current || queueRef.current.some((j) => jobKey(j) === key)) {
-        toast.info(key === currentJobKeyRef.current ? 'Already downloading' : 'Already in the queue')
+  /* --- reading a link ----------------------------------------------------------- */
+  const readLink = useCallback(
+    async (raw) => {
+      const url = String(raw || '').trim()
+      if (!url) return
+      const req = ++readReq.current
+      const link = detectLink(url)
+      setPop(null)
+      setQOpen(false)
+      setMore(false)
+      if (link.kind === 'unsupported') {
+        setEd({ view: 'error', url, src: null, alt: null, sel: [], cfg: null, fromWatch: false, err: UNSUPPORTED(url) })
         return
       }
-      job.id = ++queueIdRef.current
-      queueRef.current.push(job)
-      setQueue([...queueRef.current])
-      toast.info(`Added to queue (${queueRef.current.length})`)
-      applyUrl('')
+      setEd((e) => ({ ...e, view: 'fetching', url, err: null }))
+      const fail = (msg, noun) => {
+        if (readReq.current !== req) return
+        setEd({ view: 'error', url, src: null, alt: null, sel: [], cfg: null, fromWatch: false, err: errorCard(msg, noun, url) })
+      }
+      try {
+        let src = null
+        if (link.kind === 'vid' || link.kind === 'plvid') {
+          const info = await window.api.getVideoInfo(link.videoUrl)
+          if (readReq.current !== req) return
+          if (!info || info.error) return fail(info?.error, 'video')
+          // Same saved info → no new YouTube request.
+          const ch = await window.api.getChapters(link.videoUrl).catch(() => null)
+          if (readReq.current !== req) return
+          src = videoSource(info, ch?.chapters, link)
+          src.listUrl = link.listUrl || null
+        } else if (link.kind === 'pl') {
+          const info = await window.api.getPlaylistInfo(link.listUrl)
+          if (readReq.current !== req) return
+          if (!info || info.error || !info.tracks?.length) return fail(info?.error || 'The playlist does not exist or is private.', 'playlist')
+          src = ytListSource(info, link)
+        } else {
+          const meta = await window.api.fetchMetadata({ platform: 'soundcloud', url: link.url })
+          if (readReq.current !== req) return
+          if (!meta || meta.error) return fail(meta?.error, link.kind === 'sc' ? 'set' : 'track')
+          src = scSource(meta, link.url)
+        }
+        const sel = src.tracks.filter((t) => !t.protected).map((t) => t.id)
+        setEd({ view: 'ready', url, src, alt: null, sel, cfg: makeCfg(src, lastCfgRef.current), fromWatch: link.kind === 'plvid', err: null })
+      } catch (e) {
+        fail(e?.message, 'link')
+      }
+    },
+    []
+  )
+
+  const clearEditor = () => {
+    readReq.current += 1
+    setEd({ view: 'empty', url: '', src: null, alt: null, sel: [], cfg: null, fromWatch: false, err: null })
+    setPop(null)
+    setMore(false)
+  }
+
+  // Ctrl+V anywhere outside a text field reads the pasted link.
+  useEffect(() => {
+    const onPaste = (e) => {
+      const tag = e.target?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA') return
+      const t = e.clipboardData?.getData('text')
+      if (t) readLink(t)
+    }
+    document.addEventListener('paste', onPaste)
+    return () => document.removeEventListener('paste', onPaste)
+  }, [readLink])
+
+  // "Whole playlist" / "This video only" for a video opened from a playlist link.
+  const [altLoading, setAltLoading] = useState(false)
+  const switchToList = async () => {
+    if (ed.src?.type === 'list' || !ed.src?.listUrl || altLoading) return
+    if (ed.alt?.type === 'list') {
+      setEd((e) => ({ ...e, src: e.alt, alt: e.src, sel: e.alt.tracks.map((t) => t.id), cfg: { ...e.cfg, trimOn: false, split: false } }))
       return
     }
+    setAltLoading(true)
+    const info = await window.api.getPlaylistInfo(ed.src.listUrl).catch(() => null)
+    setAltLoading(false)
+    if (!info || info.error || !info.tracks?.length) {
+      toastMsg('error', info?.error || 'Couldn’t read the playlist.')
+      return
+    }
+    const list = ytListSource(info, { listUrl: ed.src.listUrl })
+    setEd((e) => ({ ...e, src: list, alt: e.src, sel: list.tracks.map((t) => t.id), cfg: { ...e.cfg, trimOn: false, split: false } }))
+  }
+  const switchToVideo = () => {
+    if (ed.src?.type === 'video' || ed.alt?.type !== 'video') return
+    setEd((e) => ({ ...e, src: e.alt, alt: e.src, sel: e.alt.tracks.map((t) => t.id) }))
+  }
+
+  /* --- editing ------------------------------------------------------------------ */
+  const setCfg = (patch) =>
+    setEd((e) => {
+      const cfg = { ...e.cfg, ...patch }
+      lastCfgRef.current = { ...lastCfgRef.current, format: cfg.format, res: cfg.res, codec: cfg.codec, afmt: cfg.afmt, scfmt: cfg.scfmt, meta: cfg.meta, folder: cfg.folder }
+      if (patch.codec) window.api?.setConfig({ codec: cfg.codec })
+      return { ...e, cfg }
+    })
+
+  const chooseFolder = async () => {
+    setPop(null)
+    const f = await window.api?.selectFolder()
+    if (!f) return
+    setCfg({ folder: f })
+    window.api?.setConfig({ outputFolder: f })
+    window.api?.getFolders?.().then((x) => x && setFolders(x))
+  }
+  const pickFolder = (path) => {
+    setCfg({ folder: path })
+    window.api?.setConfig({ outputFolder: path })
+    setPop(null)
+  }
+
+  /* --- queue & downloads ------------------------------------------------------- */
+  const resetLive = () => {
+    liveRef.current = { progress: 0, item: 0, itemPct: 0, speed: null }
+    speedRef.current = null
+    dl.current = { pass: 1, dest: 0, extracts: 0, extra: false }
+    setLive({ ...liveRef.current })
+  }
+
+  // A cancelled / failed item comes back into the editor with its settings —
+  // unless the user is already editing another link.
+  const reopenInEditor = (job) => {
+    setEd((e) =>
+      e.view === 'empty'
+        ? { view: 'ready', url: job.url, src: job.src, alt: job.alt, sel: job.sel, cfg: job.cfg, fromWatch: job.fromWatch, err: null }
+        : e
+    )
+  }
+
+  const runJob = async (job) => {
+    activeRef.current = job
+    skippedRef.current = false
+    setActive(job)
+    setStopping(false)
+    resetLive()
+    let res = null
+    try {
+      res = await window.api?.[job.api](job.params)
+    } catch (e) {
+      res = { success: false, error: e?.message }
+      toastMsg('error', e?.message || 'Download failed')
+    }
+    const snapshot = { ...liveRef.current }
+    activeRef.current = null
+    setActive(null)
+    return { res: res || { success: false }, snapshot }
+  }
+
+  const waitBeforeNext = async (seconds, bot) => {
+    skipRef.current = false
+    const until = Date.now() + seconds * 1000
+    setWait({ until, bot })
+    while (Date.now() < until && !skipRef.current && !abortRef.current) await new Promise((r) => setTimeout(r, 200))
+    setWait(null)
+  }
+
+  // One download at a time. Each finished item pulls the next after 5 s; a
+  // YouTube bot check pauses the queue (the blocked item goes back to the
+  // front) for as long as the message says, then it resumes on its own.
+  const runQueue = async (first) => {
+    let job = first
+    abortRef.current = false
+    setDoneJob(null)
+    while (job) {
+      const { res, snapshot } = await runJob(job)
+      const ok = res.success || res.alreadyDownloaded
+      if (res.botCheck && (job.botTries || 0) < 2 && !abortRef.current) {
+        setQueueBoth([{ ...job, botTries: (job.botTries || 0) + 1, last: snapshot, params: { ...job.params, queued: true } }, ...queueRef.current])
+      }
+      if (!queueRef.current.length || abortRef.current) {
+        if (ok) setDoneJob(job)
+        else if (!abortRef.current) reopenInEditor(job)
+        break
+      }
+      await waitBeforeNext(res.botCheck ? res.retryAfterSec || 30 : QUEUE_GAP_SEC, !!res.botCheck)
+      if (abortRef.current || !queueRef.current.length) {
+        if (ok) setDoneJob(job)
+        break
+      }
+      const [next, ...rest] = queueRef.current
+      setQueueBoth(rest)
+      // Queued items don't retry on their own: the queue's pause does that.
+      job = { ...next, params: { ...next.params, queued: true } }
+    }
+  }
+
+  const busy = !!active || !!wait
+
+  const startOrQueue = () => {
+    if (ed.view !== 'ready') return
+    const job = buildJob(ed, ++seqRef.current)
+    if (busy) {
+      const key = jobKey(job)
+      if ((activeRef.current && jobKey(activeRef.current) === key) || queueRef.current.some((j) => jobKey(j) === key)) {
+        toastMsg('info', activeRef.current && jobKey(activeRef.current) === key ? 'Already downloading' : 'Already in the queue')
+        return
+      }
+      const q = [...queueRef.current, job]
+      setQueueBoth(q)
+      toastMsg('info', `Added to queue (${(activeRef.current ? 1 : 0) + q.length})`)
+      clearEditor()
+      return
+    }
+    clearEditor()
     runQueue(job)
   }
 
-  const removeQueued = (id) => {
-    queueRef.current = queueRef.current.filter((j) => j.id !== id)
-    setQueue([...queueRef.current])
-  }
-
-  const clearQueue = () => {
-    queueRef.current = []
-    setQueue([])
-  }
-
-  const handleStop = async () => {
-    // Between two queued jobs there is nothing to cancel: just stop waiting
-    // (the remaining items stay in the queue).
-    if (!downloading && queueWait) {
-      queueAbortRef.current = true
-      return
-    }
+  const cancelActive = async () => {
     setStopping(true)
     await window.api?.cancelDownload()
   }
-
-  async function handleUpdateYtdlp() {
-    setUpdatingYtdlp(true)
-    toast.loading('Updating yt-dlp…', { id: 'ytdlp-update' })
-    const res = await window.api?.updateYtdlp()
-    setUpdatingYtdlp(false)
-    if (res?.success) {
-      setYtdlpUpdate(null)
-      toast.success(`yt-dlp updated to ${res.version || 'latest'}`, { id: 'ytdlp-update' })
-    } else {
-      toast.error('yt-dlp update failed', { id: 'ytdlp-update' })
-    }
+  const startNow = () => {
+    skipRef.current = true
+  }
+  const removeQueued = (id) => {
+    const q = queueRef.current.filter((j) => j.id !== id)
+    setQueueBoth(q)
+    // Nothing left to wait for: end the pause now.
+    if (!q.length && !activeRef.current) skipRef.current = true
+  }
+  const clearQueue = () => {
+    setQueueBoth([])
+    setQOpen(false)
+    if (!activeRef.current) abortRef.current = true
+    toastMsg('info', 'Queue cleared')
+  }
+  const downloadAgain = () => {
+    if (!doneJob || busy) return
+    const job = { ...doneJob, id: ++seqRef.current, botTries: 0, last: null, params: { ...doneJob.params, queued: false } }
+    runQueue(job)
   }
 
-  const toggleTrack = (id) => {
-    const track = playlistTracks.find((t) => t.id === id)
-    if (track?.protected) {
-      toast.error('This track is DRM-protected on SoundCloud and can’t be downloaded.')
+  /* --- settings: window, proxy, engine --------------------------------------- */
+  const selectWindow = (k) => {
+    setWindowSize(k)
+    window.api?.setWindowSize(k)
+  }
+
+  const saveProxy = async (draft, announce) => {
+    const res = await window.api?.setProxy({
+      enabled: draft.on,
+      type: draft.type,
+      host: draft.host,
+      port: Number(draft.port),
+      username: draft.username,
+      password: draft.password
+    })
+    if (!res?.ok) return false
+    const was = proxySaved?.enabled
+    setProxySaved(res.proxy)
+    if (announce || was !== res.proxy.enabled) {
+      toastMsg('info', res.proxy.enabled ? `Proxy on · ${res.proxy.type.toUpperCase()} ${res.proxy.host}:${res.proxy.port}` : 'Proxy off')
+    }
+    return true
+  }
+
+  const proxyToggle = () => {
+    const next = { ...pxDraft, on: !pxDraft.on }
+    setPxDraft(next)
+    setPxTest(null)
+    if (!next.on) saveProxy(next, true)
+    else if (proxyValid(next)) saveProxy(next, true)
+  }
+  const proxyField = (patch) => {
+    const next = { ...pxDraft, ...patch }
+    setPxDraft(next)
+    setPxTest(null)
+    clearTimeout(pxTimer.current)
+    if (next.on && proxyValid(next)) pxTimer.current = setTimeout(() => saveProxy(next, false), 600)
+  }
+  const proxyHost = (v) => {
+    const parsed = parseProxyLink(v)
+    if (parsed) {
+      proxyField({ ...parsed })
+      toastMsg('info', 'Filled every proxy field from the link')
+    } else proxyField({ host: v })
+  }
+  const proxyTest = async () => {
+    if (!proxyValid(pxDraft)) {
+      setPxTest({ color: 'var(--red)', text: 'Enter a host and a port between 1 and 65535.' })
       return
     }
-    setSelected((prev) => {
-      const next = new Set(prev)
-      next.has(id) ? next.delete(id) : next.add(id)
-      return next
-    })
+    setPxTest({ color: 'var(--ink2)', text: 'Testing…' })
+    const r = await window.api?.testProxy({ type: pxDraft.type, host: pxDraft.host, port: Number(pxDraft.port), username: pxDraft.username, password: pxDraft.password })
+    setPxTest(r?.ok ? { color: 'var(--grn)', text: `Working · ${r.ms} ms` } : { color: 'var(--red)', text: r?.error || 'The test failed.' })
   }
 
-  const selectAll = () =>
-    setSelected(new Set(playlistTracks.filter((t) => !t.protected).map((t) => t.id)))
-  const deselectAll = () => setSelected(new Set())
+  const openSettings = (focusProxy) => {
+    setPop(null)
+    setQOpen(false)
+    setSettingsOpen(true)
+    window.api?.getEngineVersions?.().then((v) => v && setEngine((e) => ({ ...e, ...v })))
+    if (focusProxy) setTimeout(() => proxyRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 80)
+  }
+  const checkEngine = async () => {
+    setEngine((e) => ({ ...e, busy: true, msg: 'Checking…', msgColor: 'var(--ink2)' }))
+    const r = await window.api?.checkYtdlpUpdate()
+    if (r?.updateAvailable) {
+      setEngine((e) => ({ ...e, msg: `Updating yt-dlp to ${r.latest}…` }))
+      const u = await window.api?.updateYtdlp()
+      const v = await window.api?.getEngineVersions?.()
+      setYtdlpUpdate(null)
+      setEngine((e) => ({ ...e, ...(v || {}), busy: false, msg: u?.success ? `yt-dlp updated to ${u.version || r.latest}` : 'The update failed. Try again later.', msgColor: u?.success ? 'var(--grn)' : 'var(--red)' }))
+    } else if (r?.error) {
+      setEngine((e) => ({ ...e, busy: false, msg: 'Couldn’t check for updates. Check your connection.', msgColor: 'var(--red)' }))
+    } else {
+      setEngine((e) => ({ ...e, busy: false, msg: 'yt-dlp and ffmpeg are up to date', msgColor: 'var(--grn)' }))
+    }
+  }
+  const openLink = (which) => {
+    window.api?.trackLink(which)
+    window.open(LINKS[which], '_blank', 'noopener,noreferrer')
+  }
 
   const dismissWhatsNew = () => {
-    const ids = whatsNew?.ids || []
+    if (!whatsNew) return
+    const ack = [...new Set([...ackRef.current, ...whatsNew.block.ids])]
+    ackRef.current = ack
     setWhatsNew(null)
-    const v = seenVersionRef.current || version
-    const ack = [...new Set([...(whatsNewAckRef.current || []), ...ids])]
-    whatsNewAckRef.current = ack
-    window.api?.setConfig({
-      ...(v ? { lastSeenVersion: v } : {}),
-      whatsNewAck: ack
+    window.api?.setConfig({ whatsNewAck: ack, ...(version ? { lastSeenVersion: version } : {}) })
+  }
+
+  // Esc closes popovers, then the sheet, then dialogs.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (e.key !== 'Escape') return
+      if (pop || qOpen) {
+        setPop(null)
+        setQOpen(false)
+      } else if (settingsOpen) setSettingsOpen(false)
+      else if (whatsNew) dismissWhatsNew()
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  })
+
+  /* ============================================================================ */
+  /*  Derived view                                                                */
+  /* ============================================================================ */
+
+  const editing = ed.view === 'fetching' || ed.view === 'error' || ed.view === 'ready'
+  const pausedItem = wait?.bot ? queue[0] : null
+  const mode = editing
+    ? ed.view
+    : active
+      ? 'active'
+      : wait
+        ? wait.bot
+          ? 'paused'
+          : 'next'
+        : doneJob
+          ? 'done'
+          : 'empty'
+
+  // The thing the main area and the dock describe.
+  let subj = null
+  let locked = false
+  if (mode === 'ready') subj = { src: ed.src, sel: ed.sel, cfg: ed.cfg }
+  else if (mode === 'active') {
+    subj = active
+    locked = true
+  } else if (mode === 'paused' || mode === 'next') {
+    subj = queue[0] || null
+    locked = true
+  } else if (mode === 'done') {
+    subj = doneJob
+    locked = true
+  }
+  const src = subj?.src || null
+  const cfg = subj?.cfg || null
+  const isSc = src?.kind === 'sc'
+  const single = src?.type === 'video'
+  const est = subj ? estimate(src, subj.sel, cfg) : null
+  const waitLeft = wait ? Math.max(0, Math.ceil((wait.until - Date.now()) / 1000)) : 0
+
+  // Progress numbers for the subject.
+  const lastSnap = pausedItem?.last || null
+  const prog = mode === 'done' ? 100 : mode === 'active' ? live.progress : mode === 'paused' ? lastSnap?.progress || 0 : 0
+  const pct = Math.floor(prog)
+  const itemIdx = mode === 'active' ? live.item : mode === 'paused' ? lastSnap?.item || 0 : 0
+  const speedMB = mode === 'active' && live.speed ? live.speed / 1024 ** 2 : null
+  const doneMB = est ? (est.mb * prog) / 100 : 0
+  const trk = est && !single ? `track ${Math.min(est.n, itemIdx + 1)} of ${est.n} · ` : ''
+  const sizePart = est ? `${fmtMB(doneMB)} / ~${fmtMB(est.mb)}` : ''
+  const progLine = est
+    ? trk + sizePart + (speedMB ? ` · ${speedMB.toFixed(1)} MB/s · ${hms(Math.max(0, est.mb - doneMB) / speedMB)} left` : '')
+    : ''
+
+  // Header (kicker / headline / meta) per state — spec §5.2 list layout table.
+  let hK = ''
+  let hHead = ''
+  let hAcc = ''
+  let hAccC = 'var(--accText)'
+  let hMeta = ''
+  if (src) {
+    const tot = src.tracks.reduce((a, t) => a + (t.dur || 0), 0)
+    const cap = isSc ? 'audio only' : src.max ? `up to ${src.max}p` : ''
+    if (mode === 'ready') {
+      hK = src.label.toUpperCase()
+      hHead = single ? '' : src.title
+      hMeta = single
+        ? [hms(src.duration), cap, src.chapters?.length ? `${src.chapters.length} chapters` : ''].filter(Boolean).join(' · ')
+        : [`${src.tracks.length} ${src.tracks.length === 1 ? 'track' : 'tracks'}`, hms(tot), cap].filter(Boolean).join(' · ')
+    } else if (mode === 'active') {
+      hK = src.title.toUpperCase()
+      hHead = 'Downloading '
+      hAcc = `${pct}%`
+      hMeta = stopping ? 'Stopping…' : progLine
+    } else if (mode === 'paused') {
+      hK = src.title.toUpperCase()
+      hHead = 'Paused at '
+      hAcc = `${pct}%`
+      hAccC = 'var(--yel)'
+      hMeta = trk + sizePart
+    } else if (mode === 'next') {
+      hK = `UP NEXT · ${queue.length} IN QUEUE`
+      hHead = 'Next download in '
+      hAcc = `${waitLeft} s`
+      hMeta = `${src.title} · ${summaryOf(subj)}`
+    } else if (mode === 'done') {
+      hK = src.title.toUpperCase()
+      hHead = 'Saved. '
+      hAcc = `${est.unit}, ${fmtMB(est.mb)}`
+      hAccC = 'var(--grn)'
+      hMeta = `→ ${cfg.folder}`
+    }
+  }
+  const pausedText = `Queue paused · YouTube bot check · resuming in ${waitLeft} s`
+
+  const openFolder = async () => {
+    const r = await window.api?.openFolder(cfg?.folder)
+    if (r?.ok) toastMsg('info', `Opened ${r.path}`)
+    else toastMsg('error', `Couldn't open ${cfg?.folder || 'the folder'}.`)
+  }
+  const newDownload = () => {
+    setDoneJob(null)
+    clearEditor()
+    setTimeout(() => inputRef.current?.focus(), 0)
+  }
+
+  const actions = {
+    switch:
+      mode === 'ready' && ed.fromWatch
+        ? { list: src?.type === 'list', toList: switchToList, toVideo: switchToVideo, loading: altLoading }
+        : null,
+    paused: mode === 'paused',
+    next: mode === 'next',
+    done: mode === 'done',
+    onResume: startNow,
+    onStartNow: startNow,
+    onProxy: () => openSettings(true),
+    onOpenFolder: openFolder,
+    onNew: newDownload
+  }
+
+  /* --- rows (list layout) ------------------------------------------------------ */
+  let listView = null
+  if (src && !single && ['ready', 'active', 'paused', 'next', 'done'].includes(mode)) {
+    const isReady = mode === 'ready'
+    const rate = ratePerMin(isSc, cfg)
+    const shown = isReady ? src.tracks : src.tracks.filter((t) => subj.sel.includes(t.id))
+    const rows = shown.map((t, k) => {
+      const i = src.tracks.indexOf(t)
+      let st = 'wait'
+      let rowPct = 0
+      if (isReady) st = t.protected ? 'drm' : ed.sel.includes(t.id) ? 'on' : 'off'
+      else if (mode === 'done') st = 'done'
+      else if (mode === 'active' || mode === 'paused') {
+        if (k < itemIdx) st = 'done'
+        else if (k === itemIdx) {
+          st = mode === 'paused' ? 'paused' : 'active'
+          rowPct = Math.floor(mode === 'paused' ? lastSnap?.itemPct || 0 : live.itemPct)
+        }
+      }
+      return {
+        key: t.id,
+        n: String(i + 1).padStart(2, '0'),
+        a: t.a,
+        t: t.t,
+        full: t.full,
+        thumb: t.thumb,
+        dur: t.dur ? hms(t.dur) : '',
+        size: `~${fmtMB(((t.dur || 0) / 60) * rate)}`,
+        st,
+        pct: rowPct,
+        dim: isReady && st !== 'on',
+        onClick:
+          isReady && !t.protected
+            ? () => setEd((e) => ({ ...e, sel: e.sel.includes(t.id) ? e.sel.filter((z) => z !== t.id) : src.tracks.filter((x) => x.id === t.id || e.sel.includes(x.id)).map((x) => x.id) }))
+            : undefined
+      }
     })
+    const selectable = src.tracks.filter((t) => !t.protected)
+    const all = selectable.length > 0 && ed.sel.length >= selectable.length
+    const none = ed.sel.length === 0
+    listView = {
+      thumb: isReady ? src.thumbnail || null : undefined,
+      kicker: hK,
+      head: hHead,
+      acc: hAcc,
+      accColor: hAccC,
+      meta: hMeta,
+      actions,
+      pill: mode === 'paused' ? pausedText : null,
+      selectAll: isReady
+        ? {
+            state: all ? 'on' : none ? 'off' : 'part',
+            onClick: () => setEd((e) => ({ ...e, sel: all ? [] : selectable.map((t) => t.id) }))
+          }
+        : null,
+      caption: isReady ? `${ed.sel.length} OF ${src.tracks.length} SELECTED` : 'TITLE',
+      statusCaption: isReady ? 'EST. SIZE' : 'STATUS',
+      rows
+    }
   }
 
-  const selectWindowSize = (next) => {
-    setWindowSize(next)
-    window.api?.setWindowSize(next)
+  let singleView = null
+  if (src && single && ['ready', 'active', 'paused', 'next', 'done'].includes(mode)) {
+    const showBar = mode === 'active' || mode === 'paused'
+    singleView = {
+      thumbnail: src.thumbnail,
+      dur: hms(src.duration),
+      kicker: mode === 'next' ? hK : src.label.toUpperCase(),
+      title: src.title,
+      by: src.by,
+      head: mode === 'ready' ? '' : mode === 'next' ? hHead : hHead,
+      acc: hAcc,
+      accColor: hAccC,
+      meta: hMeta,
+      bar: showBar ? prog : null,
+      barColor: mode === 'paused' ? 'var(--yel)' : 'var(--accGrad)',
+      pill: mode === 'paused' ? pausedText : null,
+      actions
+    }
   }
 
-  const compact = windowSize === 'compact'
-  const spec = true
+  /* --- output sentence (spec §5.3) --------------------------------------------- */
+  const folderName = (p) => {
+    if (!p) return 'Downloads'
+    const std = folders.standard.find((f) => f.path === p)
+    if (std) return std.name
+    return p.split(/[\\/]/).filter(Boolean).pop() || p
+  }
 
-  const urlRing =
-    urlState === null
-      ? 'var(--border)'
-      : urlState === 'invalid'
-        ? 'rgba(239,68,68,0.45)'
-        : 'var(--accent)'
+  const tokClick = (id, e) => {
+    if (id === 'trimS' || id === 'trimE' || id === 'split') {
+      setMore(true)
+      setPop(null)
+      return
+    }
+    const r = e.currentTarget.getBoundingClientRect()
+    const right = r.left + 310 > window.innerWidth
+    setQOpen(false)
+    setPop((p) => (p?.id === id ? null : { id, right }))
+  }
 
-  const downloadLabel =
-    mode === 'playlist'
-      ? selected.size > 0
-        ? `Download all (${selected.size} tracks)`
-        : 'Select tracks to download'
-      : 'Download'
+  const menuFor = (id) => {
+    const set = (patch) => {
+      setCfg(patch)
+      setPop(null)
+    }
+    const O = (label, desc, on, pick, why) => ({ label, desc, on, pick, why })
+    const what = single ? 'video' : 'playlist'
+    switch (id) {
+      case 'format':
+        return {
+          title: 'FORMAT',
+          opts: [
+            O('Video', `MP4 or MKV · up to ${src.max || (cfg.codec === 'h264' ? 1080 : 2160)}p`, !isSc && cfg.format === 'video', () => set({ format: 'video' }), isSc ? 'SoundCloud is audio only' : null),
+            O('Audio only', isSc ? 'Original or WAV' : 'WAV or MP3 · no picture', isSc || cfg.format === 'audio', () => set({ format: 'audio' }))
+          ]
+        }
+      case 'res':
+        return {
+          title: 'QUALITY',
+          opts: [
+            [1080, 'Full HD'],
+            [1440, '2K'],
+            [2160, '4K']
+          ].map(([r, l]) =>
+            O(
+              `${r}p`,
+              r > 1080 && cfg.codec === 'h264' ? `${l} · switches to Best quality` : l,
+              cfg.res === r,
+              () => set(r > 1080 ? { res: r, codec: 'best' } : { res: r }),
+              // 1080p means "best up to 1080p", so it's always available.
+              src.max && r > 1080 && r > src.max ? `This ${what} tops out at ${src.max}p` : null
+            )
+          )
+        }
+      case 'codec':
+        return {
+          title: 'ENCODING',
+          opts: [
+            O('H.264', cfg.res > 1080 ? 'Plays everywhere · max 1080p · drops to 1080p' : 'Plays everywhere · max 1080p · MP4', cfg.codec === 'h264', () => set({ codec: 'h264', res: Math.min(cfg.res, 1080) })),
+            O('Best quality', 'VP9 / AV1 · smaller files · MKV', cfg.codec === 'best', () => set({ codec: 'best' }))
+          ]
+        }
+      case 'afmt':
+        return {
+          title: 'AUDIO FORMAT',
+          opts: [
+            O('WAV 44.1 kHz', 'Lossless · ~10 MB per minute', cfg.afmt === 'wav', () => set({ afmt: 'wav' })),
+            O('MP3 320 kbps', 'Plays anywhere · ~2.4 MB per minute', cfg.afmt === 'mp3', () => set({ afmt: 'mp3' }))
+          ]
+        }
+      case 'scfmt':
+        return {
+          title: 'SOUNDCLOUD QUALITY',
+          opts: [
+            O('Original', 'Best available · no re-encoding', cfg.scfmt === 'original', () => set({ scfmt: 'original' })),
+            O('WAV', 'Converted to WAV · lossless container', cfg.scfmt === 'wav', () => set({ scfmt: 'wav' }))
+          ]
+        }
+      case 'meta':
+        return {
+          title: 'METADATA',
+          opts: [
+            O('With metadata', 'Title, artist and cover art embedded', cfg.meta, () => set({ meta: true })),
+            O('Without metadata', 'Clean file · nothing embedded', !cfg.meta, () => set({ meta: false }))
+          ]
+        }
+      case 'folder': {
+        const list = [...folders.standard, ...folders.recent.filter((r) => !folders.standard.some((s) => s.path === r.path))]
+        if (cfg.folder && !list.some((f) => f.path === cfg.folder)) list.push({ name: folderName(cfg.folder), path: cfg.folder })
+        return {
+          title: 'SAVE TO',
+          opts: [...list.map((f) => O(f.name, f.path, cfg.folder === f.path, () => pickFolder(f.path))), O('Choose folder…', 'Opens the system folder picker', false, chooseFolder)]
+        }
+      }
+      default:
+        return null
+    }
+  }
 
-  // Embed toggle is available for audio (single) and playlists.
-  const showEmbed = !isSc && ((mode === 'single' && format === 'audio') || mode === 'playlist')
+  const segs = useMemo(() => {
+    const out = []
+    const T = (text) => out.push({ text })
+    const B = (bold) => out.push({ bold })
+    if (!subj) {
+      T('Save ')
+      B('everything')
+      T(' as ')
+      ;['video', '1080p', 'H.264', 'with metadata', 'Downloads'].forEach((l, i, arr) => {
+        out.push({ label: l, locked: true })
+        T(i === 0 ? ' in ' : i === arr.length - 1 ? '.' : i === arr.length - 2 ? ', into ' : ', ')
+      })
+      return out
+    }
+    const K = (id, label) => {
+      const open = !locked && pop?.id === id
+      const noMenu = id === 'trimS' || id === 'trimE' || id === 'split'
+      out.push({ label, locked, open, right: open && pop.right, menu: open && !noMenu ? menuFor(id) : noMenu ? null : !locked ? { title: '', opts: [] } : null, onClick: (e) => tokClick(id, e) })
+    }
+    T('Save ')
+    B(single ? 'this' : `${est.n} ${est.n === 1 ? 'track' : 'tracks'}`)
+    T(' as ')
+    K('format', cfg.format === 'audio' || isSc ? 'audio' : 'video')
+    T(' in ')
+    if (isSc) K('scfmt', cfg.scfmt === 'wav' ? 'WAV' : 'original quality')
+    else if (cfg.format === 'audio') K('afmt', cfg.afmt === 'wav' ? 'WAV 44.1 kHz' : 'MP3 320 kbps')
+    else {
+      K('res', `${cfg.res}p`)
+      T(', ')
+      K('codec', cfg.codec === 'h264' ? 'H.264' : 'best quality')
+    }
+    if (single && cfg.trimOn) {
+      T(', from ')
+      K('trimS', cfg.tStart)
+      T(' to ')
+      K('trimE', cfg.tEnd)
+    }
+    if (single && cfg.split && src.chapters?.length) {
+      T(', ')
+      K('split', `split into ${src.chapters.length} chapters`)
+    }
+    T(', ')
+    K('meta', cfg.meta ? 'with metadata' : 'without metadata')
+    T(', into ')
+    K('folder', folderName(cfg.folder))
+    T('.')
+    return out
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [subj, locked, pop, folders, est?.n])
 
-  /* ---------------------------------------------------------------------- */
+  const dockLabel = !subj
+    ? 'OUTPUT · PASTE A LINK TO START'
+    : locked
+      ? mode === 'done'
+        ? 'OUTPUT · LAST DOWNLOAD'
+        : 'OUTPUT · LOCKED WHILE THIS RUNS'
+      : busy
+        ? 'NEXT IN QUEUE · KEEPS ITS OWN SETTINGS'
+        : 'OUTPUT · CLICK A HIGHLIGHTED WORD TO CHANGE IT'
+
+  /* --- more options (spec §5.4) -------------------------------------------------- */
+  let moreView = null
+  if (subj && !locked) {
+    const ytSingle = single && !isSc
+    const chCount = src.chapters?.length || 0
+    let trimInfo = ''
+    if (ytSingle) {
+      if (!cfg.trimOn) trimInfo = `Video length ${hms(src.duration)}`
+      else if (est.terr) trimInfo = est.terr
+      else trimInfo = `Selection ${hms(est.secs)} · ≈ ${fmtMB(est.mb)}`
+    }
+    moreView = {
+      open: more,
+      toggle: () => {
+        setMore((m) => !m)
+        setPop(null)
+      },
+      summary: !more && ytSingle ? (cfg.trimOn ? `· Trim ${cfg.tStart}–${cfg.tEnd}` : cfg.split && chCount ? `· Split into ${chCount} chapters` : '') : '',
+      note: !single
+        ? 'Trim and split by chapters work on single videos. Paste a video link to use them.'
+        : isSc
+          ? 'Trim and split by chapters work on YouTube videos. Paste a video link to use them.'
+          : null,
+      trim: ytSingle
+        ? {
+            on: cfg.trimOn,
+            err: est.terr,
+            toggle: () => setCfg(cfg.trimOn ? { trimOn: false } : { trimOn: true, split: false }),
+            note: cfg.split ? 'Turns off Split' : '',
+            start: cfg.tStart,
+            end: cfg.tEnd,
+            onStart: (e) => setCfg({ tStart: fmtT(e.target.value), trimOn: true, split: false }),
+            onEnd: (e) => setCfg({ tEnd: fmtT(e.target.value), trimOn: true, split: false }),
+            info: trimInfo
+          }
+        : null,
+      split:
+        ytSingle && chCount
+          ? {
+              on: cfg.split,
+              toggle: () => setCfg(cfg.split ? { split: false } : { split: true, trimOn: false }),
+              text: `Split into ${chCount} chapters, one file each`,
+              note: cfg.trimOn ? 'Turns off Trim' : 'Uses the chapter titles as file names'
+            }
+          : null
+    }
+  }
+
+  /* --- right column (spec §5.5) --------------------------------------------------- */
+  let sizeL = '—'
+  let sizeR = ''
+  if (est) {
+    if (mode === 'ready') {
+      sizeL = single ? (cfg.trimOn && !est.terr ? `TRIMMED · ${hms(est.secs)}` : hms(est.secs)) : `${est.n} OF ${src.tracks.length} · ${hms(est.secs)}`
+      sizeR = `≈ ${fmtMB(est.mb)} ${est.cont}`
+    } else {
+      sizeL = 'THIS DOWNLOAD'
+      sizeR = `~${fmtMB(est.mb)} ${est.cont}`
+    }
+  }
+
+  let button
+  if (mode === 'ready') {
+    if (est.n === 0) button = { kind: 'dis', label: 'Select at least one track' }
+    else if (est.terr) button = { kind: 'dis', label: 'Fix the time range' }
+    else if (busy) button = { kind: 'ready', label: 'Add to queue', glyph: '+', onClick: startOrQueue }
+    else
+      button = {
+        kind: 'ready',
+        label: single ? (isSc || cfg.format === 'audio' ? 'Download audio' : 'Download video') : `Download ${est.n} ${est.n === 1 ? 'track' : 'tracks'}`,
+        glyph: '↓',
+        onClick: startOrQueue
+      }
+  } else if (mode === 'active') {
+    button = {
+      kind: 'prog',
+      pct: prog,
+      fill: 'var(--acc)',
+      t1: `${pct}%`,
+      t2: stopping ? 'stopping…' : single ? 'downloading' : `track ${Math.min(est.n, itemIdx + 1)} of ${est.n}`,
+      act: 'Cancel',
+      onAct: cancelActive,
+      actDisabled: stopping
+    }
+  } else if (mode === 'paused') {
+    button = { kind: 'prog', pct: prog, fill: 'var(--yel)', t1: 'Paused', t2: `${pct}% · bot check`, act: 'Resume', onAct: startNow }
+  } else if (mode === 'next') {
+    button = { kind: 'prog', pct: 0, fill: 'var(--acc)', t1: `Next in ${waitLeft} s`, t2: `${queue.length} waiting`, act: 'Start now', onAct: startNow }
+  } else if (mode === 'done') {
+    button = { kind: 'ready', label: 'Download again', glyph: '↻', onClick: downloadAgain }
+  } else if (mode === 'fetching') button = { kind: 'dis', label: 'Reading link…' }
+  else button = { kind: 'dis', label: 'Paste a link first' }
+
+  const qCount = (active ? 1 : 0) + queue.length
+  const showChip = busy || queue.length > 0
+  const chipSub = active ? `${Math.floor(live.progress)}%` : wait ? (wait.bot ? 'paused' : `next in ${waitLeft} s`) : ''
+  let qView = null
+  if (qOpen && showChip) {
+    const curJob = active || pausedItem
+    const rest = active ? queue : pausedItem ? queue.slice(1) : queue
+    qView = {
+      label: `Queue · ${qCount}`,
+      cur: curJob
+        ? {
+            title: curJob.src.title,
+            pct: Math.floor(active ? live.progress : pausedItem.last?.progress || 0),
+            color: active ? 'var(--acc)' : 'var(--yel)',
+            meta: (active ? '' : 'Paused · YouTube bot check · ') + summaryOf(curJob)
+          }
+        : null,
+      note: wait && !wait.bot ? `Next download in ${waitLeft} s` : null,
+      items: rest.map((j, i) => ({ id: j.id, n: String(i + (curJob ? 2 : 1)), title: j.src.title, meta: summaryOf(j), remove: () => removeQueued(j.id) })),
+      clear: clearQueue
+    }
+  }
+
+  /* --- URL bar ---------------------------------------------------------------------- */
+  let chip = { label: 'No link', dot: 'var(--ink3)' }
+  if (ed.view === 'fetching') chip = { label: 'Reading…', dot: 'var(--acc)' }
+  else if (ed.view === 'error') chip = { label: 'Unreadable', dot: 'var(--red)' }
+  else if (ed.view === 'ready' && ed.src) {
+    const s = ed.src
+    chip = { label: s.kind === 'sc' ? (s.type === 'list' ? 'SoundCloud · Set' : 'SoundCloud · Track') : `YouTube · ${s.type === 'list' ? 'Playlist' : 'Video'}`, dot: 'var(--grn)' }
+  }
+  const pasteFromClipboard = async () => {
+    let t = ''
+    try {
+      t = await navigator.clipboard.readText()
+    } catch {
+      t = ''
+    }
+    if (t && t.trim()) readLink(t)
+    else toastMsg('info', 'Copy a YouTube or SoundCloud link first.')
+  }
+
+  /* --- banner (spec §5.7) ------------------------------------------------------------ */
+  let banner = null
+  const u = appUpdate
+  if (u?.status === 'downloading') banner = { key: 'dl', title: `Downloading update${u.version ? ` ${u.version}` : ''}`, progress: Math.round(u.percent || 0) }
+  else if (u?.status === 'downloaded')
+    banner = { key: `ready-${u.version}`, title: `${u.version || 'The update'} is ready.`, sub: ' Restart to install.', action: 'Restart to install', onAction: () => window.api?.installUpdate(), later: true }
+  else if (u?.status === 'available')
+    banner = { key: `avail-${u.version}`, title: `Version ${u.version} available`, sub: '', action: 'Update now', onAction: () => window.api?.downloadUpdate() }
+  else if (u?.status === 'portable-available')
+    banner = {
+      key: `port-${u.version}`,
+      title: `Version ${u.version} available`,
+      sub: ' · this portable copy can’t update itself',
+      action: 'Download',
+      onAction: () => window.open(u.downloadUrl || 'https://github.com/EvroHQ/EvroHQ-Downloader/releases/latest', '_blank', 'noopener,noreferrer')
+    }
+  else if (ytdlpUpdate)
+    banner = {
+      key: `ytdlp-${ytdlpUpdate.latest}`,
+      title: `yt-dlp ${ytdlpUpdate.latest} available`,
+      sub: ' · keeps YouTube downloads working',
+      action: engine.busy ? 'Updating…' : 'Update now',
+      busy: engine.busy,
+      onAction: async () => {
+        setEngine((e) => ({ ...e, busy: true }))
+        const r = await window.api?.updateYtdlp()
+        setEngine((e) => ({ ...e, busy: false }))
+        setYtdlpUpdate(null)
+        toastMsg(r?.success ? 'success' : 'error', r?.success ? `yt-dlp updated to ${r.version || 'the latest version'}` : 'yt-dlp update failed')
+      }
+    }
+  if (banner && bannerHidden === banner.key) banner = null
+  if (banner && banner.progress == null) banner.onDismiss = () => setBannerHidden(banner.key)
+
+  const proxyOn = !!(proxySaved?.enabled && proxySaved?.host)
+  const dockDim = !subj
+
+  /* ============================================================================ */
   return (
-    <div className="relative flex h-screen w-screen flex-col overflow-hidden bg-base text-text-primary">
-      {/* Ambient background */}
-      <div className="amb">
-        <span className="blob blob1" />
-        <span className="blob blob2" />
-        <span className="blob blob3" />
-      </div>
-      <div className="grain" />
+    <div className={`app${windowSize === 'compact' ? ' compact' : ''}`} data-theme-key={resolveTheme(theme)}>
+      <TitleBar
+        version={version}
+        proxyOn={proxyOn}
+        onSettings={() => openSettings(false)}
+        onMinimize={() => window.api?.minimizeWindow()}
+        onClose={() => window.api?.closeWindow()}
+      />
+      <Banner banner={banner} />
 
-      <div className={`relative z-10 flex min-h-0 flex-1 flex-col ${compact ? 'gap-2 p-2.5' : 'gap-3 p-5'}`}>
-        {/* Update banner */}
-        <AnimatePresence>
-          {activeBanner && <UpdateBanner key={activeBanner.key} {...activeBanner} />}
-        </AnimatePresence>
+      <UrlBar
+        url={ed.url}
+        chip={chip}
+        state={ed.view === 'error' ? 'error' : ed.view === 'ready' ? 'ready' : ''}
+        placeholder={busy ? 'Paste another link to add it to the queue…' : 'Paste a YouTube or SoundCloud link…'}
+        inputRef={inputRef}
+        onChange={(e) => setEd((x) => ({ ...x, url: e.target.value, view: x.view === 'empty' || !x.view ? 'empty' : x.view }))}
+        onKeyDown={(e) => e.key === 'Enter' && readLink(e.currentTarget.value)}
+        onPaste={(e) => {
+          const t = e.clipboardData?.getData('text')
+          if (t && t.trim()) {
+            e.preventDefault()
+            readLink(t)
+          }
+        }}
+        onClear={clearEditor}
+        onPasteBtn={pasteFromClipboard}
+      />
 
-        {/* Everything below the banner is blocked while an update is pending */}
-        <div className={`relative flex min-h-0 flex-1 flex-col ${compact ? 'gap-2' : 'gap-3'}`}>
-          <AnimatePresence>
-            {activeBanner && appUpdate?.status !== 'portable-available' && (
-              <motion.div
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                transition={{ duration: 0.2 }}
-                className={`absolute z-20 cursor-not-allowed bg-black/72 backdrop-blur-[4px] ${compact ? '-inset-3' : '-inset-5'}`}
-              />
-            )}
-          </AnimatePresence>
-
-          {/* Top bar — brand on the left, version on the right */}
-          <header className="flex shrink-0 items-center gap-3">
-            <AppLogo />
-            <div className="min-w-0">
-              <h1 className={`text-[17px] font-bold leading-tight tracking-[-0.3px] ${LIGHT_THEMES.has(theme) ? 'text-black' : 'text-white'}`}>
-                EvroHQ Downloader
-              </h1>
-              <p className="text-[12px] font-normal text-[var(--text-dim)]">
-                YouTube &amp; SoundCloud · powered by yt-dlp &amp; ffmpeg
-              </p>
-            </div>
-            <div className="ml-auto flex shrink-0 items-center gap-2">
-              <WindowSizeMenu value={windowSize} onChange={selectWindowSize} />
-              <ThemeMenu value={theme} onChange={setTheme} />
-              <button
-                type="button"
-                onClick={() => setProxyOpen(true)}
-                title={proxyOn ? `Proxy on · ${proxySummary(proxy)}` : 'Proxy settings'}
-                className="chrome-chip inline-flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium transition-colors hover:text-[var(--text)]"
-              >
-                {proxyOn && <span className="h-1.5 w-1.5 rounded-full bg-[var(--accent)]" />}
-                Proxy
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setAboutOpen(true)
-                  window.api?.trackLink('about')
-                }}
-                className="chrome-chip px-2.5 py-1 text-[11px] font-medium transition-colors hover:text-[var(--text)]"
-              >
-                About
-              </button>
-              {version && (
-                <span className="chrome-chip self-center px-2.5 py-1 font-mono text-[11px] font-medium">
-                  v{version}
-                </span>
-              )}
-            </div>
-          </header>
-
-          <div className={`grid min-h-0 flex-1 ${compact ? 'grid-cols-2 gap-2' : 'grid-cols-[462px_minmax(0,1fr)] gap-[22px]'}`}>
-            {/* LEFT — controls. Compact stacks everything (no scrollbar). */}
-            <div className={`flex min-h-0 flex-col ${compact ? 'gap-2' : 'gap-3'}`}>
-              <div className={`flex min-h-0 flex-col overflow-hidden ${compact ? 'gap-2' : 'flex-1 gap-3'}`}>
-                {/* URL field */}
-                <div>
-                  <div
-                    className={`flex items-center gap-2.5 px-4 transition-colors ${compact ? 'py-1.5' : 'py-2'} ${spec ? 'rounded-[10px] bg-[var(--surface)]' : 'rounded-2xl bg-white/[0.04] focus-within:bg-white/[0.06]'
-                      }`}
-                    style={{ border: `1px solid ${urlRing}` }}
-                  >
-                    <input
-                      value={url}
-                      onChange={(e) => applyUrl(e.target.value)}
-                      placeholder="Paste a YouTube or SoundCloud link…"
-                      className={`flex-1 bg-transparent text-text-primary placeholder:text-text-muted focus:outline-none ${spec ? 'font-mono text-[13px]' : 'text-sm'}`}
-                    />
-                    <button
-                      onClick={handlePaste}
-                      title="Paste from clipboard"
-                      className="grid h-7 w-7 shrink-0 place-items-center rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] text-[var(--text-dim)] transition-colors hover:border-[var(--border-strong)] hover:text-[var(--text)]"
-                    >
-                      <Clipboard size={15} />
-                    </button>
-                  </div>
-                  <AnimatePresence initial={false}>
-                    {urlCleaned && (
-                      <motion.p
-                        initial={{ opacity: 0, height: 0, marginTop: 0 }}
-                        animate={{ opacity: 1, height: 'auto', marginTop: 6 }}
-                        exit={{ opacity: 0, height: 0, marginTop: 0 }}
-                        transition={{ duration: 0.18 }}
-                        className="flex items-center gap-1.5 px-1 text-[11px] text-[var(--text-dim)]"
-                      >
-                        <Scissors size={11} className="shrink-0 text-accentMid" />
-                        {urlCleanMsg}
-                      </motion.p>
-                    )}
-                  </AnimatePresence>
-                </div>
-
-                {/* Format */}
-                <div>
-                  <SectionLabel compact={compact}>Format</SectionLabel>
-                  <div className="grid grid-cols-2 gap-2">
-                    <FormatCard
-                      spec={spec}
-                      compact={compact}
-                      active={format === 'audio'}
-                      onClick={() => setFormat('audio')}
-                      icon={<Music size={compact ? 14 : 16} />}
-                      title="Audio"
-                      subtitle={
-                        isSc
-                          ? scFormat === 'wav'
-                            ? 'WAV · uncompressed'
-                            : 'Original · best available'
-                          : audioFormat === 'wav'
-                            ? 'WAV · 44.1 kHz'
-                            : 'MP3 · 320 kbps'
-                      }
-                    />
-                    <FormatCard
-                      spec={spec}
-                      compact={compact}
-                      active={format === 'video'}
-                      disabled={isSc}
-                      hint={isSc ? 'SoundCloud is audio only' : undefined}
-                      onClick={() => setFormat('video')}
-                      icon={<Video size={compact ? 14 : 16} />}
-                      title="Video"
-                      subtitle={isSc ? 'Audio only' : codec === 'h264' ? 'MP4 · up to 1080p' : 'MP4 · up to 4K'}
-                    />
-                  </div>
-                </div>
-
-                {/* Quality pills */}
-                {format === 'audio' ? (
-                  spec ? (
-                    <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
-                      {isSc ? (
-                        <>
-                          <Pill spec compact={compact} group="audio" active={scFormat === 'original'} onClick={() => setScFormat('original')}>
-                            Original · best available
-                          </Pill>
-                          <Pill spec compact={compact} group="audio" active={scFormat === 'wav'} onClick={() => setScFormat('wav')}>
-                            WAV · uncompressed
-                          </Pill>
-                        </>
-                      ) : (
-                        <>
-                          <Pill spec compact={compact} group="audio" active={audioFormat === 'wav'} onClick={() => setAudioFormat('wav')}>
-                            WAV · uncompressed
-                          </Pill>
-                          <Pill spec compact={compact} group="audio" active={audioFormat === 'mp3'} onClick={() => setAudioFormat('mp3')}>
-                            MP3 · 320 kbps
-                          </Pill>
-                        </>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="grid grid-cols-2 gap-2">
-                      {isSc ? (
-                        <>
-                          <Pill group="a" active={scFormat === 'original'} onClick={() => setScFormat('original')}>
-                            Original · best available
-                          </Pill>
-                          <Pill group="a" active={scFormat === 'wav'} onClick={() => setScFormat('wav')}>
-                            WAV · uncompressed
-                          </Pill>
-                        </>
-                      ) : (
-                        <>
-                          <Pill group="a" active={audioFormat === 'wav'} onClick={() => setAudioFormat('wav')}>
-                            WAV · uncompressed
-                          </Pill>
-                          <Pill group="a" active={audioFormat === 'mp3'} onClick={() => setAudioFormat('mp3')}>
-                            MP3 · 320 kbps
-                          </Pill>
-                        </>
-                      )}
-                    </div>
-                  )
-                ) : spec ? (
-                  <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
-                    <Pill spec compact={compact} group="quality" active={videoQuality === '1080'} onClick={() => setVideoQuality('1080')}>
-                      1080p
-                    </Pill>
-                    <Pill
-                      spec
-                      compact={compact}
-                      group="quality"
-                      active={videoQuality === '2k'}
-                      disabled={qualityLock('2k') != null}
-                      title={qualityLock('2k') ?? undefined}
-                      onClick={() => setVideoQuality('2k')}
-                    >
-                      2K · 1440p
-                    </Pill>
-                    <Pill
-                      spec
-                      compact={compact}
-                      group="quality"
-                      active={videoQuality === '4k'}
-                      disabled={qualityLock('4k') != null}
-                      title={qualityLock('4k') ?? undefined}
-                      onClick={() => setVideoQuality('4k')}
-                    >
-                      4K · 2160p
-                    </Pill>
-                  </div>
-                ) : (
-                  <div className="grid grid-cols-3 gap-2">
-                    <Pill group="v" active={videoQuality === '1080'} onClick={() => setVideoQuality('1080')}>
-                      1080p
-                    </Pill>
-                    <Pill
-                      group="v"
-                      active={videoQuality === '2k'}
-                      disabled={qualityLock('2k') != null}
-                      title={qualityLock('2k') ?? undefined}
-                      onClick={() => setVideoQuality('2k')}
-                    >
-                      2K · 1440p
-                    </Pill>
-                    <Pill
-                      group="v"
-                      active={videoQuality === '4k'}
-                      disabled={qualityLock('4k') != null}
-                      title={qualityLock('4k') ?? undefined}
-                      onClick={() => setVideoQuality('4k')}
-                    >
-                      4K · 2160p
-                    </Pill>
-                  </div>
-                )}
-
-                {format === 'video' && (
-                  spec ? (
-                    <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
-                      <Pill
-                        spec
-                        compact={compact}
-                        group="codec"
-                        active={codec === 'best'}
-                        onClick={() => selectCodec('best')}
-                        title="AV1/VP9 · best resolution"
-                      >
-                        Best quality
-                      </Pill>
-                      <Pill
-                        spec
-                        compact={compact}
-                        group="codec"
-                        active={codec === 'h264'}
-                        onClick={() => selectCodec('h264')}
-                        title="H.264 + AAC · native YouTube streams, 1080p max"
-                      >
-                        Compatible (H.264)
-                      </Pill>
-                    </div>
-                  ) : (
-                    <div className="grid grid-cols-2 gap-2">
-                      <Pill
-                        group="c"
-                        active={codec === 'best'}
-                        onClick={() => selectCodec('best')}
-                        title="AV1/VP9 · best resolution"
-                      >
-                        Best quality
-                      </Pill>
-                      <Pill
-                        group="c"
-                        active={codec === 'h264'}
-                        onClick={() => selectCodec('h264')}
-                        title="H.264 + AAC · native YouTube streams, 1080p max"
-                      >
-                        Compatible (H.264)
-                      </Pill>
-                    </div>
-                  )
-                )}
-
-                {mode === 'single' && !isSc && (
-                  <div className="grid grid-cols-2 gap-2">
-                    <SwitchRow
-                      label="Embed metadata"
-                      on={embedMeta}
-                      onToggle={() => setEmbedMeta((v) => !v)}
-                      ariaLabel="Toggle embed metadata and cover art"
-                      compact={compact}
-                    />
-                    <SwitchRow
-                      label="Split by chapters"
-                      extra={chapters.length > 0 ? `· ${chapters.length}` : null}
-                      on={byChapters}
-                      disabled={chapters.length === 0}
-                      onToggle={() => {
-                        setUseRange(false)
-                        setByChapters((v) => !v)
-                      }}
-                      ariaLabel="Toggle split by chapters"
-                      compact={compact}
-                    />
-                  </div>
-                )}
-                {mode === 'playlist' && showEmbed && (
-                  <SwitchRow
-                    label="Embed metadata"
-                    on={embedMeta}
-                    onToggle={() => setEmbedMeta((v) => !v)}
-                    ariaLabel="Toggle embed metadata and cover art"
-                    compact={compact}
-                  />
-                )}
-                {mode === 'single' && !isSc && (
-                  <div className={`flex w-full items-center justify-between gap-3 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] ${compact ? 'h-9 px-3' : 'h-[42px] px-4'} ${byChapters ? 'pointer-events-none opacity-40' : ''}`}>
-                    <div className="flex min-w-0 flex-1 items-center">
-                      <AnimatePresence mode="wait" initial={false}>
-                        {useRange ? (
-                          <motion.div
-                            key="range"
-                            initial={{ opacity: 0 }}
-                            animate={{ opacity: 1 }}
-                            exit={{ opacity: 0 }}
-                            transition={{ duration: 0.16 }}
-                            className="grid h-7 w-full min-w-0 grid-cols-[1fr_auto_1fr] items-center rounded-[8px] bg-[var(--sunken)] p-[3px] ring-1 ring-inset ring-[var(--border)]"
-                          >
-                            <RangeInput value={start} onChange={setStart} ariaLabel="Start time" />
-                            <span className="h-3 w-px shrink-0 bg-[var(--border)]" />
-                            <RangeInput value={end} onChange={setEnd} ariaLabel="End time" />
-                          </motion.div>
-                        ) : (
-                          <motion.span
-                            key="label"
-                            initial={{ opacity: 0 }}
-                            animate={{ opacity: 1 }}
-                            exit={{ opacity: 0 }}
-                            transition={{ duration: 0.14 }}
-                            className="text-sm font-medium"
-                          >
-                            Trim a specific range
-                          </motion.span>
-                        )}
-                      </AnimatePresence>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setUseRange((v) => !v)}
-                      aria-label="Toggle trim range"
-                      className="inline-flex shrink-0 appearance-none items-center border-0 bg-transparent p-0"
-                    >
-                      <Switch on={useRange} />
-                    </button>
-                  </div>
-                )}
-
-              </div>
-
-              {/* Output + download pinned to bottom */}
-              <div className={`flex shrink-0 flex-col ${compact ? 'mt-auto gap-2' : 'gap-3'}`}>
-                <div>
-                  <SectionLabel compact={compact}>Output folder</SectionLabel>
-                  <div className={`flex items-center gap-2 rounded-[10px] px-3 ${compact ? 'py-1.5' : 'py-2'} ${spec ? 'border border-[var(--border)] bg-[var(--sunken)]' : 'glass-soft rounded-2xl'}`}>
-                    <FolderOpen size={15} className="shrink-0 text-text-secondary" />
-                    <input
-                      readOnly
-                      value={outputFolder}
-                      className={`flex-1 truncate bg-transparent focus:outline-none ${spec ? 'font-mono text-[12px] text-[var(--text)] opacity-80' : 'text-sm text-text-secondary'}`}
-                    />
-                    <button
-                      onClick={handleChangeFolder}
-                      className={`px-3 py-1.5 text-[12px] font-medium ${spec
-                        ? 'rounded-[7px] border border-[var(--border)] bg-[var(--control)] text-[var(--text)]'
-                        : 'rounded-xl border border-white/10 bg-white/5 text-xs text-text-secondary transition-colors hover:border-white/20 hover:text-text-primary'
-                        }`}
-                    >
-                      Change
-                    </button>
-                  </div>
-                </div>
-
-                {busy ? (
-                  <div className="flex gap-2">
-                    {canStart ? (
-                      <motion.button
-                        whileTap={{ scale: 0.985 }}
-                        onClick={handleDownload}
-                        className={`flex flex-1 items-center justify-center gap-2 rounded-[8px] bg-accent-gradient font-bold tracking-wide text-[var(--on-accent)] transition-[filter] hover:brightness-110 ${compact ? 'h-10 text-[13px]' : 'h-[46px] text-[15px]'}`}
-                      >
-                        <ListPlus size={16} />
-                        <span>Add to queue</span>
-                      </motion.button>
-                    ) : (
-                      <div className={`glass-soft flex flex-1 items-center justify-center gap-2 rounded-2xl text-sm font-bold tracking-wide text-text-secondary ${compact ? 'h-10' : 'h-[46px]'}`}>
-                        <Loader2 size={16} className="animate-spin" />
-                        {downloading ? 'DOWNLOADING…' : 'WAITING…'}
-                      </div>
-                    )}
-                    {queue.length > 0 && (
-                      <QueueMenu
-                        queue={queue}
-                        current={downloading ? { label: dlUi?.label, progress } : null}
-                        compact={compact}
-                        onRemove={removeQueued}
-                        onClear={clearQueue}
-                      />
-                    )}
-                    <button
-                      onClick={handleStop}
-                      disabled={stopping}
-                      title={queue.length ? 'Stops the current download; the queue continues' : undefined}
-                      className={`flex items-center justify-center gap-2 rounded-[10px] border px-5 text-sm font-medium ${compact ? 'h-10' : 'h-[46px]'} ${stopping
-                        ? 'cursor-not-allowed border-[var(--border)] bg-[var(--sunken)] text-[var(--text-faint)]'
-                        : 'border-[var(--border)] bg-[var(--surface)] text-[var(--text-dim)] hover:border-error/60 hover:text-error'
-                        }`}
-                    >
-                    <Square size={13} />
-                      {stopping ? 'Stopping…' : 'Stop'}
-                    </button>
-                  </div>
-                ) : (
-                  <motion.button
-                    whileTap={canDownload ? { scale: 0.985 } : {}}
-                    onClick={handleDownload}
-                    disabled={!canDownload}
-                    className={`flex w-full items-center justify-center gap-2 rounded-[8px] font-bold tracking-wide transition-[filter] ${compact ? 'h-10 text-[13px]' : 'h-[46px] text-[15px]'} ${canDownload
-                      ? 'bg-accent-gradient text-[var(--on-accent)] hover:brightness-110'
-                      : 'glass-soft cursor-not-allowed text-text-muted'
-                      }`}
-                  >
-                    <Download size={16} />
-                    <span>{downloadLabel}</span>
-                  </motion.button>
-                )}
-              </div>
-            </div>
-
-            {/* RIGHT — preview */}
-            <div className={`flex min-h-0 flex-col overflow-hidden ${compact ? 'p-2.5' : 'p-5'} ${spec ? 'rounded-[12px] bg-[var(--panel)] ring-1 ring-[var(--border)]' : 'rounded-2xl glass'}`}>
-              <div className={`flex h-8 shrink-0 items-center justify-between ${compact ? 'mb-2' : 'mb-3'}`}>
-                <SectionLabel className="mt-2 flex h-full items-center leading-none">Preview</SectionLabel>
-                <div className={`flex h-full items-center p-[3px] text-[12px] font-medium ${spec
-                  ? 'rounded-[8px] border border-[var(--border)] bg-[var(--sunken)]'
-                  : 'rounded-full border border-white/10 bg-white/5 text-[11px]'
-                  }`}>
-                  <ModeTab spec={spec} active={mode === 'single'} onClick={() => setMode('single')}>
-                    {isSc ? 'Track' : 'Single video'}
-                  </ModeTab>
-                  <ModeTab spec={spec} active={mode === 'playlist'} onClick={() => setMode('playlist')}>
-                    Playlist
-                  </ModeTab>
-                </div>
-              </div>
-
-              <AnimatePresence mode="wait" initial={false}>
-                {mode === 'single' ? (
-                  <motion.div
-                    key="single"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    transition={{ duration: 0.2 }}
-                    className="flex min-h-0 flex-1 flex-col"
-                  >
-                    <SinglePreview
-                      info={videoInfo}
-                      loading={previewLoading}
-                      error={previewError}
-                      empty={urlState === null}
-                      soundcloud={isSc}
-                      compact={compact}
-                      clipSecs={clipSecs}
-                      sizeLabel={
-                        clipSecs || videoInfo?.duration
-                          ? `~${singleSizeLabel(clipSecs || videoInfo.duration)} ${formatLabel}`
-                          : null
-                      }
-                    />
-                  </motion.div>
-                ) : (
-                  <motion.div
-                    key="playlist"
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0 }}
-                    transition={{ duration: 0.2 }}
-                    className="flex min-h-0 flex-1 flex-col"
-                  >
-                    <PlaylistPreview
-                      info={playlistInfo}
-                      loading={previewLoading}
-                      error={previewError}
-                      empty={urlState === null}
-                      selected={selected}
-                      onToggle={toggleTrack}
-                      onSelectAll={selectAll}
-                      onDeselectAll={deselectAll}
-                      totalSecs={totalSecs}
-                      selectedSecs={selectedSecs}
-                      sizeLabel={`~${estSizeLabel(selectedSecs)} ${formatLabel}`}
-                      soundcloud={isSc}
-                      compact={compact}
-                    />
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
-          </div>
-
-          {/* Same columns as the content above: the text sits under the
-              controls and the bar starts exactly where the Preview panel does. */}
-          <div
-            className={`grid shrink-0 items-center ${compact ? 'mt-1 grid-cols-2 gap-2' : 'mt-2 grid-cols-[462px_minmax(0,1fr)] gap-[22px]'}`}
-          >
-            <span
-              title={statusText}
-              className="min-w-0 truncate font-mono text-[11px] tabular-nums text-[var(--text-faint)]"
-            >
-              {/* "·" separators in the theme's accent color. */}
-              {statusText.split(' · ').map((part, i) => (
-                <Fragment key={i}>
-                  {i > 0 && <span className="text-[var(--accent)]"> · </span>}
-                  {part}
-                </Fragment>
-              ))}
-            </span>
-            <div className="relative min-w-0">
-              <div className={`overflow-hidden rounded-full ${spec ? 'h-[3px] bg-[var(--border)]' : 'h-1.5 bg-white/10'}`}>
-                <motion.div
-                  className="h-full rounded-full bg-accent-gradient"
-                  animate={{ width: `${downloading ? Math.max(progress, 2) : 0}%` }}
-                  transition={{ ease: 'linear', duration: 0.2 }}
-                />
-              </div>
-              <span className="pointer-events-none absolute right-0 top-1/2 w-[calc(4ch+0.75rem)] -translate-y-1/2 bg-base pl-3 text-right font-mono text-[11px] tabular-nums text-[var(--text-faint)]">
-                {Math.floor(downloading ? progress : 0)}%
-              </span>
-            </div>
-          </div>
-        </div>
+      <div className="main">
+        {mode === 'empty' ? <EmptyState onExample={() => readLink(EXAMPLE_PLAYLIST)} /> : null}
+        {mode === 'fetching' ? <Reading /> : null}
+        {mode === 'error' && ed.err ? (
+          <ErrorCard
+            err={ed.err}
+            onRetry={() => readLink(ed.url)}
+            onProxy={() => openSettings(true)}
+            onCopy={async () => {
+              try {
+                await navigator.clipboard.writeText(`${ed.err.raw}\nLink: ${ed.url}\nEvroHQ Downloader ${version}`)
+                toastMsg('info', 'Error log copied')
+              } catch {
+                toastMsg('error', 'Couldn’t copy the error log.')
+              }
+            }}
+          />
+        ) : null}
+        {singleView ? <SingleView v={singleView} /> : null}
+        {listView ? <ListView v={listView} /> : null}
       </div>
 
-      <div className={`app-footer relative z-10 flex shrink-0 items-center justify-between bg-[var(--footer)] ${compact ? 'px-3 py-1.5' : 'px-5 py-2'}`}>
-        <p className="font-sans text-[12px] text-[var(--text-dim)]">
-          {spec ? 'made by ' : 'Made by '}
-          <a
-            href="https://github.com/EvroHQ"
-            target="_blank"
-            rel="noopener noreferrer"
-            onClick={() => window.api?.trackLink('madeby')}
-            className="font-medium text-accentMid transition-opacity hover:opacity-80"
-          >
-            @EvroHQ
-          </a>
-        </p>
-        <div className="flex min-w-0 items-center gap-1 font-sans text-[12px] leading-none text-[var(--text-dim)]">
-          <span>If this helped,</span>
-          <a
-            href="https://github.com/EvroHQ/EvroHQ-Downloader"
-            target="_blank"
-            rel="noopener noreferrer"
-            onClick={() => window.api?.trackLink('star')}
-            className="inline-flex items-center gap-1 font-medium text-accentMid transition-opacity hover:opacity-80"
-          >
-            <Star size={11} strokeWidth={2.2} />
-            star it on GitHub
-          </a>
-          <span>or</span>
-          <a
-            href="https://buymeacoffee.com/evrohq"
-            target="_blank"
-            rel="noopener noreferrer"
-            onClick={() => window.api?.trackLink('coffee')}
-            className="inline-flex items-center gap-1 font-medium text-accentMid transition-opacity hover:opacity-80"
-          >
-            <Coffee size={11} strokeWidth={2.2} />
-            buy me a coffee
-          </a>
-        </div>
-      </div>
-
-      {aboutOpen && (
-        <AboutModal version={version} onClose={() => setAboutOpen(false)} />
-      )}
-
-      {proxyOpen && (
-        <ProxyModal
-          initial={proxy}
-          onClose={() => setProxyOpen(false)}
-          onSaved={(p) => {
-            setProxy(p)
-            toast.success(p.enabled ? `Proxy on · ${proxySummary(p)}` : 'Proxy off')
+      {pop || qOpen ? (
+        <div
+          className="scrim-pop"
+          onClick={() => {
+            setPop(null)
+            setQOpen(false)
           }}
-        />
-      )}
-
-      {whatsNew ? (
-        <WhatsNewModal
-          version={seenVersionRef.current || version}
-          items={whatsNew.items}
-          onDismiss={dismissWhatsNew}
         />
       ) : null}
 
-      <Toaster
-        theme={LIGHT_THEMES.has(theme) ? 'light' : 'dark'}
-        position="top-center"
-        offset={16}
-        duration={2000}
-        gap={8}
-        visibleToasts={3}
-        icons={{
-          success: <CheckCircle2 size={16} strokeWidth={2.4} />,
-          error: <XCircle size={16} strokeWidth={2.4} />,
-          info: <Info size={16} strokeWidth={2.4} />,
-          warning: <AlertTriangle size={16} strokeWidth={2.4} />,
-          loading: <Loader2 size={16} strokeWidth={2.4} className="animate-spin" />
-        }}
-        toastOptions={{
-          classNames: {
-            toast: 'app-toast',
-            title: 'app-toast-title',
-            icon: 'app-toast-icon',
-            success: 'app-toast--success',
-            error: 'app-toast--error',
-            info: 'app-toast--info',
-            warning: 'app-toast--warning',
-            loading: 'app-toast--loading'
-          }
-        }}
-      />
-    </div>
-  )
-}
-
-/* -------------------------------------------------------------------------- */
-/*  Preview panels                                                            */
-/* -------------------------------------------------------------------------- */
-
-function PreviewMessage({ icon, children, spinning }) {
-  return (
-    <div className="flex flex-1 flex-col items-center justify-center gap-3 text-center text-text-muted">
-      {spinning ? <Loader2 size={26} className="animate-spin opacity-60" /> : icon}
-      <p className="text-sm font-medium">{children}</p>
-    </div>
-  )
-}
-
-function SinglePreview({ info, loading, error, empty, sizeLabel, clipSecs, soundcloud, compact }) {
-  const [artBroken, setArtBroken] = useState(false)
-  const sc = soundcloud || info?.source === 'soundcloud'
-  useEffect(() => {
-    setArtBroken(false)
-  }, [info?.thumbnail])
-
-  if (empty) {
-    return (
-      <PreviewMessage icon={<Film size={28} className="opacity-50" />}>
-        Paste a YouTube or SoundCloud link to preview
-      </PreviewMessage>
-    )
-  }
-  if (loading && !info) {
-    return <PreviewMessage spinning>{sc ? 'Fetching track details…' : 'Fetching video details…'}</PreviewMessage>
-  }
-  if (!info) {
-    return (
-      <PreviewMessage icon={<Film size={28} className="opacity-50" />}>
-        {error || 'No preview available'}
-      </PreviewMessage>
-    )
-  }
-  const meta = sc
-    ? [info.channel, formatCount(info.views) && `${formatCount(info.views)} plays`].filter(Boolean).join(' · ')
-    : [info.channel, formatCount(info.views) && `${formatCount(info.views)} views`, relativeDate(info.uploadDate)]
-      .filter(Boolean)
-      .join(' · ')
-  return (
-    <div className="flex min-h-0 flex-1 flex-col">
-      <div className={`striped relative flex aspect-video w-full items-center justify-center overflow-hidden rounded-xl ring-1 ring-white/10 ${compact ? 'mt-1' : 'mt-[22px]'}`}>
-        {info.thumbnail && !artBroken ? (
-          <img
-            src={info.thumbnail}
-            alt=""
-            className="h-full w-full object-cover"
-            draggable={false}
-            onError={() => setArtBroken(true)}
-          />
-        ) : (
-          <span className="font-mono text-[11px] uppercase tracking-[0.2em] text-white/25">
-            {sc ? 'Artwork' : 'Video thumbnail'}
-          </span>
-        )}
-        {info.duration != null && (
-          <span className="absolute bottom-2 right-2 rounded-md bg-black/70 px-1.5 py-0.5 font-mono text-[11px] text-white/80">
-            {fmtClock(info.duration)}
-          </span>
-        )}
-      </div>
-      <h2 className="mt-3 line-clamp-2 text-[15px] font-semibold leading-snug text-text-primary">
-        {info.title || (sc ? 'Untitled track' : 'Untitled video')}
-      </h2>
-      {meta && <p className={`mt-1 ${sc ? 'text-[13px]' : 'text-[12px]'} text-text-secondary`}>{meta}</p>}
-      {sc && info.genre && (
-        <span className="mt-2 w-fit rounded-full border border-[var(--border)] px-2 py-0.5 text-[11px] text-text-muted">
-          {info.genre}
-        </span>
-      )}
-      <div className={`mt-auto flex items-center justify-between border-t border-[var(--border)] bg-[var(--panel-footer)] font-mono text-[12px] ${compact ? '-mx-3 -mb-3 px-3 py-3' : '-mx-5 -mb-5 px-5 py-3'}`}>
-        <span className="text-[var(--text-dim)]">
-          {clipSecs
-            ? `Selection · ${clipSecs < 60 ? `${Math.round(clipSecs)}s` : fmtLong(clipSecs)}` +
-              (info.duration != null ? ` of ${fmtLong(info.duration)}` : '')
-            : info.duration != null
-              ? `Full length · ${fmtLong(info.duration)}`
-              : 'Length unknown'}
-        </span>
-        {sizeLabel && <span className="size-estimate">{sizeLabel}</span>}
-      </div>
-    </div>
-  )
-}
-
-function PlaylistPreview({
-  info,
-  loading,
-  error,
-  empty,
-  selected,
-  onToggle,
-  onSelectAll,
-  onDeselectAll,
-  totalSecs,
-  selectedSecs,
-  sizeLabel,
-  soundcloud,
-  compact
-}) {
-  if (empty) {
-    return (
-      <PreviewMessage icon={<Film size={28} className="opacity-50" />}>
-        Paste a playlist link to preview
-      </PreviewMessage>
-    )
-  }
-  if (loading && !info) {
-    return <PreviewMessage spinning>Fetching playlist…</PreviewMessage>
-  }
-  if (!info) {
-    return (
-      <PreviewMessage icon={<Film size={28} className="opacity-50" />}>
-        {error || 'No playlist preview available'}
-      </PreviewMessage>
-    )
-  }
-  const tracks = info.tracks
-  const protectedCount = tracks.filter((t) => t.protected).length
-  return (
-    <div className={`flex min-h-0 flex-1 flex-col ${compact ? 'mt-1' : 'mt-[22px]'}`}>
-      <div className="mb-2.5 flex shrink-0 items-center gap-3">
-        {info.cover ? (
-          <img
-            src={info.cover}
-            alt=""
-            draggable={false}
-            className="h-10 w-14 shrink-0 rounded-md object-cover ring-1 ring-white/10"
-          />
-        ) : (
-          <div className="striped h-10 w-14 shrink-0 rounded-md ring-1 ring-white/10" />
-        )}
-        <div className="min-w-0 flex-1">
-          <h2 className="truncate text-[15px] font-semibold leading-tight text-text-primary">{info.title}</h2>
-          {info.artist && (
-            <p className="mt-0.5 truncate text-[13px] leading-tight text-text-secondary">{info.artist}</p>
-          )}
-          <p className="mt-0.5 text-[12px] leading-tight text-text-secondary">
-            {tracks.length} tracks
-            {totalSecs > 0 ? ` · ${fmtLong(totalSecs)}` : ''}
-            {soundcloud && info.plays > 0 ? ` · ${formatCount(info.plays)} plays` : ''}
-            {protectedCount > 0 ? ` · ${protectedCount} DRM` : ''}
-          </p>
+      <div className="dock">
+        <div className="dock-left" style={{ opacity: dockDim ? 0.45 : 1 }}>
+          <div className="dock-label">{dockLabel}</div>
+          <Sentence segs={segs} />
+          {moreView ? <MoreOptions m={moreView} /> : null}
         </div>
-        <div className="flex shrink-0 gap-1.5">
-          <GhostBtn onClick={onSelectAll}>Select all</GhostBtn>
-          <GhostBtn onClick={onDeselectAll}>Deselect all</GhostBtn>
-        </div>
-      </div>
-
-      <div className={`list-scroll min-h-0 flex-1 overflow-y-auto pr-3 ${compact ? '-mr-3' : '-mr-5'}`}>
-        <div className="divide-y divide-[var(--border)] border-t border-[var(--border)]">
-          {tracks.map((t, i) => {
-            const locked = !!t.protected
-            const checked = !locked && selected.has(t.id)
-            return (
-              <button
-                key={t.id}
-                onClick={() => onToggle(t.id)}
-                className="track-row flex w-full items-center gap-2.5 px-2 py-2.5 text-left"
-                style={{ opacity: locked ? 0.55 : checked ? 1 : 0.45 }}
-              >
-                <span
-                  className={`track-check grid h-[18px] w-[18px] shrink-0 place-items-center rounded-[5px] ${checked ? 'is-checked' : ''
-                    }`}
-                >
-                  {locked ? (
-                    <Lock size={10} className="text-[var(--text-faint)]" strokeWidth={2.5} />
-                  ) : (
-                    checked && <Check size={12} className="track-check-mark" strokeWidth={3} />
-                  )}
-                </span>
-                <span className="w-5 shrink-0 text-right font-mono text-[11px] tabular-nums text-[var(--text-faint)]">
-                  {pad2(i + 1)}
-                </span>
-                {t.thumbnail ? (
-                  <img
-                    src={t.thumbnail}
-                    alt=""
-                    draggable={false}
-                    className="h-7 w-11 shrink-0 rounded object-cover ring-1 ring-[var(--border)]"
-                  />
-                ) : (
-                  <span className="striped h-7 w-11 shrink-0 rounded ring-1 ring-[var(--border)]" />
-                )}
-                <span className="min-w-0 flex-1 truncate text-[13px] text-[var(--text)]">
-                  {t.title}
-                </span>
-                {locked ? (
-                  <span className="shrink-0 font-mono text-[10px] text-[var(--text-faint)]">DRM</span>
-                ) : null}
-                {soundcloud ? (
-                  <span className="w-11 shrink-0 text-right font-mono text-[11px] tabular-nums text-[var(--text-faint)]">
-                    {t.plays != null ? formatCount(t.plays) : '—'}
-                  </span>
-                ) : null}
-                <span className="min-w-10 shrink-0 text-right font-mono text-[12px] tabular-nums text-[var(--text-dim)]">
-                  {t.duration != null ? fmtClock(t.duration) : '—'}
-                </span>
-              </button>
-            )
-          })}
-        </div>
-      </div>
-
-      {/* Footer */}
-      <div className={`mt-auto flex shrink-0 items-center justify-between border-t border-[var(--border)] bg-[var(--panel-footer)] font-mono text-[12px] ${compact ? '-mx-3 -mb-3 px-3 py-3' : '-mx-5 -mb-5 px-5 py-3'}`}>
-        <span className="text-[var(--text-dim)]">
-          {selected.size} of {tracks.length} selected{selectedSecs > 0 ? ` · ${fmtLong(selectedSecs)}` : ''}
-        </span>
-        <span className="size-estimate">{sizeLabel}</span>
-      </div>
-    </div>
-  )
-}
-
-/* -------------------------------------------------------------------------- */
-/*  Small building blocks                                                     */
-/* -------------------------------------------------------------------------- */
-
-function WhatsNewModal({ version, items, onDismiss }) {
-  const [armed, setArmed] = useState(false)
-  const downOnBtn = useRef(false)
-  const dialogRef = useRef(null)
-
-  useEffect(() => {
-    dialogRef.current?.focus()
-    const t = window.setTimeout(() => setArmed(true), 1800)
-    return () => window.clearTimeout(t)
-  }, [])
-
-  useEffect(() => {
-    if (!armed) return
-    const onKey = (e) => {
-      if (e.key === 'Escape') onDismiss()
-    }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [armed, onDismiss])
-
-  const overlay = (
-    <div
-      className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 p-6 backdrop-blur-[4px]"
-      onPointerDown={(e) => {
-        e.preventDefault()
-        downOnBtn.current = false
-      }}
-    >
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="whats-new-title"
-        tabIndex={-1}
-        onPointerDown={(e) => e.stopPropagation()}
-        className="flex max-h-full w-full max-w-[400px] flex-col rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.45)] outline-none"
-      >
-        <div className="flex items-start gap-3">
-          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-accent-gradient shadow-glow">
-            <Sparkles size={16} className="text-[var(--on-accent)]" />
-          </span>
-          <div className="min-w-0 pt-0.5">
-            <h2 id="whats-new-title" className="text-[15px] font-semibold leading-tight text-text-primary">
-              What’s new
-            </h2>
-            {version && (
-              <p className="mt-0.5 text-[12px] text-[var(--text-dim)]">Version {version}</p>
-            )}
+        <div className="dock-right">
+          <div className="sizeline">
+            <span>{sizeL}</span>
+            <b>{sizeR}</b>
           </div>
-        </div>
-        <ul className="mt-4 flex min-h-0 flex-col gap-3 overflow-y-auto">
-          {items.map((item) => (
-            <li key={item.title} className="rounded-xl border border-[var(--border)] bg-[var(--sunken)] px-3.5 py-3">
-              <p className="text-[13px] font-semibold text-text-primary">{item.title}</p>
-              <p className="mt-1 text-[12px] leading-relaxed text-text-secondary">{item.body}</p>
-            </li>
-          ))}
-        </ul>
-        <button
-          type="button"
-          tabIndex={armed ? 0 : -1}
-          disabled={!armed}
-          onPointerDown={(e) => {
-            e.stopPropagation()
-            downOnBtn.current = armed && e.button === 0
-          }}
-          onPointerUp={(e) => {
-            e.stopPropagation()
-            if (!armed || !downOnBtn.current || e.button !== 0) return
-            downOnBtn.current = false
-            onDismiss()
-          }}
-          className="mt-4 h-[38px] w-full shrink-0 rounded-[10px] bg-accent-gradient text-[13px] font-semibold text-[var(--on-accent)] shadow-glow transition-[filter] hover:brightness-110 disabled:opacity-60 disabled:pointer-events-none"
-        >
-          Got it
-        </button>
-      </div>
-    </div>
-  )
-
-  return createPortal(overlay, document.body)
-}
-
-/* -------------------------------------------------------------------------- */
-/*  Proxy                                                                     */
-/* -------------------------------------------------------------------------- */
-
-const PROXY_TYPE_LABEL = { socks5: 'SOCKS5', socks4: 'SOCKS4', http: 'HTTP' }
-
-function proxySummary(p) {
-  if (!p) return ''
-  const host = String(p.host || '').includes(':') ? `[${p.host}]` : p.host
-  return `${PROXY_TYPE_LABEL[p.type] || 'SOCKS5'} ${host}:${p.port}`
-}
-
-function proxyHostError(host) {
-  const h = String(host || '').trim()
-  if (!h) return 'Enter the proxy address'
-  if (!/^\[?[A-Za-z0-9.\-:]+\]?$/.test(h)) return 'Not a valid address'
-  return null
-}
-
-function proxyPortError(port) {
-  const s = String(port || '').trim()
-  if (!s) return 'Enter the port'
-  const n = Number(s)
-  if (!/^\d+$/.test(s) || n < 1 || n > 65535) return '1 – 65535'
-  return null
-}
-
-// Parse a pasted proxy like "socks5://user:pass@127.0.0.1:1080" or "1.2.3.4:8080".
-function parseProxyString(raw) {
-  const s = String(raw || '').trim()
-  const m = s.match(
-    /^(?:(socks5h?|socks4a?|https?):\/\/)?(?:([^:@\s/]*)(?::([^@\s/]*))?@)?(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):(\d{1,5})\/?$/i
-  )
-  if (!m) return null
-  const scheme = (m[1] || '').toLowerCase()
-  const decode = (v) => {
-    try {
-      return decodeURIComponent(v || '')
-    } catch (e) {
-      return v || ''
-    }
-  }
-  return {
-    type: scheme.startsWith('socks4') ? 'socks4' : scheme.startsWith('http') ? 'http' : scheme ? 'socks5' : null,
-    host: m[4].replace(/^\[|\]$/g, ''),
-    port: m[5],
-    username: decode(m[2]),
-    password: decode(m[3])
-  }
-}
-
-function ProxyField({ label, error, className = '', children }) {
-  return (
-    <label className={`flex min-w-0 flex-col gap-1 ${className}`}>
-      <span className="text-[11px] font-medium text-[var(--text-dim)]">{label}</span>
-      {children}
-      {error ? <span className="text-[11px] text-red-400">{error}</span> : null}
-    </label>
-  )
-}
-
-const proxyInputClass = (invalid) =>
-  `h-9 w-full min-w-0 rounded-[10px] border bg-[var(--sunken)] px-3 font-mono text-[12px] text-[var(--text)] outline-none transition-colors placeholder:text-[var(--text-faint)] focus:border-[var(--border-strong)] ${invalid ? 'border-red-500/60' : 'border-[var(--border)]'
-  }`
-
-function ProxyModal({ initial, onClose, onSaved }) {
-  const [enabled, setEnabled] = useState(Boolean(initial?.enabled))
-  const [type, setType] = useState(initial?.type || 'socks5')
-  const [host, setHost] = useState(initial?.host || '')
-  const [port, setPort] = useState(initial?.port ? String(initial.port) : '1080')
-  const [username, setUsername] = useState(initial?.username || '')
-  const [password, setPassword] = useState(initial?.password || '')
-  const [authOpen, setAuthOpen] = useState(Boolean(initial?.username))
-  const [showPass, setShowPass] = useState(false)
-  const [touched, setTouched] = useState({})
-  const [test, setTest] = useState(null)
-  const [saving, setSaving] = useState(false)
-  const [saveError, setSaveError] = useState('')
-  const dialogRef = useRef(null)
-
-  useEffect(() => {
-    dialogRef.current?.focus()
-    const onKey = (e) => {
-      if (e.key === 'Escape') onClose()
-    }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [onClose])
-
-  // Any edit makes an earlier test result stale.
-  useEffect(() => {
-    setTest(null)
-    setSaveError('')
-  }, [type, host, port, username, password, enabled])
-
-  const hostErr = proxyHostError(host)
-  const portErr = proxyPortError(port)
-  const invalid = Boolean(hostErr || portErr)
-  const canAuth = type !== 'socks4'
-
-  const payload = () => ({
-    enabled,
-    type,
-    host: host.trim().replace(/^\[|\]$/g, ''),
-    port: Number(port),
-    username: canAuth ? username : '',
-    password: canAuth ? password : ''
-  })
-
-  const onHostPaste = (e) => {
-    const parsed = parseProxyString(e.clipboardData.getData('text'))
-    if (!parsed) return
-    e.preventDefault()
-    if (parsed.type) setType(parsed.type)
-    setHost(parsed.host)
-    setPort(parsed.port)
-    if (parsed.username) {
-      setUsername(parsed.username)
-      setPassword(parsed.password)
-      setAuthOpen(true)
-    }
-  }
-
-  const runTest = async () => {
-    setTouched({ host: true, port: true })
-    if (invalid) return
-    setTest({ state: 'running' })
-    try {
-      const res = await window.api.testProxy(payload())
-      setTest(res?.ok ? { state: 'ok', ms: res.ms } : { state: 'fail', msg: res?.error || 'Test failed.' })
-    } catch (e) {
-      setTest({ state: 'fail', msg: e?.message || 'Test failed.' })
-    }
-  }
-
-  const save = async () => {
-    if (enabled && invalid) {
-      setTouched({ host: true, port: true })
-      return
-    }
-    setSaving(true)
-    try {
-      const res = await window.api.setProxy(payload())
-      if (res?.ok) {
-        onSaved(res.proxy)
-        onClose()
-      } else {
-        setSaveError(res?.error || 'Could not save.')
-      }
-    } catch (e) {
-      setSaveError(e?.message || 'Could not save.')
-    } finally {
-      setSaving(false)
-    }
-  }
-
-  const overlay = (
-    <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 p-6 backdrop-blur-[4px]">
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="proxy-title"
-        tabIndex={-1}
-        className="flex max-h-full w-full max-w-[400px] flex-col rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.45)] outline-none"
-      >
-        <div className="flex shrink-0 items-start gap-3">
-          <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-accent-gradient shadow-glow">
-            <span
-              aria-hidden="true"
-              className="h-5 w-5 bg-[var(--on-accent)]"
-              style={{
-                WebkitMask: `url(${proxyIconUrl}) center / contain no-repeat`,
-                mask: `url(${proxyIconUrl}) center / contain no-repeat`
-              }}
-            />
-          </span>
-          <div className="min-w-0 pt-0.5">
-            <h2 id="proxy-title" className="text-[15px] font-semibold leading-tight text-text-primary">
-              Proxy
-            </h2>
-            <p className="mt-0.5 text-[12px] text-[var(--text-dim)]">Route downloads through a SOCKS or HTTP proxy</p>
-          </div>
-        </div>
-
-        <div className="mt-4 flex min-h-0 flex-col gap-3 overflow-y-auto">
-          <SwitchRow label="Use a proxy" on={enabled} onToggle={() => setEnabled((v) => !v)} ariaLabel="Use a proxy" />
-
-          <div className={`flex flex-col gap-3 transition-opacity ${enabled ? '' : 'pointer-events-none opacity-40'}`}>
-            <div className="flex rounded-[8px] border border-[var(--border)] bg-[var(--sunken)] p-[3px]">
-              {['socks5', 'socks4', 'http'].map((t) => (
-                <Pill key={t} spec group="proxy-type" active={type === t} onClick={() => setType(t)}>
-                  {PROXY_TYPE_LABEL[t]}
-                </Pill>
-              ))}
-            </div>
-
-            <div className="flex gap-2">
-              <ProxyField label="Address" error={touched.host && hostErr} className="flex-1">
-                <input
-                  value={host}
-                  onChange={(e) => setHost(e.target.value)}
-                  onPaste={onHostPaste}
-                  onBlur={() => setTouched((t) => ({ ...t, host: true }))}
-                  placeholder="127.0.0.1"
-                  spellCheck={false}
-                  className={proxyInputClass(touched.host && hostErr)}
-                />
-              </ProxyField>
-              <ProxyField label="Port" error={touched.port && portErr} className="w-[88px] shrink-0">
-                <input
-                  value={port}
-                  onChange={(e) => setPort(e.target.value.replace(/\D/g, '').slice(0, 5))}
-                  onBlur={() => setTouched((t) => ({ ...t, port: true }))}
-                  inputMode="numeric"
-                  placeholder="1080"
-                  className={proxyInputClass(touched.port && portErr)}
-                />
-              </ProxyField>
-            </div>
-
-            {/* SOCKS4 has no login: hidden but still taking its space, so
-                switching type never changes the dialog height. */}
-            <div
-              aria-hidden={!canAuth || undefined}
-              className={`rounded-[10px] border border-[var(--border)] bg-[var(--sunken)] ${canAuth ? '' : 'invisible'}`}
-            >
-                <button
-                  type="button"
-                  onClick={() => setAuthOpen((v) => !v)}
-                  className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-[12px] font-medium text-[var(--text-dim)] transition-colors hover:text-[var(--text)]"
-                >
-                  <ChevronRight size={13} className={`transition-transform ${authOpen ? 'rotate-90' : ''}`} />
-                  Authentication
-                  <span className="font-normal text-[var(--text-faint)]">(optional)</span>
-                </button>
-                {authOpen && (
-                  <div className="flex flex-col gap-2 px-3 pb-3">
-                   <fieldset disabled={!canAuth} className="m-0 flex min-w-0 flex-col gap-2 border-0 p-0">
-                    <ProxyField label="Username">
-                      <input
-                        value={username}
-                        onChange={(e) => setUsername(e.target.value)}
-                        spellCheck={false}
-                        autoComplete="off"
-                        className={proxyInputClass(false)}
-                      />
-                    </ProxyField>
-                    <ProxyField label="Password">
-                      <div className="relative">
-                        <input
-                          type={showPass ? 'text' : 'password'}
-                          value={password}
-                          onChange={(e) => setPassword(e.target.value)}
-                          autoComplete="off"
-                          className={`${proxyInputClass(false)} pr-9`}
-                        />
-                        <button
-                          type="button"
-                          onClick={() => setShowPass((v) => !v)}
-                          aria-label={showPass ? 'Hide password' : 'Show password'}
-                          className="absolute right-1 top-1/2 grid h-7 w-7 -translate-y-1/2 place-items-center rounded-md text-[var(--text-dim)] hover:text-[var(--text)]"
-                        >
-                          {showPass ? <EyeOff size={14} /> : <Eye size={14} />}
-                        </button>
-                      </div>
-                    </ProxyField>
-                   </fieldset>
-                    <p className="min-h-[36px] text-[11px] leading-relaxed text-[var(--text-faint)]">
-                      {type !== 'http'
-                        ? 'The login is used for downloads. App and yt-dlp updates connect directly.'
-                        : 'The login is used for downloads and app updates.'}
-                    </p>
-                  </div>
-                )}
-            </div>
-
-            <div className="flex min-h-[32px] items-center gap-3">
+          <div className="btnrow">
+            {showChip ? (
               <button
                 type="button"
-                onClick={runTest}
-                disabled={test?.state === 'running'}
-                className="inline-flex h-8 shrink-0 items-center gap-1.5 rounded-[8px] border border-[var(--border)] bg-[var(--control)] px-3 text-[12px] font-medium text-[var(--text)] transition-colors hover:border-[var(--border-strong)] disabled:opacity-60"
-              >
-                {test?.state === 'running' && <Loader2 size={13} className="animate-spin" />}
-                Test connection
-              </button>
-              {test?.state === 'ok' && (
-                <span className="inline-flex items-center gap-1 text-[12px] text-emerald-400">
-                  <CheckCircle2 size={14} /> Working · {test.ms} ms
-                </span>
-              )}
-              {test?.state === 'fail' && (
-                <span className="inline-flex min-w-0 items-start gap-1 text-[12px] leading-snug text-red-400">
-                  <XCircle size={14} className="mt-px shrink-0" /> {test.msg}
-                </span>
-              )}
-            </div>
-          </div>
-        </div>
-
-        {saveError ? <p className="mt-3 shrink-0 text-[12px] text-red-400">{saveError}</p> : null}
-
-        <div className="mt-4 flex shrink-0 gap-2">
-          <button
-            type="button"
-            onClick={onClose}
-            className="h-[38px] flex-1 rounded-[10px] border border-[var(--border)] bg-[var(--sunken)] text-[13px] font-medium text-[var(--text)] transition-colors hover:border-[var(--border-strong)]"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={save}
-            disabled={saving || (enabled && invalid)}
-            className="h-[38px] flex-1 rounded-[10px] bg-accent-gradient text-[13px] font-semibold text-[var(--on-accent)] shadow-glow transition-[filter] hover:brightness-110 disabled:opacity-50"
-          >
-            Save
-          </button>
-        </div>
-      </div>
-    </div>
-  )
-
-  return createPortal(overlay, document.body)
-}
-
-function AboutModal({ version, onClose }) {
-  const dialogRef = useRef(null)
-
-  useEffect(() => {
-    dialogRef.current?.focus()
-    const onKey = (e) => {
-      if (e.key === 'Escape') onClose()
-    }
-    document.addEventListener('keydown', onKey)
-    return () => document.removeEventListener('keydown', onKey)
-  }, [onClose])
-
-  const overlay = (
-    <div
-      className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 p-6 backdrop-blur-[4px]"
-      onPointerDown={onClose}
-    >
-      <div
-        ref={dialogRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="about-title"
-        tabIndex={-1}
-        onPointerDown={(e) => e.stopPropagation()}
-        className="w-full max-w-[420px] rounded-2xl border border-[var(--border)] bg-[var(--surface)] p-5 shadow-[0_24px_60px_rgba(0,0,0,0.45)] outline-none"
-      >
-        <div className="flex items-start gap-3">
-          <AppLogo />
-          <div className="min-w-0 pt-0.5">
-            <h2 id="about-title" className="text-[15px] font-semibold leading-tight text-text-primary">
-              About EvroHQ Downloader
-            </h2>
-            {version && (
-              <p className="mt-0.5 font-mono text-[12px] text-[var(--text-dim)]">v{version}</p>
-            )}
-          </div>
-        </div>
-
-        <div className="mt-4 flex flex-col gap-3">
-          <div className="rounded-xl border border-[var(--border)] bg-[var(--sunken)] px-3.5 py-3">
-            <p className="text-[13px] font-semibold text-text-primary">Who I am</p>
-            <p className="mt-1 text-[12px] leading-relaxed text-text-secondary">
-              I’m EvroHQ, a full-stack developer. I build web apps, desktop software, and other projects — and I keep this one free and open-source.
-            </p>
-          </div>
-          <div className="rounded-xl border border-[var(--border)] bg-[var(--sunken)] px-3.5 py-3">
-            <p className="text-[13px] font-semibold text-text-primary">This project</p>
-            <p className="mt-1 text-[12px] leading-relaxed text-text-secondary">
-              A free desktop app to download audio, video, or playlists from YouTube and SoundCloud. No ads, no account.
-            </p>
-          </div>
-          <div className="rounded-xl border border-[var(--border)] bg-[var(--sunken)] px-3.5 py-3">
-            <p className="text-[13px] font-semibold text-text-primary">Support</p>
-            <p className="mt-1 text-[12px] leading-relaxed text-text-secondary">
-              If the app helps you, a GitHub star or a coffee goes a long way. It helps cover certificates, updates, and keeping the project free.
-            </p>
-            <div className="mt-3 flex gap-2">
-              <a
-                href="https://github.com/EvroHQ/EvroHQ-Downloader"
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={() => window.api?.trackLink('star')}
-                className="inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-[10px] border border-[var(--border)] bg-[var(--control)] text-[12px] font-medium text-[var(--text)] transition-colors hover:border-[var(--border-strong)]"
-              >
-                <Star size={13} strokeWidth={2.2} />
-                Star on GitHub
-              </a>
-              <a
-                href="https://buymeacoffee.com/evrohq"
-                target="_blank"
-                rel="noopener noreferrer"
-                onClick={() => window.api?.trackLink('coffee')}
-                className="inline-flex h-9 flex-1 items-center justify-center gap-1.5 rounded-[10px] bg-accent-gradient text-[12px] font-semibold text-[var(--on-accent)] transition-[filter] hover:brightness-110"
-              >
-                <Coffee size={13} strokeWidth={2.2} />
-                Buy me a coffee
-              </a>
-            </div>
-          </div>
-        </div>
-
-        <button
-          type="button"
-          onClick={onClose}
-          className="mt-4 h-[38px] w-full rounded-[10px] border border-[var(--border)] bg-[var(--sunken)] text-[13px] font-medium text-[var(--text)] transition-colors hover:border-[var(--border-strong)]"
-        >
-          Close
-        </button>
-      </div>
-    </div>
-  )
-
-  return createPortal(overlay, document.body)
-}
-
-function UpdateBanner({ title, subtitle, actionLabel, onAction, busy, progress }) {
-  const showBar = typeof progress === 'number'
-  const pct = showBar ? Math.round(progress) : 0
-  return (
-    <motion.div
-      initial={{ opacity: 0, height: 0 }}
-      animate={{ opacity: 1, height: 'auto' }}
-      exit={{ opacity: 0, height: 0 }}
-      transition={{ duration: 0.22, ease: 'easeInOut' }}
-      className="relative z-30 shrink-0 overflow-hidden"
-    >
-      <div className="banner-grad flex items-center gap-3 rounded-2xl px-4 py-3">
-        <span className="grid h-9 w-9 shrink-0 place-items-center rounded-xl bg-accent-gradient shadow-glow">
-          <ChevronDown size={18} className="text-white" />
-        </span>
-        <div className="min-w-0 flex-1">
-          <p className="text-[13px] font-semibold text-text-primary">{title}</p>
-          <p className="truncate text-[11px] text-text-secondary">{subtitle}</p>
-        </div>
-        <div className="shrink-0">
-          {showBar ? (
-            <div className="flex w-[150px] items-center gap-2">
-              <div className="h-2 flex-1 overflow-hidden rounded-full bg-white/10">
-                <div
-                  className="h-full rounded-full bg-accent-gradient transition-[width] duration-150"
-                  style={{ width: `${pct}%` }}
-                />
-              </div>
-              <span className="w-9 shrink-0 text-right font-mono text-[11px] tabular-nums text-text-secondary">
-                {pct}%
-              </span>
-            </div>
-          ) : (
-            actionLabel && (
-              <button
-                onClick={onAction}
-                disabled={busy}
-                className={`rounded-[8px] px-3.5 py-1.5 text-xs font-semibold transition-opacity ${busy ? 'cursor-not-allowed bg-white/10 text-text-muted' : 'bg-accent-gradient text-[var(--on-accent)] shadow-glow'
-                  }`}
-              >
-                {actionLabel}
-              </button>
-            )
-          )}
-        </div>
-      </div>
-    </motion.div>
-  )
-}
-
-function AppLogo() {
-  return <img src={appIconUrl} alt="" aria-hidden="true" draggable={false} className="h-9 w-9 shrink-0 select-none" />
-}
-
-function WindowSizeMenu({ value, onChange }) {
-  const btn = (id, label, icon) => {
-    const active = value === id
-    return (
-      <button
-        type="button"
-        title={label}
-        aria-label={label}
-        aria-pressed={active}
-        onClick={() => onChange(id)}
-        className={`grid h-6 w-6 place-items-center rounded-[6px] transition-colors ${active
-          ? 'bg-[color-mix(in_srgb,var(--text)_12%,transparent)] text-[var(--text)]'
-          : 'text-[var(--text-dim)] hover:bg-[color-mix(in_srgb,var(--text)_8%,transparent)] hover:text-[var(--text)]'
-          }`}
-      >
-        {icon}
-      </button>
-    )
-  }
-
-  return (
-    <div className="chrome-chip flex items-center gap-0.5 p-[3px]" role="group" aria-label="Window size">
-      {btn('default', 'Default', <Maximize2 size={13} strokeWidth={2.2} />)}
-      {btn('compact', 'Compact', <Minimize2 size={13} strokeWidth={2.2} />)}
-    </div>
-  )
-}
-
-function ThemeMenu({ value, onChange }) {
-  const [open, setOpen] = useState(false)
-  const ref = useRef(null)
-
-  useEffect(() => {
-    if (!open) return
-    const onDoc = (e) => {
-      if (ref.current && !ref.current.contains(e.target)) setOpen(false)
-    }
-    document.addEventListener('mousedown', onDoc)
-    return () => document.removeEventListener('mousedown', onDoc)
-  }, [open])
-
-  return (
-    <div ref={ref} className="relative">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        className="chrome-chip flex items-center gap-1.5 px-2.5 py-1 text-[11px] font-medium transition-colors hover:text-[var(--text)]"
-      >
-        Themes
-        <ChevronDown size={12} className={`transition-transform ${open ? 'rotate-180' : ''}`} />
-      </button>
-      {open && (
-        <div className="absolute right-0 top-full z-40 mt-1.5 min-w-[220px] overflow-hidden rounded-[10px] border border-[var(--border)] bg-[var(--surface)] py-1 shadow-lg">
-          {THEMES.map((t) => {
-            const active = t.id === value
-            return (
-              <button
-                key={t.id}
-                type="button"
+                className={`qchip${qOpen ? ' open' : ''}`}
                 onClick={() => {
-                  onChange(t.id)
-                  setOpen(false)
+                  setPop(null)
+                  setQOpen((o) => !o)
                 }}
-                className={`menu-item flex w-full items-center gap-2.5 px-3 py-2 text-left text-[12px] ${active ? 'text-[var(--text)]' : 'text-[var(--text-dim)]'
-                  }`}
+                aria-expanded={qOpen}
               >
-                <span
-                  className="h-2.5 w-2.5 shrink-0 rounded-full ring-1 ring-white/20"
-                  style={{ background: `var(--accent)` }}
-                  data-theme={t.id}
-                />
-                <span className="min-w-0 flex-1">
-                  {t.name}
-                  {LIGHT_THEMES.has(t.id) ? ' (light)' : ''}
-                </span>
-                {active && <Check size={13} className="shrink-0 text-text-primary" />}
+                <span className="q1">Queue · {qCount}</span>
+                <span className="q2">{chipSub}</span>
               </button>
-            )
-          })}
+            ) : null}
+            <PrimaryButton b={button} />
+          </div>
+          {qView ? <QueuePopover q={qView} /> : null}
         </div>
-      )}
+      </div>
+
+      <Toast toast={toast} top={banner ? 90 : 50} onClose={() => setToast(null)} />
+
+      {settingsOpen ? (
+        <SettingsSheet
+          s={{
+            onClose: () => setSettingsOpen(false),
+            bodyRef: sheetBodyRef,
+            proxyRef,
+            theme,
+            onTheme: setTheme,
+            windowSize,
+            onWindow: selectWindow,
+            proxy: { ...pxDraft, test: pxTest },
+            onProxyToggle: proxyToggle,
+            onProxyField: proxyField,
+            onProxyHost: proxyHost,
+            onProxyTest: proxyTest,
+            engine: { ...engine, msgColor: engine.msgColor || 'var(--grn)' },
+            onCheckEngine: checkEngine,
+            version,
+            onLink: openLink
+          }}
+        />
+      ) : null}
+
+      {whatsNew ? <WhatsNew block={whatsNew.block} prevVersion={whatsNew.prev} onClose={dismissWhatsNew} /> : null}
     </div>
-  )
-}
-
-// Same API + same params = same download (a different format is a new one).
-function jobKey(job) {
-  return `${job.api}:${JSON.stringify(job.params)}`
-}
-
-// Queued downloads, opened from a small button so the list never takes room
-// in the layout. Portaled: the left column clips overflowing children.
-function QueueMenu({ queue, current, compact, onRemove, onClear }) {
-  const [pos, setPos] = useState(null)
-  const btnRef = useRef(null)
-  const listRef = useRef(null)
-
-  useEffect(() => {
-    if (!pos) return
-    const onDoc = (e) => {
-      if (btnRef.current?.contains(e.target) || listRef.current?.contains(e.target)) return
-      setPos(null)
-    }
-    const close = () => setPos(null)
-    document.addEventListener('mousedown', onDoc)
-    window.addEventListener('resize', close)
-    return () => {
-      document.removeEventListener('mousedown', onDoc)
-      window.removeEventListener('resize', close)
-    }
-  }, [pos])
-
-  const toggle = () => {
-    if (pos) return setPos(null)
-    const r = btnRef.current.getBoundingClientRect()
-    setPos({ bottom: window.innerHeight - r.top + 6, right: window.innerWidth - r.right })
-  }
-
-  return (
-    <>
-      <button
-        ref={btnRef}
-        type="button"
-        onClick={toggle}
-        title="Queued downloads"
-        className={`flex items-center justify-center gap-1.5 rounded-[10px] border border-[var(--border)] bg-[var(--surface)] px-3 text-sm font-medium text-[var(--text)] hover:border-[var(--accent)] ${compact ? 'h-10' : 'h-[46px]'}`}
-      >
-        <ListOrdered size={14} />
-        <span className="font-mono tabular-nums">{queue.length}</span>
-      </button>
-      {pos &&
-        createPortal(
-          <div
-            ref={listRef}
-            style={{ bottom: pos.bottom, right: pos.right }}
-            className="fixed z-50 w-[280px] max-w-[calc(100vw-32px)] overflow-hidden rounded-[10px] border border-[var(--border)] bg-[var(--surface)] shadow-lg"
-          >
-            <div className="flex items-center justify-between border-b border-[var(--border)] px-3 py-2">
-              <span className="text-[11px] font-semibold uppercase tracking-[0.6px] text-[var(--text-dim)]">
-                Queue · {queue.length}
-              </span>
-              <button
-                type="button"
-                onClick={() => {
-                  onClear()
-                  setPos(null)
-                }}
-                className="text-[11px] text-[var(--text-faint)] hover:text-error"
-              >
-                Clear
-              </button>
-            </div>
-            <ul className="max-h-[200px] overflow-y-auto py-1">
-              {current && (
-                <li className="relative overflow-hidden text-[12px] text-[var(--text)]" title={current.label}>
-                  <div
-                    className="absolute inset-y-0 left-0 bg-[var(--accent)] opacity-25 transition-[width] duration-300 ease-out"
-                    style={{ width: `${Math.max(0, Math.min(100, current.progress || 0))}%` }}
-                  />
-                  <div className="relative flex items-center gap-2 px-3 py-1.5">
-                    <Loader2 size={11} className="w-4 shrink-0 animate-spin text-[var(--accent)]" />
-                    <span className="min-w-0 flex-1 truncate">{current.label || 'Downloading…'}</span>
-                    <span className="shrink-0 font-mono text-[11px] tabular-nums text-[var(--text-dim)]">
-                      {Math.floor(current.progress || 0)}%
-                    </span>
-                  </div>
-                </li>
-              )}
-              {queue.map((job, i) => (
-                <li key={job.id} className="flex items-center gap-2 px-3 py-1.5 text-[12px] text-[var(--text)]">
-                  <span className="w-4 shrink-0 font-mono text-[11px] text-[var(--text-faint)]">{i + 1}</span>
-                  <span className="min-w-0 flex-1 truncate" title={job.label}>
-                    {job.label}
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => onRemove(job.id)}
-                    title="Remove from queue"
-                    className="shrink-0 text-[var(--text-faint)] hover:text-error"
-                  >
-                    <X size={13} />
-                  </button>
-                </li>
-              ))}
-            </ul>
-          </div>,
-          document.body
-        )}
-    </>
-  )
-}
-
-function SectionLabel({ children, className = '', compact }) {
-  return (
-    <label
-      className={`section-label inline-flex items-center font-semibold uppercase tracking-wide text-text-muted ${compact ? 'mb-1 text-[10px]' : 'mb-1.5 text-[11px]'} ${className}`}
-    >
-      {children}
-    </label>
-  )
-}
-
-function FormatCard({ spec, compact, active, onClick, icon, title, subtitle, disabled, hint }) {
-  if (spec) {
-    return (
-      <button
-        onClick={disabled ? undefined : onClick}
-        disabled={disabled}
-        title={hint}
-        className={`box-border flex items-start gap-2 rounded-[10px] border text-left transition-colors ${compact ? 'px-2.5 py-2' : 'px-3.5 py-[14px]'} ${disabled ? 'cursor-not-allowed opacity-40' : ''
-          }`}
-        style={{
-          borderColor: active && !disabled ? 'var(--accent)' : 'var(--border)',
-          borderWidth: compact ? 1 : active && !disabled ? 1.5 : 1,
-          background: active && !disabled ? 'var(--accent-surface)' : 'var(--sunken)'
-        }}
-      >
-        <span
-          className={`shrink-0 rounded-full ${compact ? 'mt-[5px] h-1 w-1' : 'mt-[6px] h-1.5 w-1.5'}`}
-          style={{ background: active && !disabled ? 'var(--accent)' : 'var(--border-strong)' }}
-        />
-        <span>
-          <span className={`block font-semibold leading-tight text-[var(--text)] ${compact ? 'text-[12px]' : 'text-[13px]'}`}>{title}</span>
-          <span className={`mt-0.5 block font-mono text-[var(--text-dim)] ${compact ? 'text-[10px]' : 'text-[11px]'}`}>{subtitle}</span>
-        </span>
-      </button>
-    )
-  }
-  return (
-    <button
-      onClick={onClick}
-      className={`relative flex items-center gap-3 rounded-2xl px-4 py-3 text-left transition-colors ${active ? '' : 'bg-white/[0.04]'
-        }`}
-    >
-      {active && (
-        <motion.span
-          layoutId="format-pill"
-          transition={spring}
-          className="absolute inset-0 rounded-2xl bg-accent-gradient shadow-glow"
-        />
-      )}
-      <span
-        className={`relative z-10 grid h-9 w-9 shrink-0 place-items-center rounded-xl transition-colors ${active ? 'bg-white/20 text-white' : 'bg-white/5 text-text-secondary'
-          }`}
-      >
-        {icon}
-      </span>
-      <span className="relative z-10">
-        <span className={`block text-sm font-semibold ${active ? 'text-white' : 'text-text-primary'}`}>
-          {title}
-        </span>
-        <span className={`block text-[11px] ${active ? 'text-white/80' : 'text-text-secondary'}`}>
-          {subtitle}
-        </span>
-      </span>
-    </button>
-  )
-}
-
-function Pill({ spec, compact, active, onClick, group, title, disabled, children }) {
-  if (spec) {
-    return (
-      <button
-        type="button"
-        onClick={disabled ? undefined : onClick}
-        title={title}
-        aria-disabled={disabled || undefined}
-        className={`relative isolate flex-1 rounded-[7px] text-center font-mono transition-[color,opacity] duration-200 ${compact ? 'py-1 text-[11px]' : 'py-2 text-[12px]'} ${disabled ? 'pointer-events-none cursor-default opacity-35' : ''
-          } ${active && !disabled ? 'font-medium text-[var(--text)]' : 'font-normal text-[var(--text-dim)]'
-          }`}
-      >
-        {active && !disabled && (
-          <motion.span
-            layoutId={`pill-${group}`}
-            transition={{ type: 'spring', stiffness: 380, damping: 34, mass: 0.7 }}
-            className="absolute inset-0 -z-10 rounded-[7px] bg-[var(--control)] shadow-[0_1px_2px_rgba(0,0,0,0.10)] ring-1 ring-[var(--border)]"
-          />
-        )}
-        <span className="relative z-10">{children}</span>
-      </button>
-    )
-  }
-  return (
-    <button
-      onClick={disabled ? undefined : onClick}
-      title={title}
-      aria-disabled={disabled || undefined}
-      className={`relative rounded-xl py-3 text-center text-[13px] font-semibold transition-colors ${disabled ? 'pointer-events-none cursor-default opacity-35' : ''
-        } ${active && !disabled ? 'text-white' : 'bg-white/[0.04] text-text-secondary'
-        }`}
-    >
-      {active && !disabled && (
-        <motion.span
-          layoutId={`pill-${group}`}
-          transition={spring}
-          className="absolute inset-0 rounded-xl bg-accent-gradient shadow-glow"
-        />
-      )}
-      <span className="relative z-10">{children}</span>
-    </button>
-  )
-}
-
-function ModeTab({ spec, active, onClick, children }) {
-  if (spec) {
-    return (
-      <button
-        type="button"
-        onClick={onClick}
-        className={`relative isolate h-full rounded-[7px] px-3 text-[12px] font-medium transition-colors duration-200 ${active ? 'text-[var(--on-accent)]' : 'text-[var(--text-dim)] hover:text-[var(--text)]'
-          }`}
-      >
-        {active && (
-          <motion.span
-            layoutId="preview-mode"
-            transition={{ type: 'spring', stiffness: 380, damping: 34, mass: 0.7 }}
-            className="absolute inset-0 -z-10 rounded-[7px] bg-accent-gradient"
-          />
-        )}
-        <span className="relative z-10">{children}</span>
-      </button>
-    )
-  }
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={`relative isolate h-full rounded-full px-3 transition-colors ${active ? 'text-white' : 'text-text-secondary hover:text-text-primary'
-        }`}
-    >
-      {active && (
-        <motion.span
-          layoutId="preview-mode"
-          transition={spring}
-          className="absolute inset-0 -z-10 rounded-full bg-accent-gradient"
-        />
-      )}
-      <span className="relative z-10">{children}</span>
-    </button>
-  )
-}
-
-function GhostBtn({ onClick, children }) {
-  return (
-    <button
-      onClick={onClick}
-      className="ghost-btn px-2.5 py-1 text-[11px] font-medium"
-    >
-      {children}
-    </button>
-  )
-}
-
-function SwitchRow({ label, extra, on, onToggle, ariaLabel, disabled, compact }) {
-  return (
-    <div className={`flex w-full items-center justify-between rounded-[10px] border border-[var(--border)] bg-[var(--surface)] ${compact ? 'h-9 gap-1.5 px-2.5' : 'h-[42px] px-4'} ${disabled ? 'pointer-events-none opacity-40' : ''}`}>
-      <span className={`min-w-0 truncate font-medium ${compact ? 'text-[12px]' : 'text-sm'}`}>
-        {label}
-        {extra ? (
-          <span className="ml-1 font-normal text-[var(--text-dim)]">{extra}</span>
-        ) : null}
-      </span>
-      <button
-        type="button"
-        onClick={onToggle}
-        aria-label={ariaLabel}
-        className="inline-flex shrink-0 appearance-none items-center border-0 bg-transparent p-0"
-      >
-        <Switch on={on} />
-      </button>
-    </div>
-  )
-}
-
-function Switch({ on }) {
-  return (
-    <span
-      className={`relative inline-flex h-[18px] w-8 shrink-0 items-center rounded-full p-[2px] transition-colors duration-200 ${on ? 'bg-accent-gradient' : 'bg-[var(--border-strong)]'
-        }`}
-    >
-      <span
-        className={`block h-3.5 w-3.5 rounded-full bg-white shadow-sm transition-transform duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${on ? 'translate-x-[14px]' : 'translate-x-0'
-          }`}
-      />
-    </span>
-  )
-}
-
-function RangeInput({ value, onChange, ariaLabel }) {
-  return (
-    <input
-      value={value}
-      onChange={(e) => onChange(formatTimeInput(e.target.value))}
-      inputMode="numeric"
-      maxLength={8}
-      aria-label={ariaLabel}
-      placeholder="00:00:00"
-      className="h-full min-w-0 w-full appearance-none rounded-[5px] border-0 bg-transparent p-0 text-center font-mono text-[12px] leading-none tabular-nums tracking-wide text-[var(--text)] outline-none placeholder:text-[var(--text-faint)] transition-colors focus:bg-[var(--control)]"
-    />
   )
 }

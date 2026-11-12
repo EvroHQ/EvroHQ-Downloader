@@ -31,8 +31,8 @@ const store = new Store({
     outputFolder: '',
     telemetryEnabled: true,
     installId: '',
-    theme: 'evrohq',
-    codec: 'best',
+    theme: 'graphite-amber',
+    codec: 'h264',
     platform: 'youtube',
     lastSeenVersion: '',
     whatsNewAck: [],
@@ -384,8 +384,10 @@ let cancelRequested = false
 // Default is the original mockup (1052 × 752) and never scales with the display.
 // Compact uses these caps on 1440p / 4K; on a 1080p-class screen it shrinks so
 // the window occupies about the same share of the desktop as on 4K @ 150%.
+// Frameless window: these are the full window sizes (the title bar is drawn
+// by the app), matching the 2.6 design: Full 1040 × 720, Compact 880 × 600.
 const WINDOW_SIZES = {
-  default: { width: 1052, height: 730 },
+  default: { width: 1040, height: 720 },
   compact: { width: 880, height: 600 }
 }
 
@@ -710,9 +712,12 @@ function createWindow() {
     resizable: false,
     maximizable: false,
     fullscreenable: false,
+    // The app draws its own title bar (name, version, PROXY marker, Settings,
+    // window buttons); Windows 11 still rounds the corners.
+    frame: false,
     show: false,
     autoHideMenuBar: true,
-    backgroundColor: '#0a0a0a',
+    backgroundColor: '#131313',
     title: 'EvroHQ Downloader',
     icon: appIcon,
     webPreferences: {
@@ -793,6 +798,12 @@ function beginSkipTracker() {
   skipTracker = { skipped: 0, progressed: false, lastDest: '' }
 }
 
+// True when a playlist run produced nothing: no item downloaded and none was
+// already on disk (e.g. every item failed with 403 or a bot check).
+function nothingDownloaded() {
+  return !!skipTracker && !skipTracker.progressed && skipTracker.skipped === 0
+}
+
 function endSkipTracker() {
   const t = skipTracker
   skipTracker = null
@@ -819,6 +830,13 @@ function alreadyDownloadedLine(line) {
 // Pin the final extension so --no-overwrites checks the file the user already
 // has (Song.wav) instead of the intermediate stream (Song.webm) that -x would
 // otherwise fetch again and convert.
+// Each queued item keeps its own "Save to" folder; fall back to the default.
+function jobOutputFolder(params) {
+  const p = params?.outputFolder
+  if (typeof p === 'string' && p && existsSync(p)) return p
+  return store.get('outputFolder') || app.getPath('downloads')
+}
+
 function mediaOutputTemplate(playlist, ext) {
   const file = ext ? `%(title)s.${ext}` : '%(title)s.%(ext)s'
   return playlist ? `%(playlist_title)s/${file}` : file
@@ -1314,6 +1332,7 @@ async function fetchPlaylistInfo(ytdlp, url) {
     }))
     return {
       title: j.title || 'Playlist',
+      by: j.uploader || j.channel || null,
       count: tracks.length,
       cover: tracks[0]?.thumbnail || null,
       tracks
@@ -1890,7 +1909,7 @@ async function handleDownload(params) {
   // Prepended to every yt-dlp call so it can solve YouTube's JS challenge.
   const jsArgs = getJsRuntimeArgs()
 
-  const outputFolder = store.get('outputFolder') || app.getPath('downloads')
+  const outputFolder = jobOutputFolder(params)
 
   if (!existsSync(ytdlp)) {
     throw new Error(
@@ -1904,6 +1923,8 @@ async function handleDownload(params) {
   const requestedHeight = videoQuality === '4k' ? 2160 : videoQuality === '2k' ? 1440 : 1080
   const maxHeight = codec === 'h264' ? Math.min(requestedHeight, 1080) : requestedHeight
   const videoSelector = videoFormatSelector(maxHeight, codec)
+  // H.264 stays MP4; Best quality (VP9/AV1 + Opus) goes in MKV, which carries it everywhere.
+  const videoExt = codec === 'h264' ? 'mp4' : 'mkv'
 
   // ffmpeg audio encode args for the chosen audio format.
   const audioEncodeArgs =
@@ -2014,7 +2035,7 @@ async function handleDownload(params) {
           videoSelector,
           '--no-playlist',
           '--merge-output-format',
-          'mp4',
+          videoExt,
           '--ffmpeg-location',
           ffmpeg,
           '-o',
@@ -2037,7 +2058,7 @@ async function handleDownload(params) {
       const destDir = join(outputFolder, sanitizeFilename(title, 'chapters'))
       mkdirSync(destDir, { recursive: true })
 
-      const ext = format === 'audio' ? audioExt : 'mp4'
+      const ext = format === 'audio' ? audioExt : videoExt
       const encodeArgs = format === 'audio' ? audioEncodeArgs : ['-c', 'copy']
       const width = String(chapters.length).length
 
@@ -2123,7 +2144,7 @@ async function handleDownload(params) {
   }
 
   if (format === 'video' && !useRange) {
-    const already = existingOutputForTitle(outputFolder, params.title, 'mp4')
+    const already = existingOutputForTitle(outputFolder, params.title, videoExt)
     if (already) {
       sendLog(`${already} has already been downloaded`)
       return
@@ -2138,13 +2159,15 @@ async function handleDownload(params) {
         '--ffmpeg-location',
         ffmpeg,
         '--merge-output-format',
-        'mp4',
+        videoExt,
         '--windows-filenames',
         '--trim-filenames',
         '200',
         '--no-overwrites',
+        // "with metadata": title, artist and cover art in the video file too.
+        ...(embedMeta ? ['--embed-metadata', '--embed-thumbnail', '--convert-thumbnails', 'jpg'] : []),
         '-o',
-        mediaOutputTemplate(false, 'mp4')
+        mediaOutputTemplate(false, videoExt)
       ],
       url,
       outputFolder
@@ -2161,7 +2184,7 @@ async function handleDownload(params) {
         videoSelector,
         '--no-playlist',
         '--merge-output-format',
-        'mp4',
+        videoExt,
         '--ffmpeg-location',
         ffmpeg,
         '-o',
@@ -2173,7 +2196,7 @@ async function handleDownload(params) {
     try {
       const temp = findTempFile(outputFolder, ['.mp4', '.mkv', '.webm'])
       if (!temp) throw new Error('Could not locate the downloaded temp video file.')
-      const outName = join(outputFolder, `video_${stamp}.mp4`)
+      const outName = join(outputFolder, `video_${stamp}.${videoExt}`)
       if (!existsSync(ffmpeg)) throw new Error('ffmpeg.exe is missing from the bundled resources.')
       const effectiveEnd = await checkRangeAgainstMedia(temp)
       await runBinary(
@@ -2211,7 +2234,7 @@ async function handlePlaylistDownload(params) {
   const ytdlp = getBinPath('yt-dlp.exe')
   const ffmpeg = getBinPath('ffmpeg.exe')
   const jsArgs = getJsRuntimeArgs()
-  const outputFolder = store.get('outputFolder') || app.getPath('downloads')
+  const outputFolder = jobOutputFolder(params)
 
   if (!existsSync(ytdlp)) {
     throw new Error(
@@ -2226,6 +2249,8 @@ async function handlePlaylistDownload(params) {
   const requestedHeight = videoQuality === '4k' ? 2160 : videoQuality === '2k' ? 1440 : 1080
   const maxHeight = codec === 'h264' ? Math.min(requestedHeight, 1080) : requestedHeight
   const videoSelector = videoFormatSelector(maxHeight, codec)
+  // H.264 stays MP4; Best quality (VP9/AV1 + Opus) goes in MKV, which carries it everywhere.
+  const videoExt = codec === 'h264' ? 'mp4' : 'mkv'
 
   const args = [
     ...jsArgs,
@@ -2255,14 +2280,15 @@ async function handlePlaylistDownload(params) {
         `${embedMeta ? ' · embedding metadata' : ''}`
     )
   } else {
-    args.push('-f', videoSelector, '--merge-output-format', 'mp4')
+    args.push('-f', videoSelector, '--merge-output-format', videoExt)
+    if (embedMeta) args.push('--embed-metadata', '--embed-thumbnail', '--convert-thumbnails', 'jpg')
     sendLog(`Playlist video: up to ${maxHeight}p (best available) → MP4`)
     sendLog(codecLogLine(codec))
   }
 
   // Subfolder named after the playlist, one file per track inside it.
   const folder = sanitizeFilename(params?.title, 'playlist').replace(/%/g, '_')
-  const ext = format === 'audio' ? audioFormat : 'mp4'
+  const ext = format === 'audio' ? audioFormat : videoExt
   args.push('-o', `${folder}/%(title)s.${ext}`)
 
   let batchFile = null
@@ -2280,8 +2306,9 @@ async function handlePlaylistDownload(params) {
   } catch (err) {
     if (err.message === CANCELLED || cancelRequested) throw err
     // With --ignore-errors, a non-zero exit means some items were skipped
-    // (private/deleted/region-locked). Treat that as completed-with-warnings.
-    if (err.exitCode != null) {
+    // (private/deleted/region-locked). Treat that as completed-with-warnings —
+    // unless nothing at all was downloaded: then it's a real failure.
+    if (err.exitCode != null && !nothingDownloaded()) {
       sendLog('Some items could not be downloaded and were skipped — see the log above.')
       return
     }
@@ -2307,7 +2334,7 @@ async function handleSoundCloudDownload(params, { playlist } = { playlist: false
   const ytdlp = getBinPath('yt-dlp.exe')
   const ffmpeg = getBinPath('ffmpeg.exe')
   const jsArgs = getJsRuntimeArgs()
-  const outputFolder = store.get('outputFolder') || app.getPath('downloads')
+  const outputFolder = jobOutputFolder(params)
 
   if (!existsSync(ytdlp)) {
     throw new Error(
@@ -2417,7 +2444,7 @@ async function handleSoundCloudDownload(params, { playlist } = { playlist: false
     await runBinary(ytdlp, args, outputFolder)
   } catch (err) {
     if (err.message === CANCELLED || cancelRequested) throw err
-    if (playlist && err.exitCode != null) {
+    if (playlist && err.exitCode != null && !nothingDownloaded()) {
       sendLog('Some items could not be downloaded and were skipped — see the log above.')
       return
     }
@@ -2494,8 +2521,63 @@ const THEME_IDS = [
   'paper-rust',
   'bone-forest',
   'obsidian-violet',
-  'charcoal-red'
+  'charcoal-red',
+  'system'
 ]
+
+// --- Frameless window controls (the title bar is drawn by the renderer) ------
+ipcMain.handle('window-minimize', () => mainWindow?.minimize())
+ipcMain.handle('window-close', () => mainWindow?.close())
+
+// --- Save-to folders ----------------------------------------------------------
+// The "SAVE TO" menu: the standard folders plus the last folders the user picked.
+ipcMain.handle('get-folders', () => {
+  const safe = (name) => {
+    try {
+      return app.getPath(name)
+    } catch (e) {
+      return null
+    }
+  }
+  const recent = (store.get('recentFolders') || []).filter((p) => typeof p === 'string' && existsSync(p))
+  return {
+    standard: [
+      { name: 'Downloads', path: safe('downloads') },
+      { name: 'Music', path: safe('music') },
+      { name: 'Videos', path: safe('videos') }
+    ].filter((f) => f.path),
+    recent: recent.slice(0, 4).map((p) => ({ name: basename(p) || p, path: p }))
+  }
+})
+
+// Remember a picked folder (newest first, max 4) for the SAVE TO menu.
+function rememberFolder(folder) {
+  if (typeof folder !== 'string' || !folder) return
+  const std = ['downloads', 'music', 'videos'].map((n) => {
+    try {
+      return app.getPath(n)
+    } catch (e) {
+      return null
+    }
+  })
+  if (std.includes(folder)) return
+  const list = [folder, ...(store.get('recentFolders') || []).filter((p) => p !== folder)].slice(0, 4)
+  store.set('recentFolders', list)
+}
+
+ipcMain.handle('open-folder', async (_event, folder) => {
+  const target = typeof folder === 'string' && folder ? folder : store.get('outputFolder') || app.getPath('downloads')
+  const err = await shell.openPath(target)
+  return { ok: !err, error: err || null, path: target }
+})
+
+// --- Engine versions (Settings → ENGINE) ---------------------------------------
+ipcMain.handle('get-engine-versions', async () => {
+  const ytdlp = await getProcessOutput(getBinPath('yt-dlp.exe'), ['--version'])
+  const ff = await getProcessOutput(getBinPath('ffmpeg.exe'), ['-version'])
+  const ffVer = ff ? (ff.match(/ffmpeg version (\S+)/) || [])[1] || null : null
+  return { ytdlp: ytdlp || null, ffmpeg: ffVer ? ffVer.replace(/-.*$/, '') : null }
+})
 
 ipcMain.handle('get-config', () => {
   const theme = store.get('theme')
@@ -2504,8 +2586,8 @@ ipcMain.handle('get-config', () => {
     outputFolder: store.get('outputFolder') || app.getPath('downloads'),
     version: app.getVersion(),
     telemetryEnabled: store.get('telemetryEnabled') !== false,
-    theme: THEME_IDS.includes(theme) ? theme : 'evrohq',
-    codec: store.get('codec') === 'h264' ? 'h264' : 'best',
+    theme: THEME_IDS.includes(theme) ? theme : 'graphite-amber',
+    codec: store.get('codec') === 'best' ? 'best' : 'h264',
     platform: platform === 'soundcloud' ? 'soundcloud' : 'youtube',
     lastSeenVersion: typeof store.get('lastSeenVersion') === 'string' ? store.get('lastSeenVersion') : '',
     whatsNewAck: Array.isArray(store.get('whatsNewAck')) ? store.get('whatsNewAck').filter((id) => typeof id === 'string') : [],
@@ -2517,6 +2599,7 @@ ipcMain.handle('get-config', () => {
 ipcMain.handle('set-config', (_event, cfg) => {
   if (cfg && typeof cfg.outputFolder === 'string') {
     store.set('outputFolder', cfg.outputFolder)
+    rememberFolder(cfg.outputFolder)
   }
   if (cfg && typeof cfg.telemetryEnabled === 'boolean') {
     store.set('telemetryEnabled', cfg.telemetryEnabled)
@@ -2551,6 +2634,18 @@ ipcMain.handle('set-window-size', (_event, size) => {
   applyWindowSize(next, { animate: true })
   sendTelemetry('window_size', { window_size: next })
   return next
+})
+
+// "Update now" in the banner. The installer build already downloads on its
+// own; this only starts it if it hasn't started yet.
+ipcMain.handle('download-update', async () => {
+  if (isPortableBuild() || !app.isPackaged) return false
+  try {
+    await autoUpdater.downloadUpdate()
+    return true
+  } catch (e) {
+    return false
+  }
 })
 
 ipcMain.handle('track-link', (_event, which) => {
