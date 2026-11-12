@@ -399,12 +399,12 @@ button.chk { cursor: pointer; }
   display: grid; grid-template-columns: 12px 1fr 16px; gap: 8px; align-items: start; text-align: left; padding: 8px 10px;
   border: none; border-radius: 6px; background: transparent; color: var(--ink); cursor: pointer;
 }
-/* Hover: a visible step lighter than the menu (surf2 is almost the same as --pop). */
-.opt:hover { background: color-mix(in srgb, var(--ink) 9%, var(--pop)); }
+/* Hover: a visible step darker than the menu (--bg is darker than --pop in every theme). */
+.opt:hover { background: var(--bg); }
 /* The current choice must stand out from hover: accent tint, outline,
    accent label and a check mark. */
 .opt.sel { background: var(--accSoft); box-shadow: inset 0 0 0 1px var(--accLine); }
-.opt.sel:hover { background: color-mix(in srgb, var(--acc) 18%, var(--pop)); }
+.opt.sel:hover { background: color-mix(in srgb, var(--acc) 12%, var(--bg)); }
 .opt.sel .olabel { color: var(--accText); }
 .opt .ocheck { font-size: 13px; font-weight: 800; color: var(--accText); line-height: 1.5; text-align: right; }
 .opt[aria-disabled='true'] { cursor: not-allowed; }
