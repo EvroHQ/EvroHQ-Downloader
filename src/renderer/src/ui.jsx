@@ -464,6 +464,9 @@ function Token({ s }) {
                 <span className="olabel">{o.label}</span>
                 <span className="odesc">{o.why || o.desc}</span>
               </span>
+              <span className="ocheck" aria-hidden="true">
+                {o.on ? '✓' : ''}
+              </span>
             </button>
           ))}
         </div>
