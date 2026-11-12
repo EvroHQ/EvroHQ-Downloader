@@ -429,7 +429,11 @@ export function Sentence({ segs }) {
           // invisible "ghost" keeps it constant.
           return (
             <b key={i} className="fixw">
-              <span>{s.bold}</span>
+              <span>
+                {/* The count in the theme color, the word in the text color. */}
+                <span className="num">{String(s.bold).match(/^\d+/)?.[0]}</span>
+                {String(s.bold).replace(/^\d+/, '')}
+              </span>
               <span className="ghost" aria-hidden="true">
                 {s.ghost}
               </span>

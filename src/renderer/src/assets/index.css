@@ -381,6 +381,7 @@ button.chk { cursor: pointer; }
 .sentence .fixw { display: inline-grid; font-variant-numeric: tabular-nums; vertical-align: baseline; }
 .sentence .fixw > span { grid-area: 1 / 1; white-space: nowrap; }
 .sentence .fixw .ghost { visibility: hidden; }
+.sentence .fixw .num { color: var(--accText); }
 
 .tokwrap { position: relative; display: inline-block; white-space: nowrap; }
 .tok {
