@@ -65,7 +65,14 @@ export function detectLink(raw) {
   if (!YT_HOSTS.includes(host)) return { kind: 'unsupported', url: value }
   const id = youTubeVideoId(u)
   const list = u.searchParams.get('list')
-  const listUrl = list ? `https://www.youtube.com/playlist?list=${list}` : null
+  // A YouTube Mix (list=RD…, start_radio) can't be opened as /playlist?list=
+  // ("This playlist type is unviewable"); it only exists next to its video.
+  const isMix = !!list && (/^RD/i.test(list) || u.searchParams.has('start_radio'))
+  const listUrl = list
+    ? isMix && id
+      ? `https://www.youtube.com/watch?v=${id}&list=${list}`
+      : `https://www.youtube.com/playlist?list=${list}`
+    : null
   const videoUrl = id ? (host === 'youtu.be' ? `https://youtu.be/${id}` : `https://www.youtube.com/watch?v=${id}`) : null
   if (id && list) return { kind: 'plvid', url: value, videoUrl, listUrl }
   if (list) return { kind: 'pl', url: value, listUrl }
