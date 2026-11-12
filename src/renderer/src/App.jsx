@@ -299,7 +299,8 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [whatsNew, setWhatsNew] = useState(null) // { block, prev }
   const [appUpdate, setAppUpdate] = useState(null)
-  const [ytdlpUpdate, setYtdlpUpdate] = useState(null)
+  const [ytdlpUpdate, setYtdlpUpdate] = useState(null) // { status: 'updating' | 'failed', latest, pct }
+  const ytdlpBusyRef = useRef(false)
   const [bannerHidden, setBannerHidden] = useState(null) // key of a dismissed banner
   const [engine, setEngine] = useState({ ytdlp: null, ffmpeg: null, msg: '', busy: false })
   const lastCfgRef = useRef({ format: 'video', res: 1080, codec: 'h264', afmt: 'wav', scfmt: 'original', meta: true, folder: '' })
@@ -353,6 +354,42 @@ export default function App() {
     setQueue(q)
   }
 
+  // Keep yt-dlp current on its own: YouTube changes often and an old yt-dlp
+  // starts failing (HTTP 403). No app restart needed — the next download uses
+  // the new yt-dlp.exe. ffmpeg doesn't talk to YouTube; it's updated with
+  // each app release.
+  const autoUpdateYtdlp = useCallback(async () => {
+    if (ytdlpBusyRef.current) return
+    ytdlpBusyRef.current = true
+    try {
+      const r = await window.api?.checkYtdlpUpdate()
+      if (!r?.updateAvailable) {
+        setYtdlpUpdate((u) => (u?.status === 'failed' && !r?.error ? null : u))
+        return
+      }
+      setYtdlpUpdate({ status: 'updating', latest: r.latest, pct: 0 })
+      const res = await window.api?.updateYtdlp()
+      if (res?.success) {
+        setYtdlpUpdate(null)
+        toastMsg('success', `yt-dlp updated to ${res.version || r.latest}`)
+        window.api?.getEngineVersions?.().then((v) => v && setEngine((e) => ({ ...e, ...v })))
+      } else {
+        setYtdlpUpdate({ status: 'failed', latest: r.latest })
+      }
+    } finally {
+      ytdlpBusyRef.current = false
+    }
+  }, [toastMsg])
+
+  // At startup, then every 6 hours while nothing is downloading.
+  useEffect(() => {
+    autoUpdateYtdlp()
+    const t = setInterval(() => {
+      if (!activeRef.current) autoUpdateYtdlp()
+    }, 6 * 60 * 60 * 1000)
+    return () => clearInterval(t)
+  }, [autoUpdateYtdlp])
+
   /* --- startup ---------------------------------------------------------------- */
   useEffect(() => {
     let cancelled = false
@@ -372,7 +409,6 @@ export default function App() {
       setProxySaved(p)
       setPxDraft({ on: p.enabled, type: p.type, host: p.host, port: String(p.port || ''), username: p.username || '', password: p.password || '' })
     })
-    window.api?.checkYtdlpUpdate?.().then((r) => !cancelled && r?.updateAvailable && setYtdlpUpdate(r))
     const offUpd = window.api?.onAppUpdate((p) => setAppUpdate(p))
     return () => {
       cancelled = true
@@ -403,6 +439,12 @@ export default function App() {
       if (!flushRef.current) flushRef.current = requestAnimationFrame(flush)
     }
     const off = window.api?.onLog((line) => {
+      // yt-dlp self-update progress ("Downloading yt-dlp... 42%").
+      const up = line.match(/Downloading yt-dlp\.\.\. (\d+)%/)
+      if (up) {
+        setYtdlpUpdate((u) => (u?.status === 'updating' ? { ...u, pct: Number(up[1]) } : u))
+        return
+      }
       const job = activeRef.current
       if (!job) return
       const d = dl.current
@@ -786,19 +828,25 @@ export default function App() {
     if (focusProxy) setTimeout(() => proxyRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' }), 80)
   }
   const checkEngine = async () => {
+    if (ytdlpBusyRef.current) {
+      setEngine((e) => ({ ...e, msg: 'yt-dlp is already updating…', msgColor: 'var(--ink2)' }))
+      return
+    }
+    ytdlpBusyRef.current = true
     setEngine((e) => ({ ...e, busy: true, msg: 'Checking…', msgColor: 'var(--ink2)' }))
     const r = await window.api?.checkYtdlpUpdate()
     if (r?.updateAvailable) {
       setEngine((e) => ({ ...e, msg: `Updating yt-dlp to ${r.latest}…` }))
       const u = await window.api?.updateYtdlp()
       const v = await window.api?.getEngineVersions?.()
-      setYtdlpUpdate(null)
+      setYtdlpUpdate(u?.success ? null : { status: 'failed', latest: r.latest })
       setEngine((e) => ({ ...e, ...(v || {}), busy: false, msg: u?.success ? `yt-dlp updated to ${u.version || r.latest}` : 'The update failed. Try again later.', msgColor: u?.success ? 'var(--grn)' : 'var(--red)' }))
     } else if (r?.error) {
       setEngine((e) => ({ ...e, busy: false, msg: 'Couldn’t check for updates. Check your connection.', msgColor: 'var(--red)' }))
     } else {
       setEngine((e) => ({ ...e, busy: false, msg: 'yt-dlp and ffmpeg are up to date', msgColor: 'var(--grn)' }))
     }
+    ytdlpBusyRef.current = false
   }
   const openLink = (which) => {
     window.api?.trackLink(which)
@@ -1249,7 +1297,9 @@ export default function App() {
 
   let button
   if (mode === 'ready') {
-    if (est.n === 0) button = { kind: 'dis', label: 'Select at least one track' }
+    // Wait for the yt-dlp update (a few seconds) instead of a download that would fail.
+    if (ytdlpUpdate?.status === 'updating' && !busy) button = { kind: 'dis', label: 'Updating yt-dlp…' }
+    else if (est.n === 0) button = { kind: 'dis', label: 'Select at least one track' }
     else if (est.terr) button = { kind: 'dis', label: 'Fix the time range' }
     else if (busy) button = { kind: 'ready', label: 'Add to queue', glyph: '+', onClick: startOrQueue }
     else
@@ -1337,23 +1387,20 @@ export default function App() {
       action: 'Download',
       onAction: () => window.open(u.downloadUrl || 'https://github.com/EvroHQ/EvroHQ-Downloader/releases/latest', '_blank', 'noopener,noreferrer')
     }
-  else if (ytdlpUpdate)
+  else if (ytdlpUpdate?.status === 'updating')
+    banner = { key: 'ytdlp-up', title: `Updating yt-dlp to ${ytdlpUpdate.latest}`, progress: ytdlpUpdate.pct || 0 }
+  else if (ytdlpUpdate?.status === 'failed')
+    // Can't be dismissed: an outdated yt-dlp is what makes YouTube downloads fail.
     banner = {
-      key: `ytdlp-${ytdlpUpdate.latest}`,
-      title: `yt-dlp ${ytdlpUpdate.latest} available`,
-      sub: ' · keeps YouTube downloads working',
-      action: engine.busy ? 'Updating…' : 'Update now',
-      busy: engine.busy,
-      onAction: async () => {
-        setEngine((e) => ({ ...e, busy: true }))
-        const r = await window.api?.updateYtdlp()
-        setEngine((e) => ({ ...e, busy: false }))
-        setYtdlpUpdate(null)
-        toastMsg(r?.success ? 'success' : 'error', r?.success ? `yt-dlp updated to ${r.version || 'the latest version'}` : 'yt-dlp update failed')
-      }
+      key: 'ytdlp-fail',
+      title: 'Couldn’t update yt-dlp',
+      sub: ' · YouTube downloads may fail until it’s updated',
+      action: 'Try again',
+      onAction: autoUpdateYtdlp,
+      noDismiss: true
     }
   if (banner && bannerHidden === banner.key) banner = null
-  if (banner && banner.progress == null) banner.onDismiss = () => setBannerHidden(banner.key)
+  if (banner && banner.progress == null && !banner.noDismiss) banner.onDismiss = () => setBannerHidden(banner.key)
 
   const proxyOn = !!(proxySaved?.enabled && proxySaved?.host)
   const dockDim = !subj

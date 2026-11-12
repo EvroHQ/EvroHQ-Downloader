@@ -146,7 +146,6 @@ export function SettingsSheet({ s }) {
               <a onClick={() => s.onLink('madeby')} role="link" tabIndex={0}>
                 @EvroHQ
               </a>
-              <span className="by">. Powered by yt-dlp &amp; ffmpeg.</span>
             </div>
             <div className="linkrow">
               <a className="ink" onClick={() => s.onLink('star')} role="link" tabIndex={0}>
