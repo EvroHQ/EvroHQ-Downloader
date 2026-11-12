@@ -68,8 +68,20 @@ function videoSource(info, chapters, link) {
   }
 }
 
+// Mixes repeat videos: keep the first copy only, so one checkbox = one row
+// (selection is by id) and nothing gets downloaded twice.
+function uniqueTracks(list) {
+  const seen = new Set()
+  return (list || []).filter((t, i) => {
+    const key = String(t.id ?? t.url ?? i)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
 function ytListSource(info, link) {
-  const tracks = (info.tracks || []).map((t, i) => ({
+  const tracks = uniqueTracks(info.tracks).map((t, i) => ({
     id: String(t.id ?? i),
     ...splitTitle(t.title),
     full: t.title,
@@ -91,7 +103,7 @@ function ytListSource(info, link) {
 
 function scSource(meta, url) {
   if (meta.kind === 'playlist') {
-    const tracks = (meta.tracks || []).map((t, i) => ({
+    const tracks = uniqueTracks(meta.tracks).map((t, i) => ({
       id: String(t.id ?? i),
       a: t.artist || meta.artist || 'Unknown artist',
       t: t.title,
