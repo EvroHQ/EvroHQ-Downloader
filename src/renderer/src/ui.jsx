@@ -424,6 +424,17 @@ export function Sentence({ segs }) {
     <div className="sentence">
       {glued.map((s, i) => {
         if (s.text != null) return <span key={i}>{s.text}</span>
+        if (s.bold != null && s.ghost)
+          // Both texts share one grid cell: the width is the widest, the
+          // invisible "ghost" keeps it constant.
+          return (
+            <b key={i} className="fixw">
+              <span>{s.bold}</span>
+              <span className="ghost" aria-hidden="true">
+                {s.ghost}
+              </span>
+            </b>
+          )
         if (s.bold != null) return <b key={i}>{s.bold}</b>
         return <Token key={i} s={s} />
       })}

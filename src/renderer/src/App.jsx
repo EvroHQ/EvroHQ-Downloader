@@ -1226,7 +1226,7 @@ export default function App() {
   const segs = useMemo(() => {
     const out = []
     const T = (text) => out.push({ text })
-    const B = (bold) => out.push({ bold })
+    const B = (bold, ghost) => out.push({ bold, ghost })
     if (!subj) {
       T('Save ')
       B('everything')
@@ -1243,7 +1243,10 @@ export default function App() {
       out.push({ label, locked, open, right: open && pop.right, menu: open && !noMenu ? menuFor(id) : noMenu ? null : !locked ? { title: '', opts: [] } : null, onClick: (e) => tokClick(id, e) })
     }
     T('Save ')
-    B(single ? 'this' : `${est.n} ${est.n === 1 ? 'track' : 'tracks'}`)
+    // Lists: reserve the width of the longest count ("243 tracks") so ticking
+    // tracks changes the number without shifting the rest of the sentence.
+    if (single) B('this')
+    else B(`${est.n} ${est.n === 1 ? 'track' : 'tracks'}`, `${'8'.repeat(String(src.tracks.length).length)} tracks`)
     T(' as ')
     K('format', cfg.format === 'audio' || isSc ? 'audio' : 'video')
     T(' in ')

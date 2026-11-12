@@ -377,6 +377,10 @@ button.chk { cursor: pointer; }
 .dock-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em; color: var(--ink2); }
 .sentence { font-size: var(--sentFs); font-weight: 500; letter-spacing: -0.02em; line-height: 1.85; color: var(--ink); text-wrap: pretty; }
 .sentence b { font-weight: 750; }
+/* Fixed-width track count: equal-width digits, sized to the longest count. */
+.sentence .fixw { display: inline-grid; font-variant-numeric: tabular-nums; vertical-align: baseline; }
+.sentence .fixw > span { grid-area: 1 / 1; white-space: nowrap; }
+.sentence .fixw .ghost { visibility: hidden; }
 
 .tokwrap { position: relative; display: inline-block; white-space: nowrap; }
 .tok {
