@@ -1203,7 +1203,7 @@ export default function App() {
         return {
           title: 'AUDIO FORMAT',
           opts: [
-            O('WAV · uncompressed', 'Lossless · ~10 MB per minute', cfg.afmt === 'wav', () => set({ afmt: 'wav' })),
+            O('WAV', 'Lossless · ~10 MB per minute', cfg.afmt === 'wav', () => set({ afmt: 'wav' })),
             O('MP3 · 320 kbps', 'Plays anywhere · ~2.4 MB per minute', cfg.afmt === 'mp3', () => set({ afmt: 'mp3' }))
           ]
         }
@@ -1264,7 +1264,7 @@ export default function App() {
     K('format', cfg.format === 'audio' || isSc ? 'audio' : 'video')
     T(' in ')
     if (isSc) K('scfmt', cfg.scfmt === 'wav' ? 'WAV' : 'original quality')
-    else if (cfg.format === 'audio') K('afmt', cfg.afmt === 'wav' ? 'WAV · uncompressed' : 'MP3 · 320 kbps')
+    else if (cfg.format === 'audio') K('afmt', cfg.afmt === 'wav' ? 'WAV' : 'MP3 · 320 kbps')
     else {
       K('res', `${cfg.res}p`)
       T(', ')
