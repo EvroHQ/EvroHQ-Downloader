@@ -14,7 +14,7 @@
   --rowH: 48px;
   --sentFs: 21px;
   --colW: 320px;
-  --thumbW: 340px;
+  --thumbW: 460px;
   --titleFs: 32px;
   --heroFs: 40px;
   --headFs: 26px;
@@ -31,7 +31,7 @@
   --rowH: 42px;
   --sentFs: 18px;
   --colW: 280px;
-  --thumbW: 250px;
+  --thumbW: 320px;
   --titleFs: 25px;
   --heroFs: 33px;
   --headFs: 22px;
@@ -229,7 +229,7 @@ input::placeholder {
 .pastebtn .k { font-family: var(--mono); font-size: 10px; color: var(--ink2); }
 
 /* ---------- Main area ------------------------------------------------------ */
-.main { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; padding: 0 var(--padX); }
+.main { flex: 1; min-height: 0; position: relative; display: flex; flex-direction: column; padding: 0 var(--padX); container-type: size; }
 
 .empty { flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 18px; padding-bottom: 20px; }
 .empty-row { display: flex; align-items: center; gap: 20px; }
@@ -294,7 +294,9 @@ input::placeholder {
 /* Single video */
 .single { flex: 1; min-height: 0; display: flex; gap: 26px; align-items: center; padding-bottom: 12px; }
 .sthumb {
-  width: var(--thumbW); flex: none; aspect-ratio: 16 / 9; border-radius: 8px; position: relative;
+  /* As big as --thumbW, but never taller than the main area (e.g. with More
+     options open): the width shrinks to keep 16:9. */
+  width: min(var(--thumbW), calc((100cqh - 16px) * 16 / 9)); flex: none; aspect-ratio: 16 / 9; border-radius: 8px; position: relative;
 }
 .sthumb .dur {
   position: absolute; right: 10px; bottom: 10px; background: rgba(0, 0, 0, 0.78); color: #edeae4;
