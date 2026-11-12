@@ -60,23 +60,29 @@ Open **Settings** → **Appearance** to switch, or pick **System** to follow Win
 
 ### Dark
 
-|                        EvroHQ                        |                            Graphite & Amber                            |
-| :--------------------------------------------------: | :--------------------------------------------------------------------: |
-| <img src="docs/evrohq.png" alt="EvroHQ" width="480"> | <img src="docs/graphite-amber.png" alt="Graphite & Amber" width="480"> |
-
-|                          Carbon & Cyan                           |                            Obsidian & Violet                             |
-| :--------------------------------------------------------------: | :----------------------------------------------------------------------: |
-| <img src="docs/carbon-cyan.png" alt="Carbon & Cyan" width="480"> | <img src="docs/obsidian-violet.png" alt="Obsidian & Violet" width="480"> |
-
-|                           Charcoal & Signal Red                           |
-| :-----------------------------------------------------------------------: |
-| <img src="docs/charcoal-red.png" alt="Charcoal & Signal Red" width="480"> |
+<table>
+  <tr>
+    <td width="50%" align="center"><b>EvroHQ</b><br><img src="docs/evrohq.png" alt="EvroHQ" width="100%"></td>
+    <td width="50%" align="center"><b>Graphite &amp; Amber</b><br><img src="docs/graphite-amber.png" alt="Graphite &amp; Amber" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="50%" align="center"><b>Carbon &amp; Cyan</b><br><img src="docs/carbon-cyan.png" alt="Carbon &amp; Cyan" width="100%"></td>
+    <td width="50%" align="center"><b>Obsidian &amp; Violet</b><br><img src="docs/obsidian-violet.png" alt="Obsidian &amp; Violet" width="100%"></td>
+  </tr>
+  <tr>
+    <td width="50%" align="center"><b>Charcoal &amp; Signal Red</b><br><img src="docs/charcoal-red.png" alt="Charcoal &amp; Signal Red" width="100%"></td>
+    <td width="50%"></td>
+  </tr>
+</table>
 
 ### Light
 
-|                          Paper & Rust                          |                          Bone & Forest                           |
-| :------------------------------------------------------------: | :--------------------------------------------------------------: |
-| <img src="docs/paper-rust.png" alt="Paper & Rust" width="480"> | <img src="docs/bone-forest.png" alt="Bone & Forest" width="480"> |
+<table>
+  <tr>
+    <td width="50%" align="center"><b>Paper &amp; Rust</b><br><img src="docs/paper-rust.png" alt="Paper &amp; Rust" width="100%"></td>
+    <td width="50%" align="center"><b>Bone &amp; Forest</b><br><img src="docs/bone-forest.png" alt="Bone &amp; Forest" width="100%"></td>
+  </tr>
+</table>
 
 ---
 
