@@ -1463,7 +1463,7 @@ export default function App() {
       <TitleBar
         version={version}
         proxyOn={proxyOn}
-        onSettings={() => openSettings(false)}
+        onSettings={() => (settingsOpen ? setSettingsOpen(false) : openSettings(false))}
         onMinimize={() => window.api?.minimizeWindow()}
         onClose={() => window.api?.closeWindow()}
       />
