@@ -46,6 +46,9 @@ export const WHATS_NEW = [
     { kicker: 'DESIGN', title: 'One sentence sets up your download', body: 'Paste a link, then click any highlighted word to change the format, quality or folder.' },
     { kicker: 'YT-DLP', title: 'The download engine updates itself', body: 'yt-dlp now updates in the background, so you no longer have to stop and update it by hand.' },
     { kicker: 'SOUNDCLOUD', title: 'Clearer SoundCloud sets', body: 'Tracks that can’t be saved (Go+ previews, blocked in your country) are marked in the list instead of failing during the download.' }
+  ] },
+  { id: '2.6.1', version: '2.6.1', items: [
+    { kicker: 'FIX', title: 'Download even when YouTube blocks the preview', body: 'If YouTube’s bot check stops the preview, the video still opens and can be downloaded, as before 2.6.' }
   ] }
 ]
 
@@ -56,5 +59,10 @@ export function pendingWhatsNew(ackIds, current) {
   const pending = WHATS_NEW.filter((n) => !seen.has(n.id) && cmpVer(current, n.version) >= 0)
   if (!pending.length) return null
   const latest = pending.reduce((a, b) => (cmpVer(b.version, a.version) > 0 ? b : a))
-  return { ...latest, ids: pending.map((n) => n.id) }
+  const ids = pending.map((n) => n.id)
+  // Skipped a version with a welcome note (e.g. 2.5 → 2.6.1)? Show that welcome,
+  // with the newer items first, so the redesign note isn't lost.
+  const welcomed = !latest.welcome && pending.filter((n) => n.welcome).sort((a, b) => cmpVer(b.version, a.version))[0]
+  if (welcomed) return { ...welcomed, version: latest.version, items: [...latest.items, ...welcomed.items], ids }
+  return { ...latest, ids }
 }

@@ -126,7 +126,8 @@ export function trimError(cfg, duration) {
 /* -------------------------------------------------------------------------- */
 
 // MB (Windows-style, 1024-based) → "566 MB" / "1.7 GB"
-export const fmtMB = (m) => (m >= 1024 ? `${(m / 1024).toFixed(1)} GB` : m < 10 ? `${Math.max(0, m).toFixed(1)} MB` : `${Math.round(m)} MB`)
+// null = size unknown (video read without its info after a bot check).
+export const fmtMB = (m) => m == null || !Number.isFinite(m) ? 'size unknown' : (m >= 1024 ? `${(m / 1024).toFixed(1)} GB` : m < 10 ? `${Math.max(0, m).toFixed(1)} MB` : `${Math.round(m)} MB`)
 
 // Spec §5.3 "File size estimates", MB per minute.
 export function ratePerMin(isSc, cfg) {

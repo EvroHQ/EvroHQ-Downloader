@@ -67,6 +67,32 @@ function videoSource(info, chapters, link) {
   }
 }
 
+// YouTube's bot check hit the preview read. As in 2.5.1, the video can still be
+// downloaded: the download asks YouTube again on its own (with retries), and
+// that second request often gets through. Title, length and sizes are unknown.
+const isBotError = (msg) => /as a bot|not a bot/i.test(String(msg || ''))
+
+function blindVideoSource(link) {
+  const id = (String(link.videoUrl).match(/(?:youtu\.be\/|[?&]v=|\/(?:shorts|live|embed)\/)([\w-]{6,})/) || [])[1] || null
+  return {
+    kind: 'yt',
+    type: 'video',
+    blind: true,
+    label: 'YouTube video · preview unavailable',
+    title: id ? `YouTube video ${id}` : 'YouTube video',
+    by: '',
+    thumbnail: id ? `https://i.ytimg.com/vi/${id}/hqdefault.jpg` : null,
+    duration: 0,
+    chapters: [],
+    max: null,
+    sizes: null,
+    url: link.videoUrl,
+    tracks: [{ id: id || 'v', a: id ? `YouTube video ${id}` : 'YouTube video', t: '', full: null, dur: 0, thumb: null }]
+  }
+}
+
+const BLIND_TOAST = 'YouTube blocked the preview, but you can still download: the download asks YouTube again.'
+
 // Mixes repeat videos: keep the first copy only, so one checkbox = one row
 // (selection is by id) and nothing gets downloaded twice.
 function uniqueTracks(list) {
@@ -159,7 +185,7 @@ function estimate(src, sel, cfg) {
   let secs = items.reduce((a, t) => a + (t.dur || 0), 0)
   const trimmed = single && cfg.trimOn && !terr
   if (trimmed) secs = parseT(cfg.tEnd).sec - parseT(cfg.tStart).sec
-  let mb = (secs / 60) * ratePerMin(isSc, cfg)
+  let mb = src.blind ? null : (secs / 60) * ratePerMin(isSc, cfg)
   if (single && !isSc && cfg.format === 'video' && src.sizes) {
     const bytes = cfg.codec === 'h264' ? src.sizes.h264?.[1080] : src.sizes.best?.[cfg.res]
     if (bytes) mb = (bytes / 1024 ** 2) * (trimmed && src.duration ? secs / src.duration : 1)
@@ -177,7 +203,7 @@ function estimate(src, sel, cfg) {
 
 const summaryOf = (job) => {
   const e = estimate(job.src, job.sel, job.cfg)
-  return `${e.unit} · ${qualityText(job.src.kind === 'sc', job.cfg)} · ~${fmtMB(e.mb)}${job.cfg.trimOn ? ' · trimmed' : ''}`
+  return `${e.unit} · ${qualityText(job.src.kind === 'sc', job.cfg)}${e.mb == null ? '' : ` · ~${fmtMB(e.mb)}`}${job.cfg.trimOn ? ' · trimmed' : ''}`
 }
 
 // Everything a download needs, frozen now (each queued item keeps its settings).
@@ -237,8 +263,10 @@ function buildJob(ed, seq) {
       chapterCount: src.chapters?.length || 0,
       start: cfg.tStart,
       end: cfg.tEnd,
-      title: src.title,
-      duration: src.duration
+      // Unknown for a blind source: a placeholder title would wrongly match
+      // "already downloaded", and the main process reads the length itself.
+      title: src.blind ? null : src.title,
+      duration: src.blind ? null : src.duration
     }
   }
 }
@@ -601,21 +629,32 @@ export default function App() {
             // The list can't be read (private, removed…): fall back to the video.
             const v = await window.api.getVideoInfo(link.videoUrl)
             if (readReq.current !== req) return
-            if (!v || v.error) return fail(info?.error || v?.error, 'playlist')
-            const ch = await window.api.getChapters(link.videoUrl).catch(() => null)
-            if (readReq.current !== req) return
-            src = videoSource(v, ch?.chapters, link)
-            src.listUrl = link.listUrl
-            toastMsg('warning', 'Couldn’t read the playlist, so only this video is shown.')
+            if (isBotError(v?.error)) {
+              src = blindVideoSource(link)
+              src.listUrl = link.listUrl
+              toastMsg('warning', BLIND_TOAST)
+            } else {
+              if (!v || v.error) return fail(info?.error || v?.error, 'playlist')
+              const ch = await window.api.getChapters(link.videoUrl).catch(() => null)
+              if (readReq.current !== req) return
+              src = videoSource(v, ch?.chapters, link)
+              src.listUrl = link.listUrl
+              toastMsg('warning', 'Couldn’t read the playlist, so only this video is shown.')
+            }
           }
         } else if (link.kind === 'vid') {
           const info = await window.api.getVideoInfo(link.videoUrl)
           if (readReq.current !== req) return
-          if (!info || info.error) return fail(info?.error, 'video')
-          // Same saved info → no new YouTube request.
-          const ch = await window.api.getChapters(link.videoUrl).catch(() => null)
-          if (readReq.current !== req) return
-          src = videoSource(info, ch?.chapters, link)
+          if (isBotError(info?.error)) {
+            src = blindVideoSource(link)
+            toastMsg('warning', BLIND_TOAST)
+          } else {
+            if (!info || info.error) return fail(info?.error, 'video')
+            // Same saved info → no new YouTube request.
+            const ch = await window.api.getChapters(link.videoUrl).catch(() => null)
+            if (readReq.current !== req) return
+            src = videoSource(info, ch?.chapters, link)
+          }
           src.listUrl = link.listUrl || null
         } else if (link.kind === 'pl') {
           const info = await window.api.getPlaylistInfo(link.listUrl)
@@ -689,11 +728,13 @@ export default function App() {
     const info = await window.api.getVideoInfo(videoUrl).catch(() => null)
     const ch = info && !info.error ? await window.api.getChapters(videoUrl).catch(() => null) : null
     setAltLoading(false)
-    if (!info || info.error) {
+    const blind = isBotError(info?.error)
+    if (!blind && (!info || info.error)) {
       toastMsg('error', info?.error || 'Couldn’t read this video.')
       return
     }
-    const video = videoSource(info, ch?.chapters, { kind: 'plvid', videoUrl })
+    if (blind) toastMsg('warning', BLIND_TOAST)
+    const video = blind ? blindVideoSource({ videoUrl }) : videoSource(info, ch?.chapters, { kind: 'plvid', videoUrl })
     video.listUrl = ed.src.url
     setEd((e) => ({ ...e, saved: null, src: video, alt: e.src, sel: video.tracks.map((t) => t.id), cfg: { ...makeCfg(video, lastCfgRef.current), folder: e.cfg.folder } }))
   }
@@ -1010,11 +1051,14 @@ export default function App() {
   const pct = Math.floor(prog)
   const itemIdx = mode === 'active' ? live.item : mode === 'paused' ? lastSnap?.item || 0 : 0
   const speedMB = mode === 'active' && live.speed ? live.speed / 1024 ** 2 : null
-  const doneMB = est ? (est.mb * prog) / 100 : 0
+  const sizeKnown = est && est.mb != null
+  const doneMB = sizeKnown ? (est.mb * prog) / 100 : 0
   const trk = est && !single ? `track ${Math.min(est.n, itemIdx + 1)} of ${est.n} · ` : ''
-  const sizePart = est ? `${fmtMB(doneMB)} / ~${fmtMB(est.mb)}` : ''
+  const sizePart = sizeKnown ? `${fmtMB(doneMB)} / ~${fmtMB(est.mb)}` : est ? `${pct}%` : ''
   const progLine = est
-    ? trk + sizePart + (speedMB ? ` · ${speedMB.toFixed(1)} MB/s · ${hms(Math.max(0, est.mb - doneMB) / speedMB)} left` : '')
+    ? trk +
+      sizePart +
+      (speedMB ? ` · ${speedMB.toFixed(1)} MB/s${sizeKnown ? ` · ${hms(Math.max(0, est.mb - doneMB) / speedMB)} left` : ''}` : '')
     : ''
 
   // Header (kicker / headline / meta) per state — spec §5.2 list layout table.
@@ -1348,7 +1392,7 @@ export default function App() {
     const chCount = src.chapters?.length || 0
     let trimInfo = ''
     if (ytSingle) {
-      if (!cfg.trimOn) trimInfo = `Video length ${hms6(src.duration)}`
+      if (!cfg.trimOn) trimInfo = src.blind ? 'Video length unknown' : `Video length ${hms6(src.duration)}`
       else if (est.terr) trimInfo = est.terr
       else trimInfo = `Selection ${hms6(est.secs)} · ≈ ${fmtMB(est.mb)}`
     }
@@ -1394,11 +1438,19 @@ export default function App() {
   let sizeR = ''
   if (est) {
     if (mode === 'ready') {
-      sizeL = single ? (cfg.trimOn && !est.terr ? `TRIMMED · ${hms(est.secs)}` : hms(est.secs)) : `${est.n} OF ${src.tracks.length} · ${hms(est.secs)}`
-      sizeR = `≈ ${fmtMB(est.mb)} ${est.cont}`
+      sizeL = src.blind
+        ? cfg.trimOn && !est.terr
+          ? `TRIMMED · ${hms(est.secs)}`
+          : 'LENGTH UNKNOWN'
+        : single
+          ? cfg.trimOn && !est.terr
+            ? `TRIMMED · ${hms(est.secs)}`
+            : hms(est.secs)
+          : `${est.n} OF ${src.tracks.length} · ${hms(est.secs)}`
+      sizeR = est.mb == null ? est.cont : `≈ ${fmtMB(est.mb)} ${est.cont}`
     } else {
       sizeL = 'THIS DOWNLOAD'
-      sizeR = `~${fmtMB(est.mb)} ${est.cont}`
+      sizeR = est.mb == null ? est.cont : `~${fmtMB(est.mb)} ${est.cont}`
     }
   }
 
